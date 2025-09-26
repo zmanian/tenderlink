@@ -10,6 +10,13 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 //     IP, // complete
 // }
 
+#[derive(Debug)]
+struct Peer {
+    addr: core::net::SocketAddr,
+    public_key: ed25519_zebra::VerificationKeyBytes,
+    handshake_state: Option<snow::HandshakeState>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,12 +137,22 @@ mod tests {
         let sock = std::net::UdpSocket::bind(addr_str)?;
         sock.set_nonblocking(true)?;
 
-        let mut peer_addrs: Vec<core::net::SocketAddr> = Vec::with_capacity(peers.len()+1);
+        let mut peer_addrs: Vec<Peer> = Vec::with_capacity(peers.len()+1);
 
-        let my_addr: core::net::SocketAddr = addr_str.parse().unwrap();
-        peer_addrs.push(my_addr);
+        let me = Peer {
+            addr: addr_str.parse().unwrap(),
+            public_key,
+            handshake_state: None,
+        };
+        // let my_addr: core::net::SocketAddr = addr_str.parse().unwrap();
+        peer_addrs.push(me);
+
         for peer in peers {
-            peer_addrs.push(peer.parse().unwrap());
+            peer_addrs.push(Peer {
+                addr: peer.parse().unwrap(),
+                public_key: [0u8; 32].into(), // TODO
+                handshake_state: None,
+            });
         }
         println!("{} started with sock: {:?}, peers: {:?}", addr_str, sock, peer_addrs);
 
@@ -145,7 +162,6 @@ mod tests {
             tokio::time::sleep_until(next_tick_time).await; // ALT: tokio::time::interval Burst/Skip
             next_tick_time += TICK_DURATION;
 
-            // let (len, addr) = match sock.try_recv_from(&mut buf)
             loop {
                 let (len, addr) = match sock.recv_from(&mut buf) {
                     Ok((len, addr)) => if should_fake_fail(&mut base_rng) {
@@ -159,9 +175,13 @@ mod tests {
                 };
                 let found_peer: core::net::SocketAddr = std::str::from_utf8(&buf[..len]).unwrap().parse().unwrap();
                 // println!("{} received {} bytes from {:?}", addr_str, len, addr);
-                if !peer_addrs[1..].contains(&found_peer) {
+                if !peer_addrs[1..].iter().any(|peer| peer.addr == found_peer) {
                     println!("{} given new peer {} from {}", addr_str, found_peer, addr);
-                    peer_addrs.push(found_peer);
+                    peer_addrs.push(Peer {
+                        addr: found_peer,
+                        public_key: [0u8; 32].into(), // TODO
+                        handshake_state: None,
+                    });
                 }
             }
 
@@ -169,14 +189,14 @@ mod tests {
 
             for dst_peer in &peer_addrs[1..] { // don't  send to ourselves
                 for known_peer in &peer_addrs {
-                    if dst_peer != known_peer {
-                        println!("{} sending {:?} to {:?}", my_addr, known_peer, dst_peer);
-                        let len = match sock.send_to(known_peer.to_string().as_bytes(), *dst_peer) {
+                    if dst_peer.addr != known_peer.addr {
+                        println!("{} sending {:?} to {:?}", addr_str, known_peer.addr, dst_peer.addr);
+                        let len = match sock.send_to(known_peer.addr.to_string().as_bytes(), dst_peer.addr) {
                             Ok(len) => len,
                             Err(ref e) if is_timeout(e.kind()) => continue,
                             Err(e) => return Err(e),
                         };
-                        // println!("{} sent {:?} bytes to {:?}", addr_str, len, dst_peer);
+                        // println!("{} sent {:?} bytes to {:?}", addr_str, len, dst_peer.addr);
                     }
                 }
             }
