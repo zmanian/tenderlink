@@ -14,6 +14,23 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 mod tests {
     use super::*;
 
+    use rand::{SeedableRng, Rng, RngCore};
+    use rand_pcg::Lcg128CmDxsm64 as SimRng;
+
+    const FAKE_FAIL_RATIO: f64 = 0.1;
+    // const FAKE_FAIL_DISTR: rand::distr::Bernoulli = rand::distr::Bernoulli::new(FAKE_FAIL_RATIO).unwrap();
+
+    fn should_fake_fail(rng: &mut SimRng) -> bool {
+        // use rand::distr::Distribution;
+        if FAKE_FAIL_RATIO == 0.0 {
+            false
+        } else {
+            rng.random_bool(FAKE_FAIL_RATIO)
+            // FAKE_FAIL_DISTR.sample(rng)
+        }
+    }
+
+
     fn hook_fail_on_panic() {
         std::panic::set_hook(Box::new(|panic_info| {
             #[allow(clippy::print_stderr)]
@@ -88,8 +105,17 @@ mod tests {
         }))
     }
 
-    async fn instance(addr_str: &str, peers: &[&str]) -> std::io::Result<()> {
+    async fn instance(addr_str: &str, peers: &[&str], maybe_seed: Option<u128>) -> std::io::Result<()> {
         hook_fail_on_panic();
+        let mut base_rng = {
+            let seed : u128 = maybe_seed.unwrap_or_else(||{
+                let mut seed_rng = rand::rng();
+                ((seed_rng.next_u64() as u128) << 64) | seed_rng.next_u64() as u128
+            });
+            println!("{} running with seed {:x}", addr_str, seed);
+            SimRng::new(seed, 0)
+        };
+
 
         let sock = std::net::UdpSocket::bind(addr_str)?;
         sock.set_nonblocking(true)?;
@@ -112,14 +138,19 @@ mod tests {
             // let (len, addr) = match sock.try_recv_from(&mut buf)
             loop {
                 let (len, addr) = match sock.recv_from(&mut buf) {
-                    Ok(len_addr) => len_addr,
+                    Ok((len, addr)) => if should_fake_fail(&mut base_rng) {
+                        println!("{} fake dropped packet {}", addr_str, std::str::from_utf8(&buf[..len]).unwrap());
+                        continue;
+                    } else {
+                        (len, addr)
+                    },
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(e),
                 };
                 let found_peer: core::net::SocketAddr = std::str::from_utf8(&buf[..len]).unwrap().parse().unwrap();
                 // println!("{} received {} bytes from {:?}", addr_str, len, addr);
                 if !peer_addrs[1..].contains(&found_peer) {
-                    println!("{} given new peer {}", addr_str, found_peer);
+                    println!("{} given new peer {} from {}", addr_str, found_peer, addr);
                     peer_addrs.push(found_peer);
                 }
             }
@@ -147,7 +178,7 @@ mod tests {
     fn multi_rt() {
         fn init_on_addr(addr_str: &'static str, peers: &'static [&'static str]) -> tokio::task::JoinHandle<()> {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.spawn(async move { instance(addr_str, peers).await.expect("no errors") })
+            rt.spawn(async move { instance(addr_str, peers, None).await.expect("no errors") })
         }
 
         let joins = [
@@ -166,10 +197,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let _joins = [
-            rt.spawn(instance("127.0.0.1:18080", &[])),
-            rt.spawn(instance("127.0.0.1:18081", &["127.0.0.1:18080"])),
-            rt.spawn(instance("127.0.0.1:18082", &["127.0.0.1:18080"])),
-            rt.spawn(instance("127.0.0.1:18083", &["127.0.0.1:18080"])),
+            rt.spawn(instance("127.0.0.1:18080", &[], None)),
+            rt.spawn(instance("127.0.0.1:18081", &["127.0.0.1:18080"], None)),
+            rt.spawn(instance("127.0.0.1:18082", &["127.0.0.1:18080"], None)),
+            rt.spawn(instance("127.0.0.1:18083", &["127.0.0.1:18080"], None)),
         ];
 
         rt.block_on(std::future::pending::<()>())
