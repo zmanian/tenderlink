@@ -14,7 +14,8 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 mod tests {
     use super::*;
 
-    use rand::{SeedableRng, Rng, RngCore};
+    use rand::{SeedableRng, Rng, RngCore, CryptoRng};
+    use rand_chacha::ChaCha20Rng;
     use rand_pcg::Lcg128CmDxsm64 as SimRng;
 
     const FAKE_FAIL_RATIO: f64 = 0.1;
@@ -116,6 +117,15 @@ mod tests {
             SimRng::new(seed, 0)
         };
 
+        let (private_key, public_key) = {
+            let mut crypto_rng = ChaCha20Rng::seed_from_u64(base_rng.next_u64());
+            // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
+            let mut secret_key = [0u8; 32];
+            crypto_rng.fill_bytes(&mut secret_key);
+            let private_key = ed25519_zebra::SigningKey::from(secret_key);
+            let public_key = ed25519_zebra::VerificationKeyBytes::from(&private_key);
+            (private_key, public_key)
+        };
 
         let sock = std::net::UdpSocket::bind(addr_str)?;
         sock.set_nonblocking(true)?;
