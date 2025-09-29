@@ -1,5 +1,9 @@
 #![allow(dead_code)]
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(10);
+
+use snow::{HandshakeState, StatelessTransportState};
+use tokio::time::Instant;
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
+const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
 
 fn is_timeout(e: std::io::ErrorKind) -> bool{
     e == std::io::ErrorKind::WouldBlock || e == std::io::ErrorKind::TimedOut
@@ -12,16 +16,62 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 
 #[derive(Debug)]
 struct Peer {
-    addr: core::net::SocketAddr,
-    public_key: ed25519_zebra::VerificationKeyBytes,
-    handshake_state: Option<snow::HandshakeState>,
+    endpoint: SecureUdpEndpoint,
+    outgoing_handshake_state: Option<HandshakeState>,
+    pending_client_ack_transport_state: Option<StatelessTransportState>,
+    transport_state: Option<StatelessTransportState>,
+    watch_dog: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct StaticDHKeyPair {
+    private: [u8; 32],
+    public: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct SecureUdpEndpoint {
+    public_key: [u8; 32],
+    ip_address: [u8; 16],
+    port: u16,
+}
+
+impl std::fmt::Debug for StaticDHKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StaticDHKeyPair {{ private: \"")?;
+        for b in &self.private {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\", public: \"")?;
+        for b in &self.public {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\" }}")
+    }
+}
+
+impl std::fmt::Debug for SecureUdpEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecureUdpEndpoint {{ public_key: \"")?;
+        for b in &self.public_key {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\", ip_address: \"")?;
+        for b in &self.ip_address {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\", port: {}", self.port)?;
+        write!(f, " }}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
+
     use super::*;
 
-    use rand::{SeedableRng, Rng, RngCore, CryptoRng};
+    use rand::{SeedableRng, Rng, RngCore};
     use rand_chacha::ChaCha20Rng;
     use rand_pcg::Lcg128CmDxsm64 as SimRng;
 
@@ -113,14 +163,14 @@ mod tests {
         }))
     }
 
-    async fn instance(addr_str: &str, peers: &[&str], maybe_seed: Option<u128>) -> std::io::Result<()> {
+    async fn instance(my_static_keypair: StaticDHKeyPair, my_endpoint: SecureUdpEndpoint, roster_endpoints: Vec<SecureUdpEndpoint>, maybe_seed: Option<u128>) -> std::io::Result<()> {
         hook_fail_on_panic();
         let mut base_rng = {
             let seed : u128 = maybe_seed.unwrap_or_else(||{
                 let mut seed_rng = rand::rng();
                 ((seed_rng.next_u64() as u128) << 64) | seed_rng.next_u64() as u128
             });
-            println!("{} running with seed {:x}", addr_str, seed);
+            println!("{:?} running with seed {:x}", my_endpoint, seed);
             SimRng::new(seed, 0)
         };
 
@@ -134,103 +184,208 @@ mod tests {
             (private_key, public_key)
         };
 
-        let sock = std::net::UdpSocket::bind(addr_str)?;
-        sock.set_nonblocking(true)?;
+        let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(my_endpoint.ip_address), my_endpoint.port, 0, 0))).await.unwrap();
 
-        let mut peer_addrs: Vec<Peer> = Vec::with_capacity(peers.len()+1);
+        let mut peers : Vec<Peer> = roster_endpoints.iter().filter(|e| e.public_key != my_endpoint.public_key).map(|e| {
+            Peer { endpoint: e.clone(), outgoing_handshake_state: None, pending_client_ack_transport_state: None, transport_state: None, watch_dog: Instant::now(), }
+        }).collect();
 
-        let me = Peer {
-            addr: addr_str.parse().unwrap(),
-            public_key,
-            handshake_state: None,
-        };
-        // let my_addr: core::net::SocketAddr = addr_str.parse().unwrap();
-        peer_addrs.push(me);
+        println!("{:?} started with sock: {:?}, peers: {:?}", my_endpoint, sock, peers);
 
-        for peer in peers {
-            peer_addrs.push(Peer {
-                addr: peer.parse().unwrap(),
-                public_key: [0u8; 32].into(), // TODO
-                handshake_state: None,
-            });
-        }
-        println!("{} started with sock: {:?}, peers: {:?}", addr_str, sock, peer_addrs);
+        // Wait for others to start for testing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let mut buf = [0; 1024];
+        let mut recv_buf1 = [0; 2048];
+        let mut recv_buf2 = [0; 2048];
+        let mut send_buf1 = [0; 2048];
+        let mut send_buf2 = [0; 2048];
         let mut next_tick_time = tokio::time::Instant::now();
         loop {
-            tokio::time::sleep_until(next_tick_time).await; // ALT: tokio::time::interval Burst/Skip
-            next_tick_time += TICK_DURATION;
+            let was_now = tokio::time::Instant::now();
+            if was_now > next_tick_time {
+                loop {
+                    // TICK CODE
+                    for peer in &mut peers {
+                        if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
+                            peer.outgoing_handshake_state = None;
+                            peer.pending_client_ack_transport_state = None;
+                            peer.transport_state = None;
+                            peer.watch_dog = Instant::now();
+                        }
 
-            loop {
-                let (len, addr) = match sock.recv_from(&mut buf) {
-                    Ok((len, addr)) => if should_fake_fail(&mut base_rng) {
-                        println!("{} fake dropped packet {}", addr_str, std::str::from_utf8(&buf[..len]).unwrap());
-                        continue;
-                    } else {
-                        (len, addr)
-                    },
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
-                };
-                let found_peer: core::net::SocketAddr = std::str::from_utf8(&buf[..len]).unwrap().parse().unwrap();
-                // println!("{} received {} bytes from {:?}", addr_str, len, addr);
-                if !peer_addrs[1..].iter().any(|peer| peer.addr == found_peer) {
-                    println!("{} given new peer {} from {}", addr_str, found_peer, addr);
-                    peer_addrs.push(Peer {
-                        addr: found_peer,
-                        public_key: [0u8; 32].into(), // TODO
-                        handshake_state: None,
-                    });
-                }
-            }
-
-            println!("{} peers: {:?}", addr_str, peer_addrs);
-
-            for dst_peer in &peer_addrs[1..] { // don't  send to ourselves
-                for known_peer in &peer_addrs {
-                    if dst_peer.addr != known_peer.addr {
-                        println!("{} sending {:?} to {:?}", addr_str, known_peer.addr, dst_peer.addr);
-                        let len = match sock.send_to(known_peer.addr.to_string().as_bytes(), dst_peer.addr) {
-                            Ok(len) => len,
-                            Err(ref e) if is_timeout(e.kind()) => continue,
-                            Err(e) => return Err(e),
-                        };
-                        // println!("{} sent {:?} bytes to {:?}", addr_str, len, dst_peer.addr);
+                        if let Some(transport) = &mut peer.transport_state {
+                            // NONCE SHOULD NOT BE ZERO
+                            let length = transport.write_message(0, b"BEAT", &mut send_buf2).unwrap();
+                            match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer.endpoint.ip_address), peer.endpoint.port, 0, 0))) {
+                                Ok(_) => (),
+                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                Err(error) => println!("Socket error: {:?}", error),
+                            }
+                        }
                     }
+                    for peer in &mut peers {
+                        if peer.transport_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_transport_state.is_none() {
+                            let mut outgoing_state = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+                                .local_private_key(&my_static_keypair.private).unwrap()
+                                .remote_public_key(&peer.endpoint.public_key).unwrap()
+                                .build_initiator().unwrap();
+                            let length = outgoing_state.write_message(b"CLIENT HELLO", &mut send_buf2).unwrap();
+                            match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer.endpoint.ip_address), peer.endpoint.port, 0, 0))) {
+                                Ok(_) => (),
+                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                Err(error) => println!("Socket error: {:?}", error),
+                            }
+                            peer.outgoing_handshake_state = Some(outgoing_state);
+                        }
+                    }
+                    break;
+                }
+                let now_now = tokio::time::Instant::now();
+                if now_now - next_tick_time > TICK_DURATION {
+                    next_tick_time = now_now + TICK_DURATION;
+                } else {
+                    next_tick_time += TICK_DURATION;
                 }
             }
+
+            let remaining = next_tick_time.saturating_duration_since(was_now);
+            let (length, addr) = match tokio::time::timeout(remaining, sock.recv_from(&mut recv_buf1)).await {
+                Err(_elapsed) => continue, // timeout
+                Ok(Err(error)) => { println!("Socket error: {:?}", error); continue; },
+                Ok(Ok(ret)) => if should_fake_fail(&mut base_rng) { continue; } else { ret },
+            };
+            let raw_msg = &recv_buf1[0..length];
+
+            let from_ip = match addr {
+                SocketAddr::V4(v4) => v4.ip().to_ipv6_mapped().octets(),
+                SocketAddr::V6(v6) => v6.ip().octets(),
+            };
+            let from_port = addr.port();
+
+            // DECRYPT
+            let mut msg = None;
+            if let Some(i) = peers.iter().position(|p| p.endpoint.ip_address == from_ip && p.endpoint.port == from_port) {
+                loop {
+                    let peer = &mut peers[i];
+                    if let Some(transport) = &mut peer.transport_state {
+                        // NONCE SHOULD NOT BE ZERO
+                        if let Ok(length) = transport.read_message(0, raw_msg, &mut recv_buf2) {
+                            msg = Some(&recv_buf2[0..length]);
+                            peer.watch_dog = Instant::now(); // TODO reset on acknowledged heartbeat
+                            break;
+                        }
+                    }
+                    if let Some(outgoing) = &mut peer.outgoing_handshake_state {
+                        if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
+                            let local_msg = &recv_buf2[0..length];
+                            if local_msg == b"SERVER HELLO" {
+                                // TODO hash
+                                if peer.pending_client_ack_transport_state.is_none() || my_endpoint.port > peer.endpoint.port {
+                                    if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
+                                        println!("{}: Finished outgoing handshake with {}", my_endpoint.port, addr);
+
+                                        // NONCE SHOULD NOT BE ZERO
+                                        let length = transport.write_message(0, b"CLIENT ACK", &mut send_buf2).unwrap();
+                                        match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer.endpoint.ip_address), peer.endpoint.port, 0, 0))) {
+                                            Ok(_) => (),
+                                            Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                            Err(error) => println!("Socket error: {:?}", error),
+                                        }
+                                        
+                                        peer.transport_state = Some(transport);
+                                        peer.outgoing_handshake_state = None;
+                                        peer.pending_client_ack_transport_state = None;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(incoming) = &mut peer.pending_client_ack_transport_state {
+                        // NONCE SHOULD NOT BE ZERO
+                        if let Ok(length) = incoming.read_message(0, raw_msg, &mut recv_buf2) {
+                            let local_msg = &recv_buf2[0..length];
+                            if local_msg == b"CLIENT ACK" {
+                                println!("{}: Finished incoming handshake with {}", my_endpoint.port, addr);
+                                peer.transport_state = peer.pending_client_ack_transport_state.take();
+                                peer.outgoing_handshake_state = None;
+                                break;
+                            }
+                        }
+                    }
+                    let mut incoming_state = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+                        .local_private_key(&my_static_keypair.private).unwrap()
+                        .build_responder().unwrap();
+                    if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
+                        let local_msg = &recv_buf2[0..length];
+                        if local_msg == b"CLIENT HELLO" {
+                            // TODO hash
+                            if peer.outgoing_handshake_state.is_none() || my_endpoint.port <= peer.endpoint.port {
+                                let length = incoming_state.write_message(b"SERVER HELLO", &mut send_buf2).unwrap();
+                                match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer.endpoint.ip_address), peer.endpoint.port, 0, 0))) {
+                                    Ok(_) => (),
+                                    Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                    Err(error) => println!("Socket error: {:?}", error),
+                                }
+                                if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
+                                    peer.pending_client_ack_transport_state = Some(transport);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            } else {
+                println!("UNKNOWN PEER CONNECTED. NOT IMPLEMENTED YET.");
+                continue;
+            }
+            if msg.is_none() { continue; }
+            let msg = msg.unwrap();
+
+            // HANDLE UDP PACKET
+            println!("{}: Got '{:?}' from {}", my_endpoint.port, msg, addr);
         }
     }
 
-    #[ignore]
-    #[test]
-    fn multi_rt() {
-        fn init_on_addr(addr_str: &'static str, peers: &'static [&'static str]) -> tokio::task::JoinHandle<()> {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.spawn(async move { instance(addr_str, peers, None).await.expect("no errors") })
-        }
+    // #[ignore]
+    // #[test]
+    // fn multi_rt() {
+    //     fn init_on_addr(addr_str: &'static str, peers: &'static [&'static str]) -> tokio::task::JoinHandle<()> {
+    //         let rt = tokio::runtime::Runtime::new().unwrap();
+    //         rt.spawn(async move { instance(addr_str, peers, None).await.expect("no errors") })
+    //     }
 
-        let joins = [
-            init_on_addr("127.0.0.1:18080", &[]),
-            init_on_addr("127.0.0.1:18081", &["127.0.0.1:18080"]),
-            init_on_addr("127.0.0.1:18082", &["127.0.0.1:18080"]),
-            init_on_addr("127.0.0.1:18083", &["127.0.0.1:18080"]),
-        ];
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
+    //     let joins = [
+    //         init_on_addr("127.0.0.1:18080", &[]),
+    //         init_on_addr("127.0.0.1:18081", &["127.0.0.1:18080"]),
+    //         init_on_addr("127.0.0.1:18082", &["127.0.0.1:18080"]),
+    //         init_on_addr("127.0.0.1:18083", &["127.0.0.1:18080"]),
+    //     ];
+    //     loop {
+    //         std::thread::sleep(std::time::Duration::from_secs(1));
+    //     }
+    // }
 
     #[test]
     fn single_rt() {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
+        let static_keypairs : Vec<StaticDHKeyPair> = (0..4).map(|_| {
+            let kp = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).generate_keypair().unwrap();
+            StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
+        }).collect();
+        let endpoints : Vec<SecureUdpEndpoint> = static_keypairs.iter().enumerate().map(|(i, skp)| {
+            let ip = "127.0.0.1".parse::<Ipv4Addr>().unwrap().to_ipv6_mapped();
+            let port : u16 = 18080 + i as u16;
+            SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: skp.public }
+        }).collect();
+
         let _joins = [
-            rt.spawn(instance("127.0.0.1:18080", &[], None)),
-            rt.spawn(instance("127.0.0.1:18081", &["127.0.0.1:18080"], None)),
-            rt.spawn(instance("127.0.0.1:18082", &["127.0.0.1:18080"], None)),
-            rt.spawn(instance("127.0.0.1:18083", &["127.0.0.1:18080"], None)),
+            rt.spawn(instance(static_keypairs[0], endpoints[0], endpoints.clone(), None)),
+            rt.spawn(instance(static_keypairs[1], endpoints[1], endpoints.clone(), None)),
+            rt.spawn(instance(static_keypairs[2], endpoints[2], endpoints.clone(), None)),
+            rt.spawn(instance(static_keypairs[3], endpoints[3], endpoints.clone(), None)),
         ];
 
         rt.block_on(std::future::pending::<()>())
