@@ -50,6 +50,8 @@ struct Peer {
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
     on_send_next_nonce: u64,
+
+    connection_is_unknown: bool,
 }
 impl Default for Peer {
     fn default() -> Peer {
@@ -64,6 +66,8 @@ impl Default for Peer {
             nonce_ack_latest: 0,
             nonce_ack_field: 0,
             on_send_next_nonce: 0,
+
+            connection_is_unknown: false,
         }
     }
 }
@@ -215,6 +219,12 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         if was_now > next_tick_time {
             loop {
                 // TICK CODE
+                unknown_peers.retain(|peer| {
+                    if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
+                        println!("{}: Disconnected from unknown peer {:?}", my_port, peer.endpoint);
+                        false
+                    } else { true }
+                });
                 for peer in &mut peers {
                     if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
                         if peer.transport_state.is_some() {
@@ -283,8 +293,12 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
         // DECRYPT
         let mut peer_index = 0;
+        let mut peer_is_unknown = false;
         let mut nonce = 0;
         let mut msg = None;
+
+        //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
+        //      the unknown connections array since that also shouldn't be able to be blocked.
         if let Some(i) = peers.iter().map(|p| p.endpoint.unwrap_or_default()).position(|endpoint| endpoint.ip_address == from_ip && endpoint.port == from_port) {
             let peer_endpoint = peers[i].endpoint.unwrap();
             loop {
@@ -329,10 +343,38 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         peer.pending_client_ack_transport_state = None;
                                         peer.nonce_ack_latest = nonce;
                                         peer.nonce_ack_field = !0;
+                                        peer.connection_is_unknown = false;
                                         peer.on_send_next_nonce = start_nonce + 1;
                                     }
                                     break;
                                 }
+                            }
+                            if local_msg.len() == b"SERVER UNKNOWN HELLO".len() + 18 && &local_msg[0..b"SERVER UNKNOWN HELLO".len()] == b"SERVER UNKNOWN HELLO" {
+                                let other_side_ip = &local_msg[b"SERVER UNKNOWN HELLO".len()..b"SERVER UNKNOWN HELLO".len()+16];
+                                let other_side_port = &local_msg[b"SERVER UNKNOWN HELLO".len()+16..b"SERVER UNKNOWN HELLO".len()+18];
+                                let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
+                                // TODO hash
+                                if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
+                                    println!("{}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
+
+                                    let start_nonce  = rand::random::<u64>() >> 1;
+                                    let length = transport.write_message(start_nonce, b"CLIENT UNKNOWN ACK", &mut send_buf2[8..]).unwrap();
+                                    send_buf2[0..8].copy_from_slice(&start_nonce.to_le_bytes());
+                                    match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
+                                        Ok(_) => (),
+                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                        Err(error) => println!("Socket error: {:?}", error),
+                                    }
+                                    
+                                    peer.transport_state = Some(transport);
+                                    peer.outgoing_handshake_state = None;
+                                    peer.pending_client_ack_transport_state = None;
+                                    peer.nonce_ack_latest = nonce;
+                                    peer.nonce_ack_field = !0;
+                                    peer.connection_is_unknown = true;
+                                    peer.on_send_next_nonce = start_nonce + 1;
+                                }
+                                break;
                             }
                         }
                     }
@@ -347,6 +389,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             peer.outgoing_handshake_state = None;
                             peer.nonce_ack_latest = nonce;
                             peer.nonce_ack_field = !0;
+                            peer.connection_is_unknown = false;
                             break;
                         }
                     }
@@ -383,6 +426,34 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             }
         } else {
             loop {
+                if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.ip_address == from_ip && p.endpoint.port == from_port) {
+                    let peer = &mut unknown_peers[i];
+                    nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
+                    if let Ok(length) = peer.transport_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
+                        let local_msg = &recv_buf2[0..length];
+                        if peer.pending_client_ack {
+                            if local_msg == b"CLIENT UNKNOWN ACK" {
+                                println!("{}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
+                                peer.pending_client_ack = false;
+                                peer.nonce_ack_latest = nonce;
+                                peer.nonce_ack_field = !0;
+                                break;
+                            }
+                            break;
+                        }
+                        let mut reject = false;
+                        if nonce > peer.nonce_ack_latest && nonce > peer.nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { reject = true; }
+                        if nonce == peer.nonce_ack_latest { reject = true; }
+                        if nonce + 64 < peer.nonce_ack_latest { reject = true; }
+                        if nonce < peer.nonce_ack_latest && 1_u64 << (peer.nonce_ack_latest - nonce) & peer.nonce_ack_field != 0 { reject = true; }
+                        if reject == false {
+                            msg = Some(&recv_buf2[0..length]);
+                            peer_index = i;
+                            peer_is_unknown = true;
+                        }
+                        break;
+                    }
+                }
                 let mut incoming_state = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
@@ -392,11 +463,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
                         
-                        let hello_bytes = b"SERVER HELLO";
+                        let hello_bytes = b"SERVER UNKNOWN HELLO";
                         let start_nonce  = rand::random::<u64>() >> 1;
                         send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
                         send_buf1[8..8+hello_bytes.len()].copy_from_slice(hello_bytes);
-                        let length = incoming_state.write_message(&send_buf1[0..8+hello_bytes.len()], &mut send_buf2).unwrap();
+                        send_buf1[8+hello_bytes.len()..8+hello_bytes.len()+16].copy_from_slice(&from_ip);
+                        send_buf1[8+hello_bytes.len()+16..8+hello_bytes.len()+16+2].copy_from_slice(&from_port.to_le_bytes());
+                        let length = incoming_state.write_message(&send_buf1[0..8+hello_bytes.len()+16+2], &mut send_buf2).unwrap();
                         match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(client_endpoint.ip_address), client_endpoint.port, 0, 0))) {
                             Ok(_) => (),
                             Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
@@ -408,35 +481,41 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         break;
                     }
                 }
-                println!("UNKNOWN PEER PACKET. NOT IMPLEMENTED YET.");
                 break;
             }
-            continue;
         }
         if msg.is_none() { continue; }
         let msg = msg.unwrap();
 
-        let peer = &mut peers[peer_index];
-        peer.watch_dog = Instant::now();
+        if peer_is_unknown {
+            let peer = &mut unknown_peers[peer_index];
+            peer.watch_dog = Instant::now();
 
-        // Update nonce tracking
-        if nonce > peer.nonce_ack_latest {
-            peer.nonce_ack_latest += 1;
-            peer.nonce_ack_field <<= 1;
-            peer.nonce_ack_field |= 1;
-            let shift_amount = nonce - peer.nonce_ack_latest;
-            if shift_amount >= 64 {
-                peer.nonce_ack_field = 0;
-            } else if shift_amount != 0 {
-                peer.nonce_ack_field <<= shift_amount;
-                peer.nonce_ack_latest = nonce;
-            }
-        } else {
-            peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
+            println!("{}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
         }
-
-        // HANDLE UDP PACKET
-        //println!("{}: field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+        else {
+            let peer = &mut peers[peer_index];
+            peer.watch_dog = Instant::now();
+    
+            // Update nonce tracking
+            if nonce > peer.nonce_ack_latest {
+                peer.nonce_ack_latest += 1;
+                peer.nonce_ack_field <<= 1;
+                peer.nonce_ack_field |= 1;
+                let shift_amount = nonce - peer.nonce_ack_latest;
+                if shift_amount >= 64 {
+                    peer.nonce_ack_field = 0;
+                } else if shift_amount != 0 {
+                    peer.nonce_ack_field <<= shift_amount;
+                    peer.nonce_ack_latest = nonce;
+                }
+            } else {
+                peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
+            }
+    
+            // HANDLE UDP PACKET
+            //println!("{}: field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+        }
     }
 }
 
