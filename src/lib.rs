@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 
-use std::{io::{Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
+use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{seq::IndexedRandom, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
 use snow::{HandshakeState, StatelessTransportState};
@@ -90,7 +90,7 @@ struct StaticDHKeyPair {
     public: [u8; 32],
 }
 
-#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 struct SecureUdpEndpoint {
     public_key: [u8; 32],
     ip_address: [u8; 16],
@@ -118,7 +118,7 @@ impl SecureUdpEndpoint {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct EndpointEvidence {
     endpoint: SecureUdpEndpoint,
     root_public_key: [u8; 32],
@@ -172,7 +172,7 @@ impl std::fmt::Debug for SecureUdpEndpoint {
     }
 }
 
-async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<[u8; 32]>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
+async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<[u8; 32]>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(||{
@@ -197,12 +197,20 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         p
     }).collect();
     
-    for evidence in roster_endpoint_evidence {
+    for evidence in &roster_endpoint_evidence {
         if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
             peers[i].endpoint = Some(evidence.endpoint);
         }
     }
     println!("socket port={}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
+
+    let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {
+        Some(roster_endpoint_evidence[i])
+    } else {
+        if let Some(endpoint) = my_endpoint {
+            Some(EndpointEvidence { endpoint: endpoint, root_public_key: my_root_public_key.into() })
+        } else { None }
+    };
 
     // Wait for others to start for testing.
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -238,13 +246,32 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                     if let Some(peer_endpoint) = peer.endpoint {
                         if let Some(transport) = &mut peer.transport_state {
-                            let length = transport.write_message(peer.on_send_next_nonce, b"BEAT", &mut send_buf2[8..]).unwrap();
-                            send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
-                            peer.on_send_next_nonce += 1;
-                            match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                Ok(_) => (),
-                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                Err(error) => println!("Socket error: {:?}", error),
+                            if peer.connection_is_unknown {
+                                // Gossip evidence in order to trigger upgrade
+                                if let Some(evidence) = my_endpoint_evidence {
+                                    let mut c = Cursor::new(&mut send_buf1[..]);
+                                    c.write_all(b"ENDPOINT EVIDENCE").unwrap();
+                                    evidence.write_to(&mut c).unwrap();
+                                    let len1 = c.position() as usize;
+                                    let length = transport.write_message(peer.on_send_next_nonce, &send_buf1[..len1], &mut send_buf2[8..]).unwrap();
+                                    send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
+                                    peer.on_send_next_nonce += 1;
+                                    match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
+                                        Ok(_) => (),
+                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                        Err(error) => println!("Socket error: {:?}", error),
+                                    }
+                                }
+                            }
+                            else {
+                                let length = transport.write_message(peer.on_send_next_nonce, b"BEAT", &mut send_buf2[8..]).unwrap();
+                                send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
+                                peer.on_send_next_nonce += 1;
+                                match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
+                                    Ok(_) => (),
+                                    Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                    Err(error) => println!("Socket error: {:?}", error),
+                                }
                             }
                         }
                     }
@@ -263,6 +290,23 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 Err(error) => println!("Socket error: {:?}", error),
                             }
                             peer.outgoing_handshake_state = Some(outgoing_state);
+                        }
+
+                        if let Some(transport) = &mut peer.transport_state {
+                            if let Some(evidence) = roster_endpoint_evidence.choose(&mut base_rng) {
+                                let mut c = Cursor::new(&mut send_buf1[..]);
+                                c.write_all(b"ENDPOINT EVIDENCE").unwrap();
+                                evidence.write_to(&mut c).unwrap();
+                                let len1 = c.position() as usize;
+                                let length = transport.write_message(peer.on_send_next_nonce, &send_buf1[..len1], &mut send_buf2[8..]).unwrap();
+                                send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
+                                peer.on_send_next_nonce += 1;
+                                match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
+                                    Ok(_) => (),
+                                    Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                    Err(error) => println!("Socket error: {:?}", error),
+                                }
+                            }
                         }
                     }
                 }
@@ -356,6 +400,12 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 // TODO hash
                                 if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                     println!("{}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
+
+                                    if my_endpoint_evidence.is_none() {
+                                        let evidence = EndpointEvidence { endpoint: other_side_endpoint, root_public_key: my_root_public_key.into() };
+                                        println!("{}: I am locking in the endpoint evidence {:?}", my_port, evidence);
+                                        my_endpoint_evidence = Some(evidence);
+                                    }
 
                                     let start_nonce  = rand::random::<u64>() >> 1;
                                     let length = transport.write_message(start_nonce, b"CLIENT UNKNOWN ACK", &mut send_buf2[8..]).unwrap();
@@ -491,7 +541,46 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             let peer = &mut unknown_peers[peer_index];
             peer.watch_dog = Instant::now();
 
-            println!("{}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+            // Update nonce tracking
+            if nonce > peer.nonce_ack_latest {
+                peer.nonce_ack_latest += 1;
+                peer.nonce_ack_field <<= 1;
+                peer.nonce_ack_field |= 1;
+                let shift_amount = nonce - peer.nonce_ack_latest;
+                if shift_amount >= 64 {
+                    peer.nonce_ack_field = 0;
+                } else if shift_amount != 0 {
+                    peer.nonce_ack_field <<= shift_amount;
+                    peer.nonce_ack_latest = nonce;
+                }
+            } else {
+                peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
+            }
+
+            if &msg[0..b"ENDPOINT EVIDENCE".len()] == b"ENDPOINT EVIDENCE" {
+                let evidence = EndpointEvidence::read_from(&msg[b"ENDPOINT EVIDENCE".len()..]).unwrap();
+
+                if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
+                    peers[i].endpoint = Some(evidence.endpoint);
+                    if peer.endpoint == evidence.endpoint {
+                        println!("{}: Promoting unknown peer connection {:?}", my_port, peer.endpoint);
+                        let peer = unknown_peers.remove(peer_index);
+                        peers[i].outgoing_handshake_state = None;
+                        peers[i].pending_client_ack_transport_state = None;
+                        peers[i].transport_state = Some(peer.transport_state);
+                        peers[i].watch_dog = Instant::now();
+                        peers[i].nonce_ack_latest = peer.nonce_ack_latest;
+                        peers[i].nonce_ack_field = peer.nonce_ack_field;
+                        peers[i].on_send_next_nonce = peer.on_send_next_nonce;
+                        peers[i].connection_is_unknown = false;
+                    }
+                    roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
+                    roster_endpoint_evidence.push(evidence);
+                }
+                continue;
+            } else {
+                println!("{}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+            }
         }
         else {
             let peer = &mut peers[peer_index];
@@ -512,15 +601,35 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             } else {
                 peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
             }
+
+            if peer.connection_is_unknown {
+                if msg == b"BEAT" {
+                    println!("{}: Got a heartbeat, this means that the other side does not consider me unknown anymore!", my_port);
+                    peer.connection_is_unknown = false;
+                    continue;
+                }
+            }
     
-            // HANDLE UDP PACKET
-            //println!("{}: field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+            if msg.len() >= b"ENDPOINT EVIDENCE".len() && &msg[0..b"ENDPOINT EVIDENCE".len()] == b"ENDPOINT EVIDENCE" {
+                let evidence = EndpointEvidence::read_from(&msg[b"ENDPOINT EVIDENCE".len()..]).unwrap();
+
+                if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
+                    peers[i].endpoint = Some(evidence.endpoint);
+                    roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
+                    roster_endpoint_evidence.push(evidence);
+                }
+                continue;
+            } else {
+                // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+                continue;
+            }
         }
     }
 }
 
 const PACKET_TYPE_HEARTBEAT : u8 = 0;
 
+// Note(Sam): Heart beat should be different by connection type or contain information regarding the connection type.
 struct PacketHeartbeat {
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
