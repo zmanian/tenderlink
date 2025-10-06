@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#![allow(unused_parens)]
+#![allow(clippy::never_loop)]
 
 
 use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
@@ -32,6 +34,577 @@ fn should_fake_fail(rng: &mut SimRng) -> bool {
 
 fn is_timeout(e: std::io::ErrorKind) -> bool{
     e == std::io::ErrorKind::WouldBlock || e == std::io::ErrorKind::TimedOut
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum TMStep {
+    Propose,
+    Prevote,
+    // ALT: extra sign step
+    Precommit,
+}
+
+struct TMDecision {
+    value: BlockValue,
+    //signatures: Vec<TMSig>, // ability to prove to others e.g. those catching up
+}
+
+
+struct TMVote {
+    approve: bool,
+    todo_sign_bytes: [u8; 96],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct BlockValue([u8; 6000]);
+impl BlockValue {
+    fn is_valid(&self) -> TMStatus {
+        // TODO
+        TMStatus::Pass
+    }
+}
+
+fn get_bft_value() -> BlockValue {
+    // TODO: sim/get from PoW
+    BlockValue([0; 6000])
+}
+
+
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TMStatus {
+    Indeterminate,
+    Pass, // 2f+1 yes
+    Fail, // f+1 no
+}
+
+struct TMParams {
+    propose_timeout: std::time::Duration,
+    prevote_timeout: std::time::Duration,
+    precommit_timeout: std::time::Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ValueId([u8; 32]);
+impl ValueId {
+    const NIL: Self = Self([0; 32]);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PubKeyID([u8; 32]);
+impl PubKeyID {
+    const NIL: Self = Self([0; 32]);
+}
+impl std::fmt::Display for PubKeyID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TMSig ([u8; 64]);
+impl TMSig {
+    const NIL: Self = Self([0; 64]);
+}
+
+struct RoundData {
+    height: u64,
+    round: u32,
+    // parallel with sorted roster arrays
+    // TODO: keep parallel with each other, but be sparse in members
+    proposal: BlockValue,
+    proposal_valid_round: i64,
+    proposal_sig: TMSig,
+    proposal_id: ValueId,
+    proposal_checked_validity: TMStatus,
+
+    msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
+
+    anys_n: usize,
+    prevotes_n: usize,
+    precommits_n: usize,
+    valid_prevotes_n: usize,
+    valid_precommits_n: usize,
+    nil_prevotes_n: usize,
+    // TODO: can probably do this from whether *our* node has a valid value
+    // TODO: by round or for whole state?
+    timeout_triggered: [bool; 2],
+}
+impl RoundData {
+    const EMPTY: RoundData = RoundData{
+        height: 0,
+        round: 0,
+        proposal: BlockValue([0; 6000]),
+        proposal_valid_round: -1,
+        proposal_sig: TMSig([0; 64]),
+        proposal_id: ValueId::NIL,
+        proposal_checked_validity: TMStatus::Indeterminate,
+        // TODO: probably put both step messages next to each other
+        msg_val_sigs: Vec::new(),
+        valid_prevotes_n: 0,
+        valid_precommits_n: 0,
+        nil_prevotes_n: 0,
+        prevotes_n: 0,
+        precommits_n: 0,
+        anys_n: 0,
+
+        timeout_triggered: [false;2],
+    };
+
+    // auto-caching
+    fn proposal_is_valid(&mut self) -> TMStatus {
+        if (self.proposal_checked_validity == TMStatus::Indeterminate &&
+            self.proposal_sig != TMSig::NIL) {
+            self.proposal_checked_validity = self.proposal.is_valid();
+        }
+        self.proposal_checked_validity
+    }
+}
+
+enum TMMsgData {
+    Proposal(BlockValue, i64),
+    Prevote(ValueId),
+    Precommit(ValueId),
+}
+struct TMMsg {
+    height: u64,
+    round: u32,
+    data: TMMsgData, // ALT: byteslice + step distinguisher
+    sig: TMSig,
+}
+
+fn roster_i_from_pub_key(_pub_key: PubKeyID) -> usize {
+    0
+}
+
+struct TMState {
+    roster_n: usize,
+    my_pub_key: PubKeyID,
+    round: u32,
+    step: TMStep,
+    /// basically the chain of agreed blocks
+    decisions: Vec<TMDecision>, // TODO: rearchitect
+    /// most recent "possible decision value" - successful proposal + prevote
+    /// when valid_value was updated
+    valid_value_round: (Option<BlockValue>, i64), // TODO
+    /// last value sent for precommit // TODO: non-nil only?
+    /// last round on which a *non-nil* value was sent
+    locked_value_round: (Option<BlockValue>, i64), // TODO
+
+    // active_proposer_pub_key: [u8; 32],
+    // active_proposal_value_round: (Option<BlockValue>, i64),
+    /// parallel to roster
+    votes: Vec<TMVote>,
+
+    /// treat all processing things as happening at the same time (?)
+    now: std::time::Instant,
+    timeout_start_height: u64,
+    timeout_start_round: u32,
+    timeout_step: TMStep,
+    next_timeout: Option<std::time::Instant>,
+
+    rounds_data: Vec<RoundData>,
+}
+impl TMState {
+    const PARAMS: TMParams = TMParams {
+        propose_timeout: std::time::Duration::from_secs(5),
+        prevote_timeout: std::time::Duration::from_secs(5),
+        precommit_timeout: std::time::Duration::from_secs(5),
+    };
+
+    fn init(my_pub_key: PubKeyID) -> Self {
+        Self {
+            roster_n: 0,
+            my_pub_key,
+            round: 0,
+            step: TMStep::Propose,
+            decisions: Vec::new(), // simple approach: 1 per height
+            valid_value_round: (None, -1), // TODO: is this actually protocol-relevant or just a cache?
+            locked_value_round: (None, -1),
+
+            // active_proposal_value_round: (None, -1),
+            // active_proposer_pub_key: PubKeyID::NIL,
+            votes: Vec::new(),
+
+            now: std::time::Instant::now(),
+            timeout_start_height: 0,
+            timeout_start_round: 0,
+            timeout_step: TMStep::Propose,
+            next_timeout: None,
+
+            rounds_data: Vec::new(),
+        }
+    }
+
+    fn height(&self) -> u64 {
+        self.decisions.len() as u64
+    }
+
+    fn schedule_timeout(&mut self, step: TMStep) {
+        let timeout = match step {
+            TMStep::Propose => Self::PARAMS.propose_timeout,
+            TMStep::Prevote => Self::PARAMS.prevote_timeout,
+            TMStep::Precommit => Self::PARAMS.precommit_timeout,
+        };
+
+        self.next_timeout = Some(self.now + timeout);
+        self.timeout_start_height = self.height();
+        self.timeout_start_round  = self.round;
+        self.timeout_step         = step;
+    }
+
+
+    fn broadcast(&self, step: TMStep, msg: TMMsgData) -> TMStep {
+        self.height();
+        self.round;
+        msg;
+        // TODO: sign msg data
+        // TODO: can we get away with not signing the step or separately signing the step?
+        let _sig = [1; 64];
+        // TODO: send to self
+        // TODO: send to (some) others
+        todo!();
+        step
+    }
+
+    fn proposer_from_height_round(height: u64, round: u32) -> PubKeyID {
+        // TODO: deterministic weighted round robin (hash & mod total zec on cumulative list)
+        let mut res = PubKeyID([0; 32]);
+        res.0[0] = height as u8;
+        res.0[1] = round as u8;
+        res
+    }
+
+    fn start_round(&mut self, round: u32) {
+        self.round = round;
+        // self.active_proposal_value_round = (None, -1);
+
+        if Self::proposer_from_height_round(self.height(), round) == self.my_pub_key {
+            let proposal = if let Some(valid_value) = self.valid_value_round.0 {
+                valid_value
+            } else {
+                get_bft_value()
+            };
+
+            // TODO: simple approach: send proposal messages to self when broadcasting
+            // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
+            self.step = self.broadcast(TMStep::Propose, TMMsgData::Proposal(proposal, self.valid_value_round.1));
+        } else {
+            self.schedule_timeout(TMStep::Propose);
+            self.step = TMStep::Propose;
+        }
+    }
+
+    fn id_from_value(proposal: BlockValue) -> ValueId {
+        // TODO: secure hash
+        ValueId([proposal.0[0] | 1; 32]) // non-nil
+    }
+
+    fn f_from_n(n: u64) -> u64 {
+        (n - 1) / 3
+    }
+
+    fn check_and_incorporate_msg(&mut self, from_pub_key: PubKeyID, height: u64, round: u32, data: TMMsgData, sig: TMSig) -> TMStatus {
+        let is_an_invalid_signature = false; // TODO
+        if is_an_invalid_signature { return TMStatus::Fail; }
+
+        let is_signed_by_non_roster_member = false; // TODO (account for roster at round)
+        if is_signed_by_non_roster_member { return TMStatus::Fail; }
+
+        // TODO: potentially track < self.height()
+        if height != self.height() { return TMStatus::Fail; } // may be valid later if we're catching up
+
+        let roster_i = roster_i_from_pub_key(from_pub_key);
+
+        // TODO: other checks
+        // - data size check if we're doing network stuff
+
+        let (is_prev_seen_round, round_i) = match self.rounds_data.binary_search_by_key(&(height, round), |el| (el.height, el.round)) {
+            Ok(round_i)  => (true,  round_i),
+            Err(round_i) => (false, round_i),
+        };
+
+        let status = match data {
+            TMMsgData::Proposal(value, _valid_round) => {
+                let expected_proposer_pub_key = Self::proposer_from_height_round(height, round);
+                if from_pub_key != expected_proposer_pub_key {
+                    eprintln!("BFT at {}.{}: received proposal from non-proposer expected {} ({}), received from {}. Ignoring latest...", height, round, roster_i, expected_proposer_pub_key, from_pub_key);
+                    return TMStatus::Fail;
+                }
+
+                if (is_prev_seen_round &&
+                    self.rounds_data[round_i].proposal_sig != TMSig::NIL &&
+                    self.rounds_data[round_i].proposal_id  != Self::id_from_value(value))
+                {
+                    eprintln!("BFT at {}.{}: proposer {} proposed 2 different values. Ignoring latest...", height, round, roster_i);
+                    return TMStatus::Fail;
+                }
+
+                TMStatus::Pass
+            }
+
+            TMMsgData::Prevote(v_id) | TMMsgData::Precommit(v_id) => {
+                if ! is_prev_seen_round && self.rounds_data[round_i].proposal_sig == TMSig::NIL {
+                    TMStatus::Indeterminate
+                } else if self.rounds_data[round_i].proposal_id != v_id {
+                    eprintln!("BFT at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
+                    return TMStatus::Fail;
+                } else {
+                    TMStatus::Pass
+                }
+            }
+        };
+
+        // TODO: more checks?
+
+        // Preliminary checks now finished (although not infallible from here) //////////////////////////
+
+        if ! is_prev_seen_round {
+            self.rounds_data.insert(round_i, RoundData{
+                height: self.height(),
+                round,
+                msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; self.roster_n],
+                ..RoundData::EMPTY
+            });
+        }
+        let round_data = &mut self.rounds_data[round_i];
+
+        // TODO: amend knowledge of rounds & update metadata
+            // TODO(code): collapse
+
+        match data {
+            TMMsgData::Proposal(value, valid_round) => {
+                // TODO: check expected proposer here if not above
+
+                if is_prev_seen_round { // element already in vector @ `round_i`
+                    let prev_value     = round_data.proposal;
+                    let prev_value_sig = round_data.proposal_sig;
+
+                    if prev_value_sig == TMSig::NIL { // votes but value not seen before
+                    } else if prev_value != value { // TODO: id
+                        eprintln!("BFT ERROR at {}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, roster_i);
+                        return TMStatus::Fail;
+                    } else {
+                        return TMStatus::Pass; // already good
+                    }
+                }
+
+                round_data.proposal             = value;
+                round_data.proposal_valid_round = valid_round;
+                round_data.proposal_sig         = sig;
+                round_data.proposal_id          = Self::id_from_value(value);
+
+                // TODO: include signed prevote & precommit for self?
+            }
+
+            TMMsgData::Prevote(v_id) | TMMsgData::Precommit(v_id) => {
+                let is_precommit = if let TMMsgData::Precommit(..) = data { 1 } else { 0 };
+
+                // TODO: check height
+
+                // Add the signature to the list & update counts
+                let new = &mut round_data.msg_val_sigs[roster_i];
+                let old = *new;
+                new[is_precommit] = (v_id, sig);
+
+
+                let old_has_sigs     = [(old[0].1 != TMSig::NIL) as usize, (old[1].1 != TMSig::NIL) as usize];
+                let new_has_sigs     = [(new[0].1 != TMSig::NIL) as usize, (new[1].1 != TMSig::NIL) as usize];
+                let old_has_any_sigs = old_has_sigs[0] | old_has_sigs[1];
+                let new_has_any_sigs = new_has_sigs[0] | new_has_sigs[1];
+
+                if old_has_sigs[is_precommit] != 0 && old[is_precommit] != new[is_precommit] {
+                    eprintln!("BFT ERROR at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
+                    return TMStatus::Fail;
+                }
+
+                let mut old_status = [[0,0], [0,0]];
+                old_status[0][(old[0].0 != ValueId::NIL) as usize] = 1;
+                old_status[1][(old[1].0 != ValueId::NIL) as usize] = 1;
+                let mut new_status = [[0,0], [0,0]];
+                new_status[0][(new[0].0 != ValueId::NIL) as usize] = 1;
+                new_status[1][(new[1].0 != ValueId::NIL) as usize] = 1;
+
+                // add 1 to counts that have been updated by this message
+                round_data.anys_n             += new_has_any_sigs - old_has_any_sigs;
+                round_data.prevotes_n         += new_has_sigs[0]  - old_has_sigs[0];
+                round_data.precommits_n       += new_has_sigs[1]  - old_has_sigs[1];
+                round_data.valid_prevotes_n   += new_status[0][1] as usize - old_status[0][1] as usize;
+                round_data.valid_precommits_n += new_status[1][1] as usize - old_status[1][1] as usize;
+                round_data.nil_prevotes_n     += new_status[0][0] as usize - old_status[0][0] as usize;
+            }
+        }
+
+        status
+    }
+
+    fn prune_unnecessary_data(&mut self) {
+        // TODO (perf): drop 2f+1 nil-voted rounds before n-2
+        todo!();
+    }
+
+
+    fn bft_update(&mut self) {
+        self.now = std::time::Instant::now();
+        let f = Self::f_from_n(self.roster_n as u64) as usize;
+
+        for i in 0..self.rounds_data.len() {
+            // TODO: don't spam "while" messages repeatedly
+            let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
+
+            // line 11: init proposal period
+            // (done elsewhere)
+
+            // line 22: receive first proposal this height: prevote
+            // > upon <PROPOSAL, h_p, round_p, v, −1> from proposer(h_p, round_p)
+            // > while step_p = propose do
+                // TODO: merge conditionals with below, they massively overlap
+            if (is_current_height_and_round &&
+                self.rounds_data[i].proposal_sig != TMSig::NIL && // we have received the proposal value
+                self.rounds_data[i].proposal_valid_round != -1 &&
+                self.step == TMStep::Propose)
+            {
+                // TODO: do we want to prevote NIL on currently-indeterminate?
+                // ALT: send NIL then later override with time-tagged message
+                if self.rounds_data[i].proposal_is_valid() == TMStatus::Pass && (
+                    self.locked_value_round.1 == -1 ||
+                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal)) // TODO(perf): use (previously-checked) ids for easier comparison?
+                {
+                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                } else {
+                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                }
+            }
+
+            // line 28: received 2f+1 prevotes: prevote
+            // > upon <PROPOSAL, h_p, round_p, v, vr> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, vr, id(v)>
+            // > while step_p = propose && (0 <= vr && vr < round_p)
+            if (is_current_height_and_round &&
+                self.rounds_data[i].proposal_sig != TMSig::NIL &&
+                2*f+1 <= self.rounds_data[i].valid_prevotes_n &&
+                self.step == TMStep::Propose &&
+                0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
+            {
+                if self.rounds_data[i].proposal_is_valid() == TMStatus::Pass && (
+                    self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
+                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal))
+                {
+                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                } else {
+                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                }
+            }
+
+            // line 34: last orders on prevote period
+            // > upon 2f+1 <PREVOTE, h_p, round_p, ∗> while step_p = prevote for the first time do
+            if (is_current_height_and_round &&
+                // don't need the proposal itself
+                2*f+1 <= self.rounds_data[i].prevotes_n &&
+                self.step == TMStep::Prevote &&
+                !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
+            {
+                self.rounds_data[i].timeout_triggered[0] = true;
+                self.schedule_timeout(TMStep::Prevote);
+            }
+
+            // line 36: seen 2f+1 valid prevotes: lock, valid, precommit
+            // > upon <PROPOSAL, h_p, round_p, v, ∗> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, round_p, id(v)>
+            // > while valid(v) && step_p >= prevote for the first time do
+            if (is_current_height_and_round &&
+                self.rounds_data[i].proposal_sig != TMSig::NIL &&
+                2*f+1 <= self.rounds_data[i].valid_prevotes_n &&
+                self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
+                (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
+            {
+                if self.step == TMStep::Prevote {
+                    self.locked_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
+                    self.step = self.broadcast(TMStep::Precommit, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                }
+                self.valid_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
+            }
+
+            // line 44: seen 2f+1 nil prevotes: precommit nil
+            // > upon 2f+1 <PREVOTE, h_p, round_p, nil>
+            // > while step_p = prevote do
+            if (is_current_height_and_round &&
+                2*f+1 <= self.rounds_data[i].nil_prevotes_n &&
+                self.step == TMStep::Prevote)
+            {
+                self.step = self.broadcast(TMStep::Precommit, TMMsgData::Precommit(ValueId::NIL));
+            }
+
+            // line 47: last orders on precommit period
+            // > upon 2f+1 <PRECOMMIT, h_p, round_p, ∗> for the first time do
+            if (is_current_height_and_round &&
+                2*f+1 <= self.rounds_data[i].precommits_n &&
+                !self.rounds_data[i].timeout_triggered[1])
+            {
+                self.rounds_data[i].timeout_triggered[1] = true;
+                self.schedule_timeout(TMStep::Precommit);
+            }
+
+            // line 49: value decided
+            // > upon <PROPOSAL, h_p, r, v, ∗> from proposer(h_p, r) AND 2f+1 <PRECOMMIT, h_p, r, id(v)>
+            // > while decision_p[h_p] = nil do
+            if (self.height() == self.rounds_data[i].height && // any round
+                self.rounds_data[i].proposal_sig != TMSig::NIL &&
+                2*f+1 <= self.rounds_data[i].precommits_n &&
+                self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
+            {
+                self.decisions.push(TMDecision {
+                    value: self.rounds_data[i].proposal,
+                    // value_sig: self.rounds_data[i].proposal_sig,
+                    // votes: self.rounds_data[i].msg_val_sigs
+                });
+            }
+
+            // line 55: round catchup
+            // > upon f+1 <∗, h_p, round, ∗, ∗> with round > round_p do
+            if (f+1 <= self.rounds_data[i].anys_n &&
+                self.round < self.rounds_data[i].round) {
+                self.start_round(self.rounds_data[i].round)
+            }
+        }
+
+        // timeouts
+        if let Some(timeout) = self.next_timeout {
+            if timeout <= self.now {
+                // TODO(code): can we just use *our* step or is there a possible sequence issue?
+                //             (from the presence of step checks, probably not)
+                match self.timeout_step {
+                    // TODO(code): collapse propose & precommit to broadcast step+1
+                    TMStep::Propose => {
+                        if (self.height() == self.timeout_start_height &&
+                            self.round    == self.timeout_start_round &&
+                            self.step     == TMStep::Propose)
+                        {
+                            self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                        }
+                    }
+
+                    TMStep::Prevote => {
+                        if (self.height() == self.timeout_start_height &&
+                            self.round    == self.timeout_start_round &&
+                            self.step     == TMStep::Propose)
+                        {
+                            self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                        }
+                    }
+
+                    TMStep::Precommit => {
+                        if (self.height() == self.timeout_start_height &&
+                            self.round    == self.timeout_start_round)
+                        {
+                            self.start_round(self.round + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // enum PacketKind {
@@ -190,13 +763,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
     let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
     let my_port = sock.local_addr().unwrap().port();
-    
+
     let mut peers : Vec<Peer> = roster.iter().filter(|k| **k != my_root_public_key.as_ref()).map(|k| {
         let mut p = Peer::default();
         p.root_public_key = *k;
         p
     }).collect();
-    
+
     for evidence in &roster_endpoint_evidence {
         if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
             peers[i].endpoint = Some(evidence.endpoint);
@@ -381,7 +954,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                             Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
                                             Err(error) => println!("Socket error: {:?}", error),
                                         }
-                                        
+
                                         peer.transport_state = Some(transport);
                                         peer.outgoing_handshake_state = None;
                                         peer.pending_client_ack_transport_state = None;
@@ -415,7 +988,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
                                         Err(error) => println!("Socket error: {:?}", error),
                                     }
-                                    
+
                                     peer.transport_state = Some(transport);
                                     peer.outgoing_handshake_state = None;
                                     peer.pending_client_ack_transport_state = None;
@@ -512,7 +1085,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if local_msg == b"CLIENT HELLO" {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
-                        
+
                         let hello_bytes = b"SERVER UNKNOWN HELLO";
                         let start_nonce  = rand::random::<u64>() >> 1;
                         send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
@@ -585,7 +1158,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         else {
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
-    
+
             // Update nonce tracking
             if nonce > peer.nonce_ack_latest {
                 peer.nonce_ack_latest += 1;
@@ -609,7 +1182,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     continue;
                 }
             }
-    
+
             if msg.len() >= b"ENDPOINT EVIDENCE".len() && &msg[0..b"ENDPOINT EVIDENCE".len()] == b"ENDPOINT EVIDENCE" {
                 let evidence = EndpointEvidence::read_from(&msg[b"ENDPOINT EVIDENCE".len()..]).unwrap();
 
