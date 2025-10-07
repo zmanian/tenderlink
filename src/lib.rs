@@ -91,10 +91,7 @@ impl PubKeyID {
 }
 impl std::fmt::Display for PubKeyID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in &self.0 {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
+        fmt_byte_str(f, &self.0)
     }
 }
 
@@ -595,6 +592,7 @@ impl TMState {
     }
 }
 
+// TODO: can we megastruct these and collapse the codepaths?
 #[derive(Debug)]
 struct Peer {
     root_public_key: [u8; 32],
@@ -675,7 +673,7 @@ impl SecureUdpEndpoint {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct EndpointEvidence {
     endpoint: SecureUdpEndpoint,
     root_public_key: [u8; 32],
@@ -700,32 +698,39 @@ impl EndpointEvidence {
     }
 }
 
+fn fmt_byte_str(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    for b in bytes { write!(f, "{:02x}", b)?; }
+    Ok(())
+}
+
+fn fmt_prefixed_byte_str(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
+    write!(f, "{}", pre)?;
+    for b in bytes { write!(f, "{:02x}", b)?; }
+    Ok(())
+}
+
 impl std::fmt::Debug for StaticDHKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StaticDHKeyPair {{ private: \"")?;
-        for b in &self.private {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "\", public: \"")?;
-        for b in &self.public {
-            write!(f, "{:02x}", b)?;
-        }
+        fmt_prefixed_byte_str(f, "StaticDHKeyPair { private: \"", &self.private)?;
+        fmt_prefixed_byte_str(f, "\", public: \"",                &self.public)?;
+        write!(f, "\" }}")
+    }
+}
+
+impl std::fmt::Debug for EndpointEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EndpointEvidence {{ endpoint: ")?;
+        self.endpoint.fmt(f)?;
+        fmt_prefixed_byte_str(f, ", root_public_key: \"", &self.root_public_key)?;
         write!(f, "\" }}")
     }
 }
 
 impl std::fmt::Debug for SecureUdpEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SecureUdpEndpoint {{ public_key: \"")?;
-        for b in &self.public_key {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "\", ip_address: \"")?;
-        for b in &self.ip_address {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "\", port: {}", self.port)?;
-        write!(f, " }}")
+        fmt_prefixed_byte_str(f, "SecureUdpEndpoint { public_key: \"", &self.public_key)?;
+        fmt_prefixed_byte_str(f, "\", ip_address: \"",                 &self.ip_address)?;
+        write!(f, "\", port: {:05} }}", self.port)
     }
 }
 
@@ -759,7 +764,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             peers[i].endpoint = Some(evidence.endpoint);
         }
     }
-    println!("socket port={}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
+    println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {
         Some(roster_endpoint_evidence[i])
@@ -786,14 +791,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // TICK CODE
                 unknown_peers.retain(|peer| {
                     if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
-                        println!("{}: Disconnected from unknown peer {:?}", my_port, peer.endpoint);
+                        println!("{:05}: Disconnected from unknown peer {:?}", my_port, peer.endpoint);
                         false
                     } else { true }
                 });
                 for peer in &mut peers {
                     if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
                         if peer.transport_state.is_some() {
-                            println!("{}: Disconnected from peer {:?}", my_port, peer.endpoint);
+                            println!("{:05}: Disconnected from peer {:?}", my_port, peer.endpoint);
                         }
                         peer.outgoing_handshake_state = None;
                         peer.pending_client_ack_transport_state = None;
@@ -928,7 +933,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 // TODO hash
                                 if peer.pending_client_ack_transport_state.is_none() || my_port > peer_endpoint.port {
                                     if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                        println!("{}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
+                                        println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
 
                                         let start_nonce  = rand::random::<u64>() >> 1;
                                         let length = transport.write_message(start_nonce, b"CLIENT ACK", &mut send_buf2[8..]).unwrap();
@@ -956,11 +961,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
                                 // TODO hash
                                 if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                    println!("{}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
+                                    println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
 
                                     if my_endpoint_evidence.is_none() {
                                         let evidence = EndpointEvidence { endpoint: other_side_endpoint, root_public_key: my_root_public_key.into() };
-                                        println!("{}: I am locking in the endpoint evidence {:?}", my_port, evidence);
+                                        println!("{:05}: I am locking in the endpoint evidence {:?}", my_port, evidence);
                                         my_endpoint_evidence = Some(evidence);
                                     }
 
@@ -991,7 +996,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let local_msg = &recv_buf2[0..length];
                         if local_msg == b"CLIENT ACK" {
-                            println!("{}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
+                            println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
                             peer.transport_state = peer.pending_client_ack_transport_state.take();
                             peer.outgoing_handshake_state = None;
                             peer.nonce_ack_latest = nonce;
@@ -1008,7 +1013,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     let local_msg = &recv_buf2[0..length];
                     if local_msg == b"CLIENT HELLO" {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
-                        println!("{}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
+                        println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
                         // TODO hash
                         if peer.outgoing_handshake_state.is_none() || my_port <= peer_endpoint.port {
                             let hello_bytes = b"SERVER HELLO";
@@ -1040,7 +1045,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let local_msg = &recv_buf2[0..length];
                         if peer.pending_client_ack {
                             if local_msg == b"CLIENT UNKNOWN ACK" {
-                                println!("{}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
+                                println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
                                 peer.pending_client_ack = false;
                                 peer.nonce_ack_latest = nonce;
                                 peer.nonce_ack_field = !0;
@@ -1068,7 +1073,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     let local_msg = &recv_buf2[0..length];
                     if local_msg == b"CLIENT HELLO" {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
-                        println!("{}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
+                        println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
                         let hello_bytes = b"SERVER UNKNOWN HELLO";
                         let start_nonce  = rand::random::<u64>() >> 1;
@@ -1120,7 +1125,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
                     peers[i].endpoint = Some(evidence.endpoint);
                     if peer.endpoint == evidence.endpoint {
-                        println!("{}: Promoting unknown peer connection {:?}", my_port, peer.endpoint);
+                        println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint);
                         let peer = unknown_peers.remove(peer_index);
                         peers[i].outgoing_handshake_state = None;
                         peers[i].pending_client_ack_transport_state = None;
@@ -1136,7 +1141,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
                 continue;
             } else {
-                println!("{}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+                println!("{:05}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
             }
         }
         else {
