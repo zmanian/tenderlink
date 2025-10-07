@@ -735,6 +735,33 @@ impl std::fmt::Debug for SecureUdpEndpoint {
     }
 }
 
+fn nonce_is_ok(nonce: u64, nonce_ack_latest: u64, nonce_ack_field: u64) -> bool {
+    let mut ok = true;
+    if nonce > nonce_ack_latest && nonce > nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { ok = false; }
+    if nonce == nonce_ack_latest { ok = false; }
+    if nonce + 64 < nonce_ack_latest { ok = false; }
+    if nonce < nonce_ack_latest && 1_u64 << (nonce_ack_latest - nonce) & nonce_ack_field != 0 { ok = false; }
+    ok
+}
+
+fn nonce_update(nonce: u64, nonce_ack_latest: &mut u64, nonce_ack_field: &mut u64) {
+    // Update nonce tracking
+    if nonce > *nonce_ack_latest {
+        *nonce_ack_latest += 1;
+        *nonce_ack_field <<= 1;
+        *nonce_ack_field |= 1;
+        let shift_amount = nonce - *nonce_ack_latest;
+        if shift_amount >= 64 {
+            *nonce_ack_field = 0;
+        } else if shift_amount != 0 {
+            *nonce_ack_field <<= shift_amount;
+            *nonce_ack_latest = nonce;
+        }
+    } else {
+        *nonce_ack_field |= 1_u64 << (*nonce_ack_latest - nonce);
+    }
+}
+
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<[u8; 32]>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
@@ -913,13 +940,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 if let Some(transport) = &mut peer.transport_state {
                     nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
                     if let Ok(length) = transport.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        let mut reject = false;
-                        if nonce > peer.nonce_ack_latest && nonce > peer.nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { reject = true; }
-                        if nonce == peer.nonce_ack_latest { reject = true; }
-                        if nonce + 64 < peer.nonce_ack_latest { reject = true; }
-                        if nonce < peer.nonce_ack_latest && 1_u64 << (peer.nonce_ack_latest - nonce) & peer.nonce_ack_field != 0 { reject = true; }
-                        if reject == false {
-                            msg = Some(&recv_buf2[0..length]);
+                        if nonce_is_ok(nonce, peer.nonce_ack_latest, peer.nonce_ack_field) {
+                            msg        = Some(&recv_buf2[0..length]);
                             peer_index = i;
                         }
                         break;
@@ -1043,14 +1065,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             }
                             break;
                         }
-                        let mut reject = false;
-                        if nonce > peer.nonce_ack_latest && nonce > peer.nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { reject = true; }
-                        if nonce == peer.nonce_ack_latest { reject = true; }
-                        if nonce + 64 < peer.nonce_ack_latest { reject = true; }
-                        if nonce < peer.nonce_ack_latest && 1_u64 << (peer.nonce_ack_latest - nonce) & peer.nonce_ack_field != 0 { reject = true; }
-                        if reject == false {
-                            msg = Some(&recv_buf2[0..length]);
-                            peer_index = i;
+
+                        if nonce_is_ok(nonce, peer.nonce_ack_latest, peer.nonce_ack_field) {
+                            msg             = Some(&recv_buf2[0..length]);
+                            peer_index      = i;
                             peer_is_unknown = true;
                         }
                         break;
@@ -1093,22 +1111,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
             peer.watch_dog = Instant::now();
-
-            // Update nonce tracking
-            if nonce > peer.nonce_ack_latest {
-                peer.nonce_ack_latest += 1;
-                peer.nonce_ack_field <<= 1;
-                peer.nonce_ack_field |= 1;
-                let shift_amount = nonce - peer.nonce_ack_latest;
-                if shift_amount >= 64 {
-                    peer.nonce_ack_field = 0;
-                } else if shift_amount != 0 {
-                    peer.nonce_ack_field <<= shift_amount;
-                    peer.nonce_ack_latest = nonce;
-                }
-            } else {
-                peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
-            }
+            nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
 
             match tag {
                 PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
@@ -1139,22 +1142,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         else {
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
-
-            // Update nonce tracking
-            if nonce > peer.nonce_ack_latest {
-                peer.nonce_ack_latest += 1;
-                peer.nonce_ack_field <<= 1;
-                peer.nonce_ack_field |= 1;
-                let shift_amount = nonce - peer.nonce_ack_latest;
-                if shift_amount >= 64 {
-                    peer.nonce_ack_field = 0;
-                } else if shift_amount != 0 {
-                    peer.nonce_ack_field <<= shift_amount;
-                    peer.nonce_ack_latest = nonce;
-                }
-            } else {
-                peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
-            }
+            nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
 
             match tag {
                 PACKET_TAG_HEARTBEAT => if peer.connection_is_unknown {
