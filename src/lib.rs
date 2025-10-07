@@ -78,12 +78,6 @@ enum TMStatus {
     Fail, // f+1 no
 }
 
-struct TMParams {
-    propose_timeout: std::time::Duration,
-    prevote_timeout: std::time::Duration,
-    precommit_timeout: std::time::Duration,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ValueId([u8; 32]);
 impl ValueId {
@@ -131,6 +125,7 @@ struct RoundData {
     nil_prevotes_n: usize,
     // TODO: can probably do this from whether *our* node has a valid value
     // TODO: by round or for whole state?
+    active_timeout: Option<Timeout>,
     timeout_triggered: [bool; 2],
 }
 impl RoundData {
@@ -151,6 +146,7 @@ impl RoundData {
         precommits_n: 0,
         anys_n: 0,
 
+        active_timeout: None,
         timeout_triggered: [false;2],
     };
 
@@ -180,6 +176,21 @@ fn roster_i_from_pub_key(_pub_key: PubKeyID) -> usize {
     0
 }
 
+struct Timeout { time: Instant, height: u64, round: u32, step: TMStep }
+impl Timeout {
+    fn new(now: Instant, height: u64, round: u32, step: TMStep) -> Timeout {
+        use std::time::Duration;
+        let timeout = match step {
+            TMStep::Propose   => Duration::from_secs(3) + round * Duration::from_millis(500),
+            TMStep::Prevote   => Duration::from_secs(3) + round * Duration::from_millis(500),
+            TMStep::Precommit => Duration::from_secs(3) + round * Duration::from_millis(500),
+        };
+
+        Timeout{ time: now + timeout, height, round, step }
+    }
+}
+
+
 struct TMState {
     roster_n: usize,
     my_pub_key: PubKeyID,
@@ -200,21 +211,14 @@ struct TMState {
     votes: Vec<TMVote>,
 
     /// treat all processing things as happening at the same time (?)
-    now: std::time::Instant,
     timeout_start_height: u64,
     timeout_start_round: u32,
     timeout_step: TMStep,
-    next_timeout: Option<std::time::Instant>,
+    next_timeout: Option<(Instant, u64, u32, TMStep)>,
 
     rounds_data: Vec<RoundData>,
 }
 impl TMState {
-    const PARAMS: TMParams = TMParams {
-        propose_timeout: std::time::Duration::from_secs(5),
-        prevote_timeout: std::time::Duration::from_secs(5),
-        precommit_timeout: std::time::Duration::from_secs(5),
-    };
-
     fn init(my_pub_key: PubKeyID) -> Self {
         Self {
             roster_n: 0,
@@ -229,7 +233,6 @@ impl TMState {
             // active_proposer_pub_key: PubKeyID::NIL,
             votes: Vec::new(),
 
-            now: std::time::Instant::now(),
             timeout_start_height: 0,
             timeout_start_round: 0,
             timeout_step: TMStep::Propose,
@@ -241,19 +244,6 @@ impl TMState {
 
     fn height(&self) -> u64 {
         self.decisions.len() as u64
-    }
-
-    fn schedule_timeout(&mut self, step: TMStep) {
-        let timeout = match step {
-            TMStep::Propose => Self::PARAMS.propose_timeout,
-            TMStep::Prevote => Self::PARAMS.prevote_timeout,
-            TMStep::Precommit => Self::PARAMS.precommit_timeout,
-        };
-
-        self.next_timeout = Some(self.now + timeout);
-        self.timeout_start_height = self.height();
-        self.timeout_start_round  = self.round;
-        self.timeout_step         = step;
     }
 
 
@@ -278,7 +268,17 @@ impl TMState {
         res
     }
 
-    fn start_round(&mut self, round: u32) {
+    fn insert_round(&mut self, insert_i: usize, round: u32) -> &mut RoundData {
+        self.rounds_data.insert(insert_i, RoundData{
+            height: self.height(),
+            round,
+            msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; self.roster_n],
+            ..RoundData::EMPTY
+        });
+        &mut self.rounds_data[insert_i]
+    }
+
+    fn start_round(&mut self, now: Instant, round: u32) {
         self.round = round;
         // self.active_proposal_value_round = (None, -1);
 
@@ -293,8 +293,12 @@ impl TMState {
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
             self.step = self.broadcast(TMStep::Propose, TMMsgData::Proposal(proposal, self.valid_value_round.1));
         } else {
-            self.schedule_timeout(TMStep::Propose);
             self.step = TMStep::Propose;
+
+            match self.rounds_data.binary_search_by_key(&(self.height(), round), |el| (el.height, el.round)) {
+                Ok(round_i)  => &mut self.rounds_data[round_i],
+                Err(round_i) => self.insert_round(round_i, round)
+            }.active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Propose));
         }
     }
 
@@ -329,12 +333,14 @@ impl TMState {
 
         let status = match data {
             TMMsgData::Proposal(value, _valid_round) => {
+                // "is it the correct proposer?"
                 let expected_proposer_pub_key = Self::proposer_from_height_round(height, round);
                 if from_pub_key != expected_proposer_pub_key {
                     eprintln!("BFT at {}.{}: received proposal from non-proposer expected {} ({}), received from {}. Ignoring latest...", height, round, roster_i, expected_proposer_pub_key, from_pub_key);
                     return TMStatus::Fail;
                 }
 
+                // "have they previously proposed a different value?"
                 if (is_prev_seen_round &&
                     self.rounds_data[round_i].proposal_sig != TMSig::NIL &&
                     self.rounds_data[round_i].proposal_id  != Self::id_from_value(value))
@@ -347,7 +353,10 @@ impl TMState {
             }
 
             TMMsgData::Prevote(v_id) | TMMsgData::Precommit(v_id) => {
+                // TODO: check if this person has previously voted differently
+
                 if ! is_prev_seen_round && self.rounds_data[round_i].proposal_sig == TMSig::NIL {
+                    // if we don't have a real proposal yet we can't check for
                     TMStatus::Indeterminate
                 } else if self.rounds_data[round_i].proposal_id != v_id {
                     eprintln!("BFT at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
@@ -363,12 +372,7 @@ impl TMState {
         // Preliminary checks now finished (although not infallible from here) //////////////////////////
 
         if ! is_prev_seen_round {
-            self.rounds_data.insert(round_i, RoundData{
-                height: self.height(),
-                round,
-                msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; self.roster_n],
-                ..RoundData::EMPTY
-            });
+            self.insert_round(round_i, round);
         }
         let round_data = &mut self.rounds_data[round_i];
 
@@ -448,7 +452,7 @@ impl TMState {
 
 
     fn bft_update(&mut self) {
-        self.now = std::time::Instant::now();
+        let now = Instant::now();
         let f = Self::f_from_n(self.roster_n as u64) as usize;
 
         for i in 0..self.rounds_data.len() {
@@ -461,7 +465,7 @@ impl TMState {
             // line 22: receive first proposal this height: prevote
             // > upon <PROPOSAL, h_p, round_p, v, −1> from proposer(h_p, round_p)
             // > while step_p = propose do
-                // TODO: merge conditionals with below, they massively overlap
+            // TODO: merge conditionals with below, they massively overlap
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sig != TMSig::NIL && // we have received the proposal value
                 self.rounds_data[i].proposal_valid_round != -1 &&
@@ -507,7 +511,7 @@ impl TMState {
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
                 self.rounds_data[i].timeout_triggered[0] = true;
-                self.schedule_timeout(TMStep::Prevote);
+                self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Prevote));
             }
 
             // line 36: seen 2f+1 valid prevotes: lock, valid, precommit
@@ -543,7 +547,7 @@ impl TMState {
                 !self.rounds_data[i].timeout_triggered[1])
             {
                 self.rounds_data[i].timeout_triggered[1] = true;
-                self.schedule_timeout(TMStep::Precommit);
+                self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Precommit));
             }
 
             // line 49: value decided
@@ -563,53 +567,33 @@ impl TMState {
 
             // line 55: round catchup
             // > upon f+1 <∗, h_p, round, ∗, ∗> with round > round_p do
-            if (f+1 <= self.rounds_data[i].anys_n &&
-                self.round < self.rounds_data[i].round) {
-                self.start_round(self.rounds_data[i].round)
+            if (self.height() == self.rounds_data[i].height &&
+                self.round    <  self.rounds_data[i].round  &&
+                f+1 <= self.rounds_data[i].anys_n)
+            {
+                self.start_round(now, self.rounds_data[i].round)
             }
-        }
 
-        // timeouts
-        if let Some(timeout) = self.next_timeout {
-            if timeout <= self.now {
-                // TODO(code): can we just use *our* step or is there a possible sequence issue?
-                //             (from the presence of step checks, probably not)
-                match self.timeout_step {
-                    // TODO(code): collapse propose & precommit to broadcast step+1
-                    TMStep::Propose => {
-                        if (self.height() == self.timeout_start_height &&
-                            self.round    == self.timeout_start_round &&
-                            self.step     == TMStep::Propose)
-                        {
-                            self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
-                        }
-                    }
-
-                    TMStep::Prevote => {
-                        if (self.height() == self.timeout_start_height &&
-                            self.round    == self.timeout_start_round &&
-                            self.step     == TMStep::Propose)
-                        {
-                            self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
-                        }
-                    }
-
-                    TMStep::Precommit => {
-                        if (self.height() == self.timeout_start_height &&
-                            self.round    == self.timeout_start_round)
-                        {
-                            self.start_round(self.round + 1);
-                        }
-                    }
+            // timeouts
+            if let Some(timeout) = &self.rounds_data[i].active_timeout &&
+                timeout.time <= now &&
+                self.height() == timeout.height &&
+                self.round    == timeout.round
+            {
+                // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
+                match timeout.step {
+                    TMStep::Propose => if self.step == TMStep::Propose {
+                        self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                    },
+                    TMStep::Prevote => if self.step == TMStep::Prevote {
+                        self.step = self.broadcast(TMStep::Precommit, TMMsgData::Precommit(ValueId::NIL));
+                    },
+                    TMStep::Precommit => self.start_round(now, self.round + 1),
                 }
             }
         }
     }
 }
-
-// enum PacketKind {
-//     IP, // complete
-// }
 
 #[derive(Debug)]
 struct Peer {
