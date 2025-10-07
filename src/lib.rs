@@ -927,6 +927,26 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
+                        fn finish_outgoing_handshake(buf: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool) {
+                            let start_nonce = rand::random::<u64>() >> 1;
+                            let tag         = if connection_is_unknown { PACKET_TAG_CLIENT_UNKNOWN_ACK } else { PACKET_TAG_CLIENT_ACK };
+                            let length      = transport.write_message(start_nonce, &[tag], &mut buf[8..]).unwrap();
+                            buf[0..8].copy_from_slice(&start_nonce.to_le_bytes());
+                            match sock.try_send_to(&buf[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
+                                Ok(_) => (),
+                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                                Err(error) => println!("Socket error: {:?}", error),
+                            }
+
+                            peer.transport_state                    = Some(transport);
+                            peer.outgoing_handshake_state           = None;
+                            peer.pending_client_ack_transport_state = None;
+                            peer.nonce_ack_latest                   = nonce;
+                            peer.nonce_ack_field                    = !0;
+                            peer.connection_is_unknown              = connection_is_unknown;
+                            peer.on_send_next_nonce                 = start_nonce + 1;
+                        }
+
                         if length >= 8 {
                             nonce = u64::from_le_bytes(recv_buf2[0..8].try_into().unwrap());
                             if length == 8 { break; } // presumably we don't care about standalone nonces
@@ -936,23 +956,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 if peer.pending_client_ack_transport_state.is_none() || my_port > peer_endpoint.port {
                                     if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                         println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
-
-                                        let start_nonce  = rand::random::<u64>() >> 1;
-                                        let length = transport.write_message(start_nonce, &[PACKET_TAG_CLIENT_ACK], &mut send_buf2[8..]).unwrap();
-                                        send_buf2[0..8].copy_from_slice(&start_nonce.to_le_bytes());
-                                        match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                            Ok(_) => (),
-                                            Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                            Err(error) => println!("Socket error: {:?}", error),
-                                        }
-
-                                        peer.transport_state                    = Some(transport);
-                                        peer.outgoing_handshake_state           = None;
-                                        peer.pending_client_ack_transport_state = None;
-                                        peer.nonce_ack_latest                   = nonce;
-                                        peer.nonce_ack_field                    = !0;
-                                        peer.connection_is_unknown              = false;
-                                        peer.on_send_next_nonce                 = start_nonce + 1;
+                                        finish_outgoing_handshake(&mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false);
                                     }
                                     break;
                                 }
@@ -970,22 +974,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         my_endpoint_evidence = Some(evidence);
                                     }
 
-                                    let start_nonce = rand::random::<u64>() >> 1;
-                                    let length = transport.write_message(start_nonce, &[PACKET_TAG_CLIENT_UNKNOWN_ACK], &mut send_buf2[8..]).unwrap();
-                                    send_buf2[0..8].copy_from_slice(&start_nonce.to_le_bytes());
-                                    match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                        Ok(_) => (),
-                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                        Err(error) => println!("Socket error: {:?}", error),
-                                    }
-
-                                    peer.transport_state                    = Some(transport);
-                                    peer.outgoing_handshake_state           = None;
-                                    peer.pending_client_ack_transport_state = None;
-                                    peer.nonce_ack_latest                   = nonce;
-                                    peer.nonce_ack_field                    = !0;
-                                    peer.connection_is_unknown              = true;
-                                    peer.on_send_next_nonce                 = start_nonce + 1;
+                                    finish_outgoing_handshake(&mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true);
                                 }
                                 break;
                             }
