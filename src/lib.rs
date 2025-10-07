@@ -1220,6 +1220,62 @@ impl PacketHeartbeat {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PubKeySig {
+    pub_key: PubKeyID,
+    sig: TMSig,
+}
+
+// agnostic to prevote/precommit - communicated elsewhere
+// NOTE: all votes for the same value_id (or nil)
+// #[repr(C)]
+struct PacketVotes {
+    tag:      u8,
+    votes_n:  u8,
+    // pad_:     u16, // TODO: useful?
+    round:    u32,
+    height:   u64,
+    value_id: ValueId,
+    votes:    [PubKeySig; 12],
+}
+const_assert!(size_of::<PacketVotes>() == 1200); // TODO(azmr): exactly how much space is left
+                                                 // after noice/nonce/...?
+
+impl PacketVotes {
+    pub fn write_to<W: Write>(&self, mut w: W) -> std::io::Result<()> {
+        w.write_u8(self.tag)?;
+        w.write_u8(self.votes_n)?;
+        // w.write_u16::<LittleEndian>(0)?;
+        w.write_u32::<LittleEndian>(self.round)?;
+        w.write_u64::<LittleEndian>(self.height)?;
+        w.write_all(&self.value_id.0)?;
+        // NOTE(azmr): slight saving of bytes-on-wire if unused?
+        for i in 0..self.votes_n as usize {
+            w.write_all(&self.votes[i].pub_key.0)?;
+            w.write_all(&self.votes[i].sig.0)?;
+        }
+        Ok(())
+    }
+
+    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
+        let mut packet = PacketVotes {
+            tag: 0, votes_n: 0, round: 0, height: 0,
+            value_id: ValueId::NIL,
+            votes: [PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12],
+        };
+        packet.tag     = r.read_u8()?;
+        packet.votes_n = r.read_u8()?;
+        packet.round   = r.read_u32::<LittleEndian>()?;
+        packet.height  = r.read_u64::<LittleEndian>()?;
+        r.read_exact(&mut packet.value_id.0)?;
+        for i in 0..packet.votes_n as usize {
+            r.read_exact(&mut packet.votes[i].pub_key.0)?;
+            r.read_exact(&mut packet.votes[i].sig.0)?;
+        }
+        Ok(packet)
+    }
+}
+
 fn hook_fail_on_panic() {
     std::panic::set_hook(Box::new(|panic_info| {
         #[allow(clippy::print_stderr)]
