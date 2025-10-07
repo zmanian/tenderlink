@@ -3,6 +3,7 @@
 #![allow(clippy::never_loop)]
 
 
+use static_assertions::{const_assert};
 use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
@@ -744,19 +745,19 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         SimRng::new(seed, 0)
     };
 
+    let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
     let my_root_public_key = VerificationKeyBytes::from(&my_root_private_key);
     let my_static_keypair = my_static_keypair.unwrap_or_else(|| {
-        let kp = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).generate_keypair().unwrap();
+        let kp = snow::Builder::new(noise_params.clone()).generate_keypair().unwrap();
         StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
     });
 
     let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
     let my_port = sock.local_addr().unwrap().port();
 
-    let mut peers : Vec<Peer> = roster.iter().filter(|k| **k != my_root_public_key.as_ref()).map(|k| {
-        let mut p = Peer::default();
-        p.root_public_key = *k;
-        p
+    let mut peers : Vec<Peer> = roster.iter().filter(|k| **k != my_root_public_key.as_ref()).map(|k| Peer {
+        root_public_key: *k,
+        ..Peer::default()
     }).collect();
 
     for evidence in &roster_endpoint_evidence {
@@ -800,10 +801,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         if peer.transport_state.is_some() {
                             println!("{:05}: Disconnected from peer {:?}", my_port, peer.endpoint);
                         }
-                        peer.outgoing_handshake_state = None;
+                        peer.outgoing_handshake_state           = None;
                         peer.pending_client_ack_transport_state = None;
-                        peer.transport_state = None;
-                        peer.watch_dog = Instant::now();
+                        peer.transport_state                    = None;
+                        peer.watch_dog                          = Instant::now();
                     }
 
                     if let Some(peer_endpoint) = peer.endpoint {
@@ -812,7 +813,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 // Gossip evidence in order to trigger upgrade
                                 if let Some(evidence) = my_endpoint_evidence {
                                     let mut c = Cursor::new(&mut send_buf1[..]);
-                                    c.write_all(b"ENDPOINT EVIDENCE").unwrap();
+                                    c.write_all(&[PACKET_TAG_ENDPOINT_EVIDENCE]).unwrap();
                                     evidence.write_to(&mut c).unwrap();
                                     let len1 = c.position() as usize;
                                     let length = transport.write_message(peer.on_send_next_nonce, &send_buf1[..len1], &mut send_buf2[8..]).unwrap();
@@ -826,7 +827,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
                             }
                             else {
-                                let length = transport.write_message(peer.on_send_next_nonce, b"BEAT", &mut send_buf2[8..]).unwrap();
+                                let length = transport.write_message(peer.on_send_next_nonce, &[PACKET_TAG_HEARTBEAT], &mut send_buf2[8..]).unwrap();
                                 send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
                                 peer.on_send_next_nonce += 1;
                                 match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
@@ -841,11 +842,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 for peer in &mut peers {
                     if let Some(peer_endpoint) = peer.endpoint {
                         if peer.transport_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_transport_state.is_none() {
-                            let mut outgoing_state = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+                            let mut outgoing_state = snow::Builder::new(noise_params.clone())
                                 .local_private_key(&my_static_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
-                            let length = outgoing_state.write_message(b"CLIENT HELLO", &mut send_buf2).unwrap();
+                            let length = outgoing_state.write_message(&[PACKET_TAG_CLIENT_HELLO], &mut send_buf2).unwrap();
                             match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
                                 Ok(_) => (),
                                 Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
@@ -857,7 +858,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         if let Some(transport) = &mut peer.transport_state {
                             if let Some(evidence) = roster_endpoint_evidence.choose(&mut base_rng) {
                                 let mut c = Cursor::new(&mut send_buf1[..]);
-                                c.write_all(b"ENDPOINT EVIDENCE").unwrap();
+                                c.write_all(&[PACKET_TAG_ENDPOINT_EVIDENCE]).unwrap();
                                 evidence.write_to(&mut c).unwrap();
                                 let len1 = c.position() as usize;
                                 let length = transport.write_message(peer.on_send_next_nonce, &send_buf1[..len1], &mut send_buf2[8..]).unwrap();
@@ -901,7 +902,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         let mut peer_index = 0;
         let mut peer_is_unknown = false;
         let mut nonce = 0;
-        let mut msg = None;
+        let mut msg: Option<&[u8]> = None;
 
         //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
         //      the unknown connections array since that also shouldn't be able to be blocked.
@@ -928,15 +929,16 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
                         if length >= 8 {
                             nonce = u64::from_le_bytes(recv_buf2[0..8].try_into().unwrap());
+                            if length == 8 { break; } // presumably we don't care about standalone nonces
                             let local_msg = &recv_buf2[8..length];
-                            if local_msg == b"SERVER HELLO" {
+                            if local_msg == [PACKET_TAG_SERVER_HELLO] {
                                 // TODO hash
                                 if peer.pending_client_ack_transport_state.is_none() || my_port > peer_endpoint.port {
                                     if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                         println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
 
                                         let start_nonce  = rand::random::<u64>() >> 1;
-                                        let length = transport.write_message(start_nonce, b"CLIENT ACK", &mut send_buf2[8..]).unwrap();
+                                        let length = transport.write_message(start_nonce, &[PACKET_TAG_CLIENT_ACK], &mut send_buf2[8..]).unwrap();
                                         send_buf2[0..8].copy_from_slice(&start_nonce.to_le_bytes());
                                         match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
                                             Ok(_) => (),
@@ -944,20 +946,19 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                             Err(error) => println!("Socket error: {:?}", error),
                                         }
 
-                                        peer.transport_state = Some(transport);
-                                        peer.outgoing_handshake_state = None;
+                                        peer.transport_state                    = Some(transport);
+                                        peer.outgoing_handshake_state           = None;
                                         peer.pending_client_ack_transport_state = None;
-                                        peer.nonce_ack_latest = nonce;
-                                        peer.nonce_ack_field = !0;
-                                        peer.connection_is_unknown = false;
-                                        peer.on_send_next_nonce = start_nonce + 1;
+                                        peer.nonce_ack_latest                   = nonce;
+                                        peer.nonce_ack_field                    = !0;
+                                        peer.connection_is_unknown              = false;
+                                        peer.on_send_next_nonce                 = start_nonce + 1;
                                     }
                                     break;
                                 }
-                            }
-                            if local_msg.len() == b"SERVER UNKNOWN HELLO".len() + 18 && &local_msg[0..b"SERVER UNKNOWN HELLO".len()] == b"SERVER UNKNOWN HELLO" {
-                                let other_side_ip = &local_msg[b"SERVER UNKNOWN HELLO".len()..b"SERVER UNKNOWN HELLO".len()+16];
-                                let other_side_port = &local_msg[b"SERVER UNKNOWN HELLO".len()+16..b"SERVER UNKNOWN HELLO".len()+18];
+                            } else if local_msg.len() == 1 + 18 && local_msg[0] == PACKET_TAG_SERVER_UNKNOWN_HELLO {
+                                let other_side_ip       = &local_msg[1..1+16];
+                                let other_side_port     = &local_msg[1+16..1+18];
                                 let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
                                 // TODO hash
                                 if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
@@ -969,8 +970,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         my_endpoint_evidence = Some(evidence);
                                     }
 
-                                    let start_nonce  = rand::random::<u64>() >> 1;
-                                    let length = transport.write_message(start_nonce, b"CLIENT UNKNOWN ACK", &mut send_buf2[8..]).unwrap();
+                                    let start_nonce = rand::random::<u64>() >> 1;
+                                    let length = transport.write_message(start_nonce, &[PACKET_TAG_CLIENT_UNKNOWN_ACK], &mut send_buf2[8..]).unwrap();
                                     send_buf2[0..8].copy_from_slice(&start_nonce.to_le_bytes());
                                     match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
                                         Ok(_) => (),
@@ -978,13 +979,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         Err(error) => println!("Socket error: {:?}", error),
                                     }
 
-                                    peer.transport_state = Some(transport);
-                                    peer.outgoing_handshake_state = None;
+                                    peer.transport_state                    = Some(transport);
+                                    peer.outgoing_handshake_state           = None;
                                     peer.pending_client_ack_transport_state = None;
-                                    peer.nonce_ack_latest = nonce;
-                                    peer.nonce_ack_field = !0;
-                                    peer.connection_is_unknown = true;
-                                    peer.on_send_next_nonce = start_nonce + 1;
+                                    peer.nonce_ack_latest                   = nonce;
+                                    peer.nonce_ack_field                    = !0;
+                                    peer.connection_is_unknown              = true;
+                                    peer.on_send_next_nonce                 = start_nonce + 1;
                                 }
                                 break;
                             }
@@ -995,28 +996,28 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let local_msg = &recv_buf2[0..length];
-                        if local_msg == b"CLIENT ACK" {
+                        if local_msg == &[PACKET_TAG_CLIENT_ACK] {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
-                            peer.transport_state = peer.pending_client_ack_transport_state.take();
+                            peer.transport_state          = peer.pending_client_ack_transport_state.take();
                             peer.outgoing_handshake_state = None;
-                            peer.nonce_ack_latest = nonce;
-                            peer.nonce_ack_field = !0;
-                            peer.connection_is_unknown = false;
+                            peer.nonce_ack_latest         = nonce;
+                            peer.nonce_ack_field          = !0;
+                            peer.connection_is_unknown    = false;
                             break;
                         }
                     }
                 }
-                let mut incoming_state = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+                let mut incoming_state = snow::Builder::new(noise_params.clone())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
                     let local_msg = &recv_buf2[0..length];
-                    if local_msg == b"CLIENT HELLO" {
+                    if local_msg == &[PACKET_TAG_CLIENT_HELLO] {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
                         // TODO hash
                         if peer.outgoing_handshake_state.is_none() || my_port <= peer_endpoint.port {
-                            let hello_bytes = b"SERVER HELLO";
+                            let hello_bytes = &[PACKET_TAG_SERVER_HELLO];
                             let start_nonce  = rand::random::<u64>() >> 1;
                             send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
                             send_buf1[8..8+hello_bytes.len()].copy_from_slice(hello_bytes);
@@ -1028,7 +1029,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             }
                             if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
                                 peer.pending_client_ack_transport_state = Some(transport);
-                                peer.on_send_next_nonce = start_nonce+1;
+                                peer.on_send_next_nonce                 = start_nonce+1;
                             }
                             break;
                         }
@@ -1044,11 +1045,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if let Ok(length) = peer.transport_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let local_msg = &recv_buf2[0..length];
                         if peer.pending_client_ack {
-                            if local_msg == b"CLIENT UNKNOWN ACK" {
+                            if local_msg == [PACKET_TAG_CLIENT_UNKNOWN_ACK] {
                                 println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
                                 peer.pending_client_ack = false;
-                                peer.nonce_ack_latest = nonce;
-                                peer.nonce_ack_field = !0;
+                                peer.nonce_ack_latest   = nonce;
+                                peer.nonce_ack_field    = !0;
                                 break;
                             }
                             break;
@@ -1066,22 +1067,21 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         break;
                     }
                 }
-                let mut incoming_state = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+                let mut incoming_state = snow::Builder::new(noise_params.clone())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
                     let local_msg = &recv_buf2[0..length];
-                    if local_msg == b"CLIENT HELLO" {
+                    if local_msg == [PACKET_TAG_CLIENT_HELLO] {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
-                        let hello_bytes = b"SERVER UNKNOWN HELLO";
-                        let start_nonce  = rand::random::<u64>() >> 1;
+                        let start_nonce = rand::random::<u64>() >> 1;
                         send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
-                        send_buf1[8..8+hello_bytes.len()].copy_from_slice(hello_bytes);
-                        send_buf1[8+hello_bytes.len()..8+hello_bytes.len()+16].copy_from_slice(&from_ip);
-                        send_buf1[8+hello_bytes.len()+16..8+hello_bytes.len()+16+2].copy_from_slice(&from_port.to_le_bytes());
-                        let length = incoming_state.write_message(&send_buf1[0..8+hello_bytes.len()+16+2], &mut send_buf2).unwrap();
+                        send_buf1[8] = PACKET_TAG_SERVER_UNKNOWN_HELLO;
+                        send_buf1[8+1..8+1+16].copy_from_slice(&from_ip);
+                        send_buf1[8+1+16..8+1+16+2].copy_from_slice(&from_port.to_le_bytes());
+                        let length = incoming_state.write_message(&send_buf1[0..8+1+16+2], &mut send_buf2).unwrap();
                         match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(client_endpoint.ip_address), client_endpoint.port, 0, 0))) {
                             Ok(_) => (),
                             Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
@@ -1097,7 +1097,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             }
         }
         if msg.is_none() { continue; }
-        let msg = msg.unwrap();
+        let msg: &[u8] = msg.unwrap();
+        if msg.len() == 0 { continue; }
+        let tag = msg[0];
 
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
@@ -1119,31 +1121,32 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
             }
 
-            if &msg[0..b"ENDPOINT EVIDENCE".len()] == b"ENDPOINT EVIDENCE" {
-                let evidence = EndpointEvidence::read_from(&msg[b"ENDPOINT EVIDENCE".len()..]).unwrap();
-
-                if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
-                    peers[i].endpoint = Some(evidence.endpoint);
-                    if peer.endpoint == evidence.endpoint {
-                        println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint);
-                        let peer = unknown_peers.remove(peer_index);
-                        peers[i].outgoing_handshake_state = None;
-                        peers[i].pending_client_ack_transport_state = None;
-                        peers[i].transport_state = Some(peer.transport_state);
-                        peers[i].watch_dog = Instant::now();
-                        peers[i].nonce_ack_latest = peer.nonce_ack_latest;
-                        peers[i].nonce_ack_field = peer.nonce_ack_field;
-                        peers[i].on_send_next_nonce = peer.on_send_next_nonce;
-                        peers[i].connection_is_unknown = false;
+            match tag {
+                PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
+                    Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
+                        peers[i].endpoint = Some(evidence.endpoint);
+                        if peer.endpoint == evidence.endpoint {
+                            println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint);
+                            let peer = unknown_peers.remove(peer_index);
+                            peers[i].outgoing_handshake_state           = None;
+                            peers[i].pending_client_ack_transport_state = None;
+                            peers[i].transport_state                    = Some(peer.transport_state);
+                            peers[i].watch_dog                          = Instant::now();
+                            peers[i].nonce_ack_latest                   = peer.nonce_ack_latest;
+                            peers[i].nonce_ack_field                    = peer.nonce_ack_field;
+                            peers[i].on_send_next_nonce                 = peer.on_send_next_nonce;
+                            peers[i].connection_is_unknown              = false;
+                        }
+                        roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
+                        roster_endpoint_evidence.push(evidence);
                     }
-                    roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
-                    roster_endpoint_evidence.push(evidence);
+                    Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 }
-                continue;
-            } else {
-                println!("{:05}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+                _ => println!("{:05}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr),
             }
+            continue;
         }
+
         else {
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
@@ -1164,32 +1167,59 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 peer.nonce_ack_field |= 1_u64 << (peer.nonce_ack_latest - nonce);
             }
 
-            if peer.connection_is_unknown {
-                if msg == b"BEAT" {
-                    println!("{}: Got a heartbeat, this means that the other side does not consider me unknown anymore!", my_port);
+            match tag {
+                PACKET_TAG_HEARTBEAT => if peer.connection_is_unknown {
+                    println!("{:05}: Got a heartbeat, this means that the other side does not consider me unknown anymore!", my_port);
                     peer.connection_is_unknown = false;
                     continue;
                 }
-            }
 
-            if msg.len() >= b"ENDPOINT EVIDENCE".len() && &msg[0..b"ENDPOINT EVIDENCE".len()] == b"ENDPOINT EVIDENCE" {
-                let evidence = EndpointEvidence::read_from(&msg[b"ENDPOINT EVIDENCE".len()..]).unwrap();
-
-                if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
-                    peers[i].endpoint = Some(evidence.endpoint);
-                    roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
-                    roster_endpoint_evidence.push(evidence);
+                PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
+                    Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
+                        peers[i].endpoint = Some(evidence.endpoint);
+                        roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
+                        roster_endpoint_evidence.push(evidence);
+                    }
+                    Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 }
-                continue;
-            } else {
-                // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
-                continue;
+
+                _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
             }
+            continue;
         }
     }
 }
 
-const PACKET_TYPE_HEARTBEAT : u8 = 0;
+// network
+const PACKET_TAG_CLIENT_HELLO         : u8 = 0;
+const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 = 1;
+const PACKET_TAG_CLIENT_ACK           : u8 = 2;
+const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 = 3;
+const PACKET_TAG_SERVER_HELLO         : u8 = 4;
+const PACKET_TAG_HEARTBEAT            : u8 = 5;
+const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 = 6;
+// consensus
+const PACKET_TAG_PREVOTE_SIGNATURES   : u8 = 7;
+const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 = 8;
+const PACKET_TAG_COUNT                : u8 = 9;
+
+const PACKET_TAG_NAMES: [&str; PACKET_TAG_COUNT as usize] = {
+    let mut names = ["<MISSING>"; PACKET_TAG_COUNT as usize];
+    names[PACKET_TAG_CLIENT_HELLO         as usize] = "CLIENT_HELLO";
+    names[PACKET_TAG_CLIENT_UNKNOWN_ACK   as usize] = "CLIENT_UNKNOWN_ACK";
+    names[PACKET_TAG_CLIENT_ACK           as usize] = "CLIENT_ACK";
+    names[PACKET_TAG_SERVER_UNKNOWN_HELLO as usize] = "SERVER_UNKNOWN_HELLO";
+    names[PACKET_TAG_SERVER_HELLO         as usize] = "SERVER_HELLO";
+    names[PACKET_TAG_HEARTBEAT            as usize] = "HEARTBEAT";
+    names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = "ENDPOINT_EVIDENCE";
+    names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = "PREVOTE_SIGNATURES";
+    names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = "PRECOMMIT_SIGNATURES";
+    const_assert!(PACKET_TAG_COUNT == 9); // keep names array updated when adding other tags
+    names
+};
+fn packet_name_from_tag(tag: u8) -> &'static str { PACKET_TAG_NAMES.get(tag as usize).unwrap_or(&"<UNKNOWN>") }
+
+// NOTE(azmr): could add packet sizes so we can check all sizes in 1 location
 
 // Note(Sam): Heart beat should be different by connection type or contain information regarding the connection type.
 struct PacketHeartbeat {
