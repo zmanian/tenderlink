@@ -4,7 +4,7 @@
 
 
 use static_assertions::{const_assert};
-use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
+use std::{io::{Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use rand::{seq::IndexedRandom, Rng, RngCore, SeedableRng};
@@ -628,6 +628,15 @@ impl Default for Peer {
     }
 }
 
+// NOTE: buf can be open-ended
+trait SliceWrite         { fn write_to(&self, buf: &mut [u8]) -> usize; }
+impl SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&u64::to_le_bytes(*self)); 8 } }
+impl SliceWrite for u32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..4].copy_from_slice(&u32::to_le_bytes(*self)); 4 } }
+impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..2].copy_from_slice(&u16::to_le_bytes(*self)); 2 } }
+impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                       1 } }
+impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);   self.len() } }
+
+
 #[derive(Debug)]
 struct UnknownPeer {
     endpoint: SecureUdpEndpoint,
@@ -657,12 +666,13 @@ impl Default for SecureUdpEndpoint {
         SecureUdpEndpoint { public_key: [0_u8; 32], ip_address: [0_u8; 16], port: 0 }
     }
 }
+
 impl SecureUdpEndpoint {
-    pub fn write_to<W: Write>(&self, mut w: W) -> std::io::Result<()> {
-        w.write_all(&self.public_key)?;
-        w.write_all(&self.ip_address)?;
-        w.write_u16::<LittleEndian>(self.port)?;
-        Ok(())
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        self.public_key.write_to(&mut buf[..]);
+        self.ip_address.write_to(&mut buf[32..]);
+        self.port      .write_to(&mut buf[32+16..]);
+        32+16+2
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
@@ -685,10 +695,9 @@ impl Default for EndpointEvidence {
     }
 }
 impl EndpointEvidence {
-    pub fn write_to<W: Write>(&self, mut w: W) -> std::io::Result<()> {
-        self.endpoint.write_to(&mut w)?;
-        w.write_all(self.root_public_key.as_ref())?;
-        Ok(())
+    pub fn write_to(&self, buf: &mut [u8]) -> usize {
+        let o = self.endpoint.write_to(&mut buf[..]);
+        o + self.root_public_key.write_to(&mut buf[o..])
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
@@ -820,7 +829,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             }
         }
         fn send_noise_msg(transport: &mut StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, on_send_next_nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8]) {
-            send_buf2[0..8].copy_from_slice(&on_send_next_nonce.to_le_bytes());
+            on_send_next_nonce.write_to(&mut send_buf2[0..8]);
             let length = transport.write_message(*on_send_next_nonce, msg, &mut send_buf2[8..]).unwrap();
             *on_send_next_nonce += 1;
             send_sock_msg(sock, peer_endpoint, &send_buf2[0..8+length]);
@@ -852,10 +861,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             if peer.connection_is_unknown {
                                 // Gossip evidence in order to trigger upgrade
                                 if let Some(evidence) = my_endpoint_evidence {
-                                    let mut c = Cursor::new(&mut send_buf1[..]);
-                                    c.write_all(&[PACKET_TAG_ENDPOINT_EVIDENCE]).unwrap();
-                                    evidence.write_to(&mut c).unwrap();
-                                    let len1 = c.position() as usize;
+                                    send_buf1[0] = PACKET_TAG_ENDPOINT_EVIDENCE;
+                                    let len1 = 1 + evidence.write_to(&mut send_buf1[1..]);
                                     send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                                 }
                             }
@@ -880,17 +887,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                         if let Some(transport) = &mut peer.transport_state {
                             if let Some(evidence) = roster_endpoint_evidence.choose(&mut base_rng) {
-                                let mut c = Cursor::new(&mut send_buf1[..]);
-                                c.write_all(&[PACKET_TAG_ENDPOINT_EVIDENCE]).unwrap();
-                                evidence.write_to(&mut c).unwrap();
-                                let len1 = c.position() as usize;
+                                send_buf1[0] = PACKET_TAG_ENDPOINT_EVIDENCE;
+                                let len1     = 1 + evidence.write_to(&mut send_buf1[1..]);
                                 send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                             }
                         }
                     }
                 }
 
-                // TODO:
                 break;
             }
             let now_now = tokio::time::Instant::now();
@@ -991,7 +995,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let local_msg = &recv_buf2[0..length];
-                        if local_msg == &[PACKET_TAG_CLIENT_ACK] {
+                        if local_msg == [PACKET_TAG_CLIENT_ACK] {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
                             peer.transport_state          = peer.pending_client_ack_transport_state.take();
                             peer.outgoing_handshake_state = None;
@@ -1013,8 +1017,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         // TODO hash
                         if peer.outgoing_handshake_state.is_none() || my_port <= peer_endpoint.port {
                             let start_nonce = rand::random::<u64>() >> 1;
-                            send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
-                            send_buf1[8] = PACKET_TAG_SERVER_HELLO;
+                            start_nonce            .write_to(&mut send_buf1[0..]);
+                            PACKET_TAG_SERVER_HELLO.write_to(&mut send_buf1[8..]);
                             let length = incoming_state.write_message(&send_buf1[0..8+1], &mut send_buf2).unwrap();
                             send_sock_msg(&sock, peer_endpoint, &send_buf2[0..length]);
 
@@ -1064,10 +1068,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
                         let start_nonce = rand::random::<u64>() >> 1;
-                        send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
-                        send_buf1[8] = PACKET_TAG_SERVER_UNKNOWN_HELLO;
-                        send_buf1[8+1..8+1+16].copy_from_slice(&from_ip);
-                        send_buf1[8+1+16..8+1+16+2].copy_from_slice(&from_port.to_le_bytes());
+                        start_nonce                    .write_to(&mut send_buf1[      ..]);
+                        PACKET_TAG_SERVER_UNKNOWN_HELLO.write_to(&mut send_buf1[8     ..]);
+                        from_ip                        .write_to(&mut send_buf1[8+1   ..]);
+                        from_port                      .write_to(&mut send_buf1[8+1+16..]);
                         let length = incoming_state.write_message(&send_buf1[0..8+1+16+2], &mut send_buf2).unwrap();
                         send_sock_msg(&sock, client_endpoint, &send_buf2[0..length]);
 
@@ -1181,10 +1185,10 @@ struct PacketHeartbeat {
     nonce_ack_field: u64,
 }
 impl PacketHeartbeat {
-    pub fn write_to<W: Write>(&self, mut w: W) -> std::io::Result<()> {
-        w.write_u64::<LittleEndian>(self.nonce_ack_latest)?;
-        w.write_u64::<LittleEndian>(self.nonce_ack_field)?;
-        Ok(())
+    pub fn write_to(&self, buf: &mut [u8]) -> usize {
+        self.nonce_ack_latest.write_to(&mut buf[..]);
+        self.nonce_ack_field.write_to(&mut buf[64..]);
+        128
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
@@ -1208,30 +1212,31 @@ struct PubKeySig {
 // #[repr(C)]
 struct PacketVotes {
     tag:      u8,
-    votes_n:  u8,
+    votes_n:  u8, // ALT: split yes_votes, no_votes
     // pad_:     u16, // TODO: useful?
     round:    u32,
     height:   u64,
     value_id: ValueId,
+    // TODO: use u16 roster_idxs instead of pub_keys
     votes:    [PubKeySig; 12],
 }
 const_assert!(size_of::<PacketVotes>() == 1200); // TODO(azmr): exactly how much space is left
-                                                 // after noice/nonce/...?
+                                                 // after noise/nonce/ECC/...?
 
 impl PacketVotes {
-    pub fn write_to<W: Write>(&self, mut w: W) -> std::io::Result<()> {
-        w.write_u8(self.tag)?;
-        w.write_u8(self.votes_n)?;
-        // w.write_u16::<LittleEndian>(0)?;
-        w.write_u32::<LittleEndian>(self.round)?;
-        w.write_u64::<LittleEndian>(self.height)?;
-        w.write_all(&self.value_id.0)?;
-        // NOTE(azmr): slight saving of bytes-on-wire if unused?
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        self.tag       .write_to(&mut buf[ 0..]);
+        self.votes_n   .write_to(&mut buf[ 1..]);
+        self.round     .write_to(&mut buf[ 2..]);
+        self.height    .write_to(&mut buf[ 6..]);
+        self.value_id.0.write_to(&mut buf[14..]);
+        let mut o = 46;
+        // NOTE(azmr): slight saving of bytes-on-wire if unused? i.e. initial few times each
         for i in 0..self.votes_n as usize {
-            w.write_all(&self.votes[i].pub_key.0)?;
-            w.write_all(&self.votes[i].sig.0)?;
+            o += &self.votes[i].pub_key.0.write_to(&mut buf[o..]);
+            o += &self.votes[i].sig    .0.write_to(&mut buf[o..]);
         }
-        Ok(())
+        o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
