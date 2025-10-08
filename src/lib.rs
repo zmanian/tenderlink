@@ -740,6 +740,7 @@ fn nonce_is_ok(nonce: u64, nonce_ack_latest: u64, nonce_ack_field: u64) -> bool 
     if nonce > nonce_ack_latest && nonce > nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { ok = false; }
     if nonce == nonce_ack_latest { ok = false; }
     if nonce + 64 < nonce_ack_latest { ok = false; }
+    // TODO: this can overflow
     if nonce < nonce_ack_latest && 1_u64 << (nonce_ack_latest - nonce) & nonce_ack_field != 0 { ok = false; }
     ok
 }
@@ -782,10 +783,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
     let my_port = sock.local_addr().unwrap().port();
 
-    let mut peers : Vec<Peer> = roster.iter().filter(|k| **k != my_root_public_key.as_ref()).map(|k| Peer {
-        root_public_key: *k,
-        ..Peer::default()
-    }).collect();
+    let mut peers : Vec<Peer> = roster.iter().filter(|k| **k != my_root_public_key.as_ref())
+        .map(|k| Peer { root_public_key: *k, ..Peer::default() }).collect();
 
     for evidence in &roster_endpoint_evidence {
         if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
@@ -813,6 +812,20 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     let mut send_buf2 = [0; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
     loop {
+        fn send_sock_msg(sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8]) {
+            match sock.try_send_to(msg, SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
+                Ok(_) => (),
+                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
+                Err(error) => println!("Socket error: {:?}", error),
+            }
+        }
+        fn send_noise_msg(transport: &mut StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, on_send_next_nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8]) {
+            send_buf2[0..8].copy_from_slice(&on_send_next_nonce.to_le_bytes());
+            let length = transport.write_message(*on_send_next_nonce, msg, &mut send_buf2[8..]).unwrap();
+            *on_send_next_nonce += 1;
+            send_sock_msg(sock, peer_endpoint, &send_buf2[0..8+length]);
+        }
+
         let was_now = tokio::time::Instant::now();
         if was_now > next_tick_time {
             loop {
@@ -843,25 +856,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     c.write_all(&[PACKET_TAG_ENDPOINT_EVIDENCE]).unwrap();
                                     evidence.write_to(&mut c).unwrap();
                                     let len1 = c.position() as usize;
-                                    let length = transport.write_message(peer.on_send_next_nonce, &send_buf1[..len1], &mut send_buf2[8..]).unwrap();
-                                    send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
-                                    peer.on_send_next_nonce += 1;
-                                    match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                        Ok(_) => (),
-                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                        Err(error) => println!("Socket error: {:?}", error),
-                                    }
+                                    send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                                 }
                             }
                             else {
-                                let length = transport.write_message(peer.on_send_next_nonce, &[PACKET_TAG_HEARTBEAT], &mut send_buf2[8..]).unwrap();
-                                send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
-                                peer.on_send_next_nonce += 1;
-                                match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                    Ok(_) => (),
-                                    Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                    Err(error) => println!("Socket error: {:?}", error),
-                                }
+                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &[PACKET_TAG_HEARTBEAT]);
                             }
                         }
                     }
@@ -869,16 +868,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 for peer in &mut peers {
                     if let Some(peer_endpoint) = peer.endpoint {
                         if peer.transport_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_transport_state.is_none() {
-                            let mut outgoing_state = snow::Builder::new(noise_params.clone())
+                            let mut outgoing_state: HandshakeState = snow::Builder::new(noise_params.clone())
                                 .local_private_key(&my_static_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
                             let length = outgoing_state.write_message(&[PACKET_TAG_CLIENT_HELLO], &mut send_buf2).unwrap();
-                            match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                Ok(_) => (),
-                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                Err(error) => println!("Socket error: {:?}", error),
-                            }
+                            // TODO: no nonce?
+                            send_sock_msg(&sock, peer_endpoint, &send_buf2[0..length]);
                             peer.outgoing_handshake_state = Some(outgoing_state);
                         }
 
@@ -888,18 +884,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 c.write_all(&[PACKET_TAG_ENDPOINT_EVIDENCE]).unwrap();
                                 evidence.write_to(&mut c).unwrap();
                                 let len1 = c.position() as usize;
-                                let length = transport.write_message(peer.on_send_next_nonce, &send_buf1[..len1], &mut send_buf2[8..]).unwrap();
-                                send_buf2[0..8].copy_from_slice(&peer.on_send_next_nonce.to_le_bytes());
-                                peer.on_send_next_nonce += 1;
-                                match sock.try_send_to(&send_buf2[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                    Ok(_) => (),
-                                    Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                    Err(error) => println!("Socket error: {:?}", error),
-                                }
+                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                             }
                         }
                     }
                 }
+
+                // TODO:
                 break;
             }
             let now_now = tokio::time::Instant::now();
@@ -949,16 +940,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(buf: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool) {
-                            let start_nonce = rand::random::<u64>() >> 1;
-                            let tag         = if connection_is_unknown { PACKET_TAG_CLIENT_UNKNOWN_ACK } else { PACKET_TAG_CLIENT_ACK };
-                            let length      = transport.write_message(start_nonce, &[tag], &mut buf[8..]).unwrap();
-                            buf[0..8].copy_from_slice(&start_nonce.to_le_bytes());
-                            match sock.try_send_to(&buf[0..8+length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                Ok(_) => (),
-                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                Err(error) => println!("Socket error: {:?}", error),
-                            }
+                        fn finish_outgoing_handshake(send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool) {
+                            let tag = if connection_is_unknown { PACKET_TAG_CLIENT_UNKNOWN_ACK } else { PACKET_TAG_CLIENT_ACK };
+                            peer.on_send_next_nonce = rand::random::<u64>() >> 1;
+                            send_noise_msg(&mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &[tag]);
 
                             peer.transport_state                    = Some(transport);
                             peer.outgoing_handshake_state           = None;
@@ -966,7 +951,6 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             peer.nonce_ack_latest                   = nonce;
                             peer.nonce_ack_field                    = !0;
                             peer.connection_is_unknown              = connection_is_unknown;
-                            peer.on_send_next_nonce                 = start_nonce + 1;
                         }
 
                         if length >= 8 {
@@ -1018,7 +1002,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         }
                     }
                 }
-                let mut incoming_state = snow::Builder::new(noise_params.clone())
+                let mut incoming_state: HandshakeState = snow::Builder::new(noise_params.clone())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
@@ -1028,16 +1012,12 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
                         // TODO hash
                         if peer.outgoing_handshake_state.is_none() || my_port <= peer_endpoint.port {
-                            let hello_bytes = &[PACKET_TAG_SERVER_HELLO];
-                            let start_nonce  = rand::random::<u64>() >> 1;
+                            let start_nonce = rand::random::<u64>() >> 1;
                             send_buf1[0..8].copy_from_slice(&u64::to_le_bytes(start_nonce));
-                            send_buf1[8..8+hello_bytes.len()].copy_from_slice(hello_bytes);
-                            let length = incoming_state.write_message(&send_buf1[0..8+hello_bytes.len()], &mut send_buf2).unwrap();
-                            match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0))) {
-                                Ok(_) => (),
-                                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                                Err(error) => println!("Socket error: {:?}", error),
-                            }
+                            send_buf1[8] = PACKET_TAG_SERVER_HELLO;
+                            let length = incoming_state.write_message(&send_buf1[0..8+1], &mut send_buf2).unwrap();
+                            send_sock_msg(&sock, peer_endpoint, &send_buf2[0..length]);
+
                             if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
                                 peer.pending_client_ack_transport_state = Some(transport);
                                 peer.on_send_next_nonce                 = start_nonce+1;
@@ -1074,7 +1054,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         break;
                     }
                 }
-                let mut incoming_state = snow::Builder::new(noise_params.clone())
+                let mut incoming_state: HandshakeState = snow::Builder::new(noise_params.clone())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
@@ -1089,11 +1069,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         send_buf1[8+1..8+1+16].copy_from_slice(&from_ip);
                         send_buf1[8+1+16..8+1+16+2].copy_from_slice(&from_port.to_le_bytes());
                         let length = incoming_state.write_message(&send_buf1[0..8+1+16+2], &mut send_buf2).unwrap();
-                        match sock.try_send_to(&send_buf2[0..length], SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(client_endpoint.ip_address), client_endpoint.port, 0, 0))) {
-                            Ok(_) => (),
-                            Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                            Err(error) => println!("Socket error: {:?}", error),
-                        }
+                        send_sock_msg(&sock, client_endpoint, &send_buf2[0..length]);
+
                         if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
                             unknown_peers.push(UnknownPeer { endpoint: client_endpoint, transport_state: transport, pending_client_ack: true, watch_dog: Instant::now(), nonce_ack_latest: 0, nonce_ack_field: 0, on_send_next_nonce: start_nonce+1, });
                         }
