@@ -81,26 +81,17 @@ enum TMStatus {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ValueId([u8; 32]);
-impl ValueId {
-    const NIL: Self = Self([0; 32]);
-}
+impl ValueId { const NIL: Self = Self([0; 32]); }
+impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PubKeyID([u8; 32]);
-impl PubKeyID {
-    const NIL: Self = Self([0; 32]);
-}
-impl std::fmt::Display for PubKeyID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_byte_str(f, &self.0)
-    }
-}
+impl PubKeyID { const NIL: Self = Self([0; 32]); }
+impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TMSig ([u8; 64]);
-impl TMSig {
-    const NIL: Self = Self([0; 64]);
-}
+impl TMSig { const NIL: Self = Self([0; 64]); }
 
 struct RoundData {
     height: u64,
@@ -301,8 +292,8 @@ impl TMState {
     }
 
     fn id_from_value(proposal: BlockValue) -> ValueId {
-        // TODO: secure hash
-        ValueId([proposal.0[0] | 1; 32]) // non-nil
+        let key: [u8; 32] = blake3::Hasher::new_derive_key("BFT Value ID").finalize().into();
+        ValueId(*blake3::keyed_hash(&key, &proposal.0).as_bytes())
     }
 
     fn f_from_n(n: u64) -> u64 {
@@ -744,6 +735,16 @@ impl std::fmt::Debug for SecureUdpEndpoint {
     }
 }
 
+// returns true if a is initiator
+fn contended_noise_is_initiator(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    // TODO: do we want a fast insecure hash for this kind of thing?
+    // TODO: talk to Zooko about not paying the upfront key derive cost every time
+    let key: [u8; 32] = blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into(); // NOTE(azmr): skipping update
+    let a_to_b_hash = blake3::Hasher::new_keyed(&key).update(a).update(b).finalize();
+    let b_to_a_hash = blake3::Hasher::new_keyed(&key).update(b).update(a).finalize();
+    a_to_b_hash.as_bytes() <= b_to_a_hash.as_bytes()
+}
+
 fn nonce_is_ok(nonce: u64, nonce_ack_latest: u64, nonce_ack_field: u64) -> bool {
     let mut ok = true;
     if nonce > nonce_ack_latest && nonce > nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { ok = false; }
@@ -962,8 +963,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             if length == 8 { break; } // presumably we don't care about standalone nonces
                             let local_msg = &recv_buf2[8..length];
                             if local_msg == [PACKET_TAG_SERVER_HELLO] {
-                                // TODO hash
-                                if peer.pending_client_ack_transport_state.is_none() || my_port > peer_endpoint.port {
+                                if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&my_root_public_key.into(), &peer.root_public_key) {
                                     if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                         println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
                                         finish_outgoing_handshake(&mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false);
@@ -1014,8 +1014,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if local_msg == &[PACKET_TAG_CLIENT_HELLO] {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
-                        // TODO hash
-                        if peer.outgoing_handshake_state.is_none() || my_port <= peer_endpoint.port {
+                        if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&my_root_public_key.into(), &peer.root_public_key) {
                             let start_nonce = rand::random::<u64>() >> 1;
                             start_nonce            .write_to(&mut send_buf1[0..]);
                             PACKET_TAG_SERVER_HELLO.write_to(&mut send_buf1[8..]);
