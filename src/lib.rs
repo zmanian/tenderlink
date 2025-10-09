@@ -660,6 +660,7 @@ impl Default for Peer {
 // NOTE: buf can be open-ended
 trait SliceWrite         { fn write_to(&self, buf: &mut [u8]) -> usize; }
 impl SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&u64::to_le_bytes(*self)); 8 } }
+impl SliceWrite for i64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&i64::to_le_bytes(*self)); 8 } }
 impl SliceWrite for u32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..4].copy_from_slice(&u32::to_le_bytes(*self)); 4 } }
 impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..2].copy_from_slice(&u16::to_le_bytes(*self)); 2 } }
 impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                       1 } }
@@ -961,7 +962,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                     my_pub_key.0.write_to(&mut proposal.0[..]);
                     let mut hdr = PacketProposalChunkHeader {
-                        height: bft_state.height(), round: bft_state.round, proposal_id: TMState::id_from_value(&proposal), chunk_i: 0,
+                        height:      bft_state.height(),
+                        round:       bft_state.round,
+                        proposal_id: TMState::id_from_value(&proposal),
+                        valid_round: bft_state.valid_value_round.1,
+                        chunk_i:     0,
                     };
                     send_buf1[0] = PACKET_TAG_PROPOSAL_CHUNK;
 
@@ -1466,7 +1471,7 @@ impl PacketVotes {
 
 const PROPOSAL_SEM_SIZE:        usize = 6000;
 const PROPOSAL_CHUNK_SIZE:      usize = 1200;
-const PROPOSAL_CHUNK_DATA_SIZE: usize = 1087;
+const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_CHUNK_SIZE - (1 + 56 + 64);
 const PROPOSAL_CHUNKS_N:        usize = (PROPOSAL_SEM_SIZE + PROPOSAL_CHUNK_DATA_SIZE - 1) / PROPOSAL_CHUNK_DATA_SIZE; // ceil div
 const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
 const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
@@ -1479,40 +1484,31 @@ struct PacketProposalChunkHeader {
     chunk_i:     u32,
     round:       u32,
     height:      u64,
+    valid_round: i64,
     proposal_id: ValueId, // for the total proposal, not just this chunk
     // data:        [u8; 1087], // 1200-113
     // proposer_signature: TMSig,
 }
 impl PacketProposalChunkHeader {
-    // TODO: we can avoid an extra moderate-size copy if we don't use these
-
-    // fn write_to_and_sign(&self, buf: &mut [u8], private_key: &ed25519_zebra::SigningKey) -> usize {
-    //     self.chunk_i      .write_to(&mut buf[ 0..]);
-    //     self.round        .write_to(&mut buf[ 4..]);
-    //     self.height       .write_to(&mut buf[ 8..]);
-    //     self.proposal_id.0.write_to(&mut buf[16..]);
-    //     self.data         .write_to(&mut buf[48..]);
-    //     let sig = private_key.sign(&buf[..1135]);
-    //     sig.to_bytes().write_to(&mut buf[1135..]);
-    //     1199
-    // }
     fn write_to(&self, buf: &mut [u8]) -> usize {
         self.chunk_i      .write_to(&mut buf[   0..]);
         self.round        .write_to(&mut buf[   4..]);
         self.height       .write_to(&mut buf[   8..]);
-        self.proposal_id.0.write_to(&mut buf[  16..]);
+        self.valid_round  .write_to(&mut buf[  16..]);
+        self.proposal_id.0.write_to(&mut buf[  24..]);
         // self.data                .write_to(&mut buf[48..]);
         // self.proposer_signature.0.write_to(&mut buf[1135..]);
-        48
+        56
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = PacketProposalChunkHeader {
-            chunk_i: 0, round: 0, height: 0, proposal_id: ValueId::NIL
+            chunk_i: 0, round: 0, height: 0, valid_round: 0, proposal_id: ValueId::NIL
         };
-        packet.chunk_i = r.read_u32::<LittleEndian>()?;
-        packet.round   = r.read_u32::<LittleEndian>()?;
-        packet.height  = r.read_u64::<LittleEndian>()?;
+        packet.chunk_i     = r.read_u32::<LittleEndian>()?;
+        packet.round       = r.read_u32::<LittleEndian>()?;
+        packet.height      = r.read_u64::<LittleEndian>()?;
+        packet.valid_round = r.read_i64::<LittleEndian>()?;
         r.read_exact(&mut packet.proposal_id.0)?;
         Ok(packet)
     }
