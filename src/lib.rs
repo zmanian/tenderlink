@@ -168,8 +168,8 @@ struct TMMsg {
     sig: TMSig,
 }
 
-fn roster_i_from_pub_key(_pub_key: PubKeyID) -> usize {
-    0
+fn roster_i_from_pub_key(roster: &[SortedRosterMember], pub_key: PubKeyID) -> Option<usize> {
+    roster.iter().position(|m| m.pub_key == pub_key)
 }
 
 struct Timeout { time: Instant, height: u64, round: u32, step: TMStep }
@@ -321,7 +321,14 @@ impl TMState {
         // TODO: potentially track < self.height(), but we'll need to have historical roster info
         if height != self.height() { return TMStatus::Fail; } // may be valid later if we're catching up
 
-        let roster_i = roster_i_from_pub_key(from_pub_key);
+        let Some(roster_i) = roster_i_from_pub_key(roster, from_pub_key) else {
+            eprintln!("BFT ERROR at {}.{}: {} not on roster", height, round, from_pub_key);
+            return TMStatus::Fail;
+        };
+        if roster_i >= active_roster_len(roster) {
+            eprintln!("BFT ERROR at {}.{}: {} is outside active roster: {}", height, round, from_pub_key, roster_i);
+            return TMStatus::Fail;
+        }
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -355,11 +362,13 @@ impl TMState {
             TMMsgData::Prevote(v_id) | TMMsgData::Precommit(v_id) => {
                 // TODO: check if this person has previously voted differently
 
-                if ! is_prev_seen_round && self.rounds_data[round_i].proposal_sig == TMSig::NIL {
-                    // if we don't have a real proposal yet we can't check for
+                if v_id == ValueId::NIL { // always legal
+                    TMStatus::Pass
+                } else if ! is_prev_seen_round || self.rounds_data[round_i].proposal_sig == TMSig::NIL {
+                    // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
                 } else if self.rounds_data[round_i].proposal_id != v_id {
-                    eprintln!("BFT at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
+                    eprintln!("BFT FAULT at {}.{}: finalizer {} voted on non-proposed value. Ignoring...", height, round, roster_i);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
@@ -389,7 +398,7 @@ impl TMState {
 
                     if prev_value_sig == TMSig::NIL { // votes but value not seen before
                     } else if prev_value != value { // TODO: id
-                        eprintln!("BFT ERROR at {}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, roster_i);
+                        eprintln!("BFT FAULT at {}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, roster_i);
                         return TMStatus::Fail;
                     } else {
                         return TMStatus::Pass; // already good
@@ -421,7 +430,7 @@ impl TMState {
                 let new_has_any_sigs = new_has_sigs[0] | new_has_sigs[1];
 
                 if old_has_sigs[is_precommit] != 0 && old[is_precommit] != new[is_precommit] {
-                    eprintln!("BFT ERROR at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
+                    eprintln!("BFT FAULT at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
                     return TMStatus::Fail;
                 }
 
@@ -942,10 +951,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
                         };
 
-                        packet.votes[0] = PubKeySig{ pub_key: PubKeyID(my_root_public_key.into()), sig: TMSig::NIL };
+                        let sign_datas = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
+                        let sig        = my_root_private_key.sign(&sign_datas[0]);
+                        packet.votes[0] = PubKeySig{ pub_key: PubKeyID(my_root_public_key.into()), sig: TMSig(sig.to_bytes()) };
                         packet.votes_n  = 1;
 
-                        println!("{:05}: sending {} prevote sigs", my_port, packet.votes_n);
+                        let src_roster_i = roster_i_from_pub_key(&roster, packet.votes[0].pub_key);
+                        let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
+                        println!("{:05}: {:?} sending {} prevote sigs to {:?}", my_port, src_roster_i, packet.votes_n, dst_roster_i);
                         let len1 = packet.write_to(&mut send_buf1[..]);
                         send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1])
                     }
@@ -1220,7 +1233,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 };
                             let msg = if tag == PACKET_TAG_PREVOTE_SIGNATURES { TMMsgData::Prevote(value_id) } else { TMMsgData::Precommit(value_id) };
 
-                            eprintln!("{:05}: valid signature in {} from {} for value id: {}", my_port, packet_name_from_tag(tag), pub_key, value_id);
+                            let roster_i = roster_i_from_pub_key(&roster, pub_key);
+                            eprintln!("{:05}: valid signature in {}.{} {} from {:?} ({}) for value id: {}", my_port, packet.height, packet.round, packet_name_from_tag(tag), roster_i, pub_key, value_id);
                             bft_state.check_and_incorporate_msg(&roster, pub_key, packet.height, packet.round, msg, sig);
                         }
                     }
