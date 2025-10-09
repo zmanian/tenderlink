@@ -4,7 +4,7 @@
 
 
 use static_assertions::{const_assert};
-use std::{io::{Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
+use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use rand::{seq::IndexedRandom, Rng, RngCore, SeedableRng};
@@ -64,7 +64,7 @@ struct TMVote {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct BlockValue([u8; 6000]);
+struct BlockValue([u8; PROPOSAL_BUF_SIZE]); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
 impl BlockValue {
     fn is_valid(&self) -> TMStatus {
         // TODO
@@ -74,7 +74,7 @@ impl BlockValue {
 
 fn get_bft_value() -> BlockValue {
     // TODO: sim/get from PoW
-    BlockValue([0; 6000])
+    BlockValue([0; PROPOSAL_BUF_SIZE])
 }
 
 
@@ -128,7 +128,7 @@ impl RoundData {
     const EMPTY: RoundData = RoundData{
         height: 0,
         round: 0,
-        proposal: BlockValue([0; 6000]),
+        proposal: BlockValue([0; PROPOSAL_BUF_SIZE]),
         proposal_valid_round: -1,
         proposal_sig: TMSig([0; 64]),
         proposal_id: ValueId::NIL,
@@ -302,9 +302,9 @@ impl TMState {
         }
     }
 
-    fn id_from_value(proposal: BlockValue) -> ValueId {
+    fn id_from_value(proposal: &BlockValue) -> ValueId {
         let key: [u8; 32] = blake3::Hasher::new_derive_key("BFT Value ID").finalize().into();
-        ValueId(*blake3::keyed_hash(&key, &proposal.0).as_bytes())
+        ValueId(*blake3::keyed_hash(&key, &proposal.0[..PROPOSAL_SEM_SIZE]).as_bytes())
     }
 
     fn f_from_n(n: u64) -> u64 {
@@ -350,7 +350,7 @@ impl TMState {
                 // "have they previously proposed a different value?"
                 if (is_prev_seen_round &&
                     self.rounds_data[round_i].proposal_sig != TMSig::NIL &&
-                    self.rounds_data[round_i].proposal_id  != Self::id_from_value(value))
+                    self.rounds_data[round_i].proposal_id  != Self::id_from_value(&value))
                 {
                     eprintln!("BFT at {}.{}: proposer {} proposed 2 different values. Ignoring latest...", height, round, roster_i);
                     return TMStatus::Fail;
@@ -398,6 +398,7 @@ impl TMState {
 
                     if prev_value_sig == TMSig::NIL { // votes but value not seen before
                     } else if prev_value != value { // TODO: id
+                        // TODO: treat this as a failed is_valid & early out before awaiting full proposal
                         eprintln!("BFT FAULT at {}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, roster_i);
                         return TMStatus::Fail;
                     } else {
@@ -408,7 +409,7 @@ impl TMState {
                 round_data.proposal             = value;
                 round_data.proposal_valid_round = valid_round;
                 round_data.proposal_sig         = sig;
-                round_data.proposal_id          = Self::id_from_value(value);
+                round_data.proposal_id          = Self::id_from_value(&value);
 
                 // TODO: include signed prevote & precommit for self?
             }
@@ -451,13 +452,13 @@ impl TMState {
                 let d_valid_precommits_n = new_status[1][1] - old_status[1][1];
                 let d_nil_prevotes_n     = new_status[0][0] - old_status[0][0];
 
-                println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
-                println!("    {} d_anys_n            ", d_anys_n);
-                println!("    {} d_prevotes_n        ", d_prevotes_n);
-                println!("    {} d_precommits_n      ", d_precommits_n);
-                println!("    {} d_valid_prevotes_n  ", d_valid_prevotes_n);
-                println!("    {} d_valid_precommits_n", d_valid_precommits_n);
-                println!("    {} d_nil_prevotes_n    ", d_nil_prevotes_n);
+                // println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
+                // println!("    {} d_anys_n            ", d_anys_n);
+                // println!("    {} d_prevotes_n        ", d_prevotes_n);
+                // println!("    {} d_precommits_n      ", d_precommits_n);
+                // println!("    {} d_valid_prevotes_n  ", d_valid_prevotes_n);
+                // println!("    {} d_valid_precommits_n", d_valid_precommits_n);
+                // println!("    {} d_nil_prevotes_n    ", d_nil_prevotes_n);
 
                 round_data.anys_n             += d_anys_n;
                 round_data.prevotes_n         += d_prevotes_n;
@@ -953,6 +954,47 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
 
+                let my_pub_key = PubKeyID(my_root_public_key.into());
+                let proposal_id = if TMState::proposer_from_height_round(&roster, bft_state.height(), bft_state.round).1 == my_pub_key {
+                    let mut proposal = BlockValue([((bft_state.height() << 4) as u32 ^ bft_state.round) as u8; PROPOSAL_BUF_SIZE]);
+                    [0; PROPOSAL_BUF_SIZE - PROPOSAL_SEM_SIZE].write_to(&mut proposal.0[PROPOSAL_SEM_SIZE..]);
+
+                    my_pub_key.0.write_to(&mut proposal.0[..]);
+                    let mut hdr = PacketProposalChunkHeader {
+                        height: bft_state.height(), round: bft_state.round, proposal_id: TMState::id_from_value(&proposal), chunk_i: 0,
+                    };
+                    send_buf1[0] = PACKET_TAG_PROPOSAL_CHUNK;
+
+                    // TODO: spread out sending
+                    // TODO: filter on full connection?
+                    for peer_i in 0..peers.len() {
+                        let peer = &mut peers[peer_i];
+                        for chunk_i in 0..PROPOSAL_CHUNKS_N {
+                            if let Some(peer_endpoint) = peer.endpoint &&
+                               let Some(transport)     = &mut peer.transport_state
+                            {
+                                // @testing
+                                hdr.chunk_i = chunk_i as u32;
+                                let mut o = 1 + hdr.write_to(&mut send_buf1[1..]);
+
+                                let chunk_bgn_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+                                o += proposal.0[chunk_bgn_o..chunk_bgn_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut send_buf1[o..]);
+
+                                let sig_o = o;
+                                let sig = my_root_private_key.sign(&send_buf1[1..sig_o]);
+                                o += sig.to_bytes().write_to(&mut send_buf1[o..]);
+
+                                let src_roster_i = roster_i_from_pub_key(&roster, my_pub_key);
+                                let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
+                                println!("{:05}: {:?} sending proposal {}.{}.{} ({}) sig_o: {} to {:?}", my_port, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
+                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o])
+                            }
+                        }
+                    }
+
+                    hdr.proposal_id
+                } else { ValueId([0xab; 32]) };
+
                 // send out updates
                 for peer in &mut peers {
                     if let Some(peer_endpoint) = peer.endpoint &&
@@ -963,14 +1005,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             tag: PACKET_TAG_PREVOTE_SIGNATURES,
                             height: bft_state.height(),
                             round:  bft_state.round,
-                            value_id: ValueId([0xab; 32]),
+                            value_id: proposal_id,
                             votes_n: 0,
                             votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
                         };
 
                         let sign_datas = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
                         let sig        = my_root_private_key.sign(&sign_datas[1]);
-                        packet.votes[0] = PubKeySig{ pub_key: PubKeyID(my_root_public_key.into()), sig: TMSig(sig.to_bytes()) };
+                        packet.votes[0] = PubKeySig{ pub_key: my_pub_key, sig: TMSig(sig.to_bytes()) };
                         packet.votes_n  = 1;
 
                         let src_roster_i = roster_i_from_pub_key(&roster, packet.votes[0].pub_key);
@@ -1225,6 +1267,49 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 }
 
+                PACKET_TAG_PROPOSAL_CHUNK => if msg.len() == PROPOSAL_CHUNK_SIZE {
+                    let mut cur = Cursor::new(&msg[1..]);
+                    let hdr = match PacketProposalChunkHeader::read_from(&mut cur) {
+                        Ok(hdr)  => hdr,
+                        Err(err) => { eprintln!("{:05}: couldn't read proposal chunk: {}", my_port, err); continue; }
+                    };
+
+                    if hdr.height != bft_state.height() {
+                        eprintln!("{:05}: BFT FAULT: received proposal for height {} when we're at {}", my_port, hdr.height, bft_state.height());
+                    }
+
+                    let data_o = 1 + cur.position() as usize;
+                    let sig_o  = data_o + PROPOSAL_CHUNK_DATA_SIZE;
+                    let signed_data = &msg[1..sig_o];
+                    let sig = match ed25519_zebra::Signature::from_slice(&msg[sig_o..sig_o + 64]) {
+                        Ok(v)=>v, Err(err)=>{ eprintln!("{:05}: BFT FAULT: malformed proposal signature: {}", my_port, err); continue; }
+                    };
+
+                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round);
+                    let vk = match ed25519_zebra::VerificationKey::try_from(proposer_pub_key.0) {
+                        Ok(vk)   => vk,
+                        Err(err) => {
+                            eprintln!("{:05}: BFT ERROR: invalid proposer public key: {} ({})", my_port, proposer_pub_key, err);
+                            continue;
+                        }
+                    };
+
+                    match vk.verify(&sig, signed_data) {
+                        Ok(_)    => {},
+                        Err(err) => {
+                            eprintln!("{:05}: BFT FAULT: invalid signature from {} for proposal chunk {}.{}.{}[1..{}]: {}",
+                                my_port, proposer_pub_key, hdr.height, hdr.round, hdr.chunk_i, sig_o, err);
+                            continue;
+                        }
+                    }
+                    let roster_i = roster_i_from_pub_key(&roster, proposer_pub_key);
+                    eprintln!("{:05}: valid signature in proposal {}.{}.{} from {:?} ({}) for value id: {}",
+                    my_port, hdr.height, hdr.round, hdr.chunk_i, roster_i, proposer_pub_key, hdr.proposal_id);
+                    // bft_state.check_and_incorporate_msg(&roster, proposer_pub_key, hdr.height, hdr.round, TMMSgData::Proposal(..), TMSig(sig.to_bytes()));
+                } else {
+                    eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
+                }
+
                 PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(msg) {
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
@@ -1266,17 +1351,18 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 }
 
 // network
-const PACKET_TAG_CLIENT_HELLO         : u8 = 0;
-const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 = 1;
-const PACKET_TAG_CLIENT_ACK           : u8 = 2;
-const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 = 3;
-const PACKET_TAG_SERVER_HELLO         : u8 = 4;
-const PACKET_TAG_HEARTBEAT            : u8 = 5;
-const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 = 6;
+const PACKET_TAG_CLIENT_HELLO         : u8 =  0;
+const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  1;
+const PACKET_TAG_CLIENT_ACK           : u8 =  2;
+const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  3;
+const PACKET_TAG_SERVER_HELLO         : u8 =  4;
+const PACKET_TAG_HEARTBEAT            : u8 =  5;
+const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  6;
 // consensus
-const PACKET_TAG_PREVOTE_SIGNATURES   : u8 = 7;
-const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 = 8;
-const PACKET_TAG_COUNT                : u8 = 9;
+const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  7;
+const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  8;
+const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 =  9;
+const PACKET_TAG_COUNT                : u8 = 10;
 
 const PACKET_TAG_NAMES: [&str; PACKET_TAG_COUNT as usize] = {
     let mut names = ["<MISSING>"; PACKET_TAG_COUNT as usize];
@@ -1287,9 +1373,10 @@ const PACKET_TAG_NAMES: [&str; PACKET_TAG_COUNT as usize] = {
     names[PACKET_TAG_SERVER_HELLO         as usize] = "SERVER_HELLO";
     names[PACKET_TAG_HEARTBEAT            as usize] = "HEARTBEAT";
     names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = "ENDPOINT_EVIDENCE";
+    names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = "PROPOSAL_CHUNK";
     names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = "PREVOTE_SIGNATURES";
     names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = "PRECOMMIT_SIGNATURES";
-    const_assert!(PACKET_TAG_COUNT == 9); // keep names array updated when adding other tags
+    const_assert!(PACKET_TAG_COUNT == 10); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_tag(tag: u8) -> &'static str { PACKET_TAG_NAMES.get(tag as usize).unwrap_or(&"<UNKNOWN>") }
@@ -1323,6 +1410,8 @@ struct PubKeySig {
     pub_key: PubKeyID,
     sig: TMSig,
 }
+
+// ALT: common packet header: tag, height, round, value_id
 
 // agnostic to prevote/precommit - communicated elsewhere
 // NOTE: all votes for the same value_id (or nil)
@@ -1371,6 +1460,60 @@ impl PacketVotes {
             r.read_exact(&mut packet.votes[i].pub_key.0)?;
             r.read_exact(&mut packet.votes[i].sig.0)?;
         }
+        Ok(packet)
+    }
+}
+
+const PROPOSAL_SEM_SIZE:        usize = 6000;
+const PROPOSAL_CHUNK_SIZE:      usize = 1200;
+const PROPOSAL_CHUNK_DATA_SIZE: usize = 1087;
+const PROPOSAL_CHUNKS_N:        usize = (PROPOSAL_SEM_SIZE + PROPOSAL_CHUNK_DATA_SIZE - 1) / PROPOSAL_CHUNK_DATA_SIZE; // ceil div
+const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
+const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
+
+// NOTE(azmr): this is:
+// - conservative in terms of max chunks, value_id, & arrival order
+// - assuming a fixed total proposal size
+struct PacketProposalChunkHeader {
+    // tag
+    chunk_i:     u32,
+    round:       u32,
+    height:      u64,
+    proposal_id: ValueId, // for the total proposal, not just this chunk
+    // data:        [u8; 1087], // 1200-113
+    // proposer_signature: TMSig,
+}
+impl PacketProposalChunkHeader {
+    // TODO: we can avoid an extra moderate-size copy if we don't use these
+
+    // fn write_to_and_sign(&self, buf: &mut [u8], private_key: &ed25519_zebra::SigningKey) -> usize {
+    //     self.chunk_i      .write_to(&mut buf[ 0..]);
+    //     self.round        .write_to(&mut buf[ 4..]);
+    //     self.height       .write_to(&mut buf[ 8..]);
+    //     self.proposal_id.0.write_to(&mut buf[16..]);
+    //     self.data         .write_to(&mut buf[48..]);
+    //     let sig = private_key.sign(&buf[..1135]);
+    //     sig.to_bytes().write_to(&mut buf[1135..]);
+    //     1199
+    // }
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        self.chunk_i      .write_to(&mut buf[   0..]);
+        self.round        .write_to(&mut buf[   4..]);
+        self.height       .write_to(&mut buf[   8..]);
+        self.proposal_id.0.write_to(&mut buf[  16..]);
+        // self.data                .write_to(&mut buf[48..]);
+        // self.proposer_signature.0.write_to(&mut buf[1135..]);
+        48
+    }
+
+    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
+        let mut packet = PacketProposalChunkHeader {
+            chunk_i: 0, round: 0, height: 0, proposal_id: ValueId::NIL
+        };
+        packet.chunk_i = r.read_u32::<LittleEndian>()?;
+        packet.round   = r.read_u32::<LittleEndian>()?;
+        packet.height  = r.read_u64::<LittleEndian>()?;
+        r.read_exact(&mut packet.proposal_id.0)?;
         Ok(packet)
     }
 }
