@@ -985,6 +985,115 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
+                if let Ok(round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), bft_state.round), |el| (el.height, el.round)) {
+                    let round_data = &bft_state.rounds_data[round_i];
+                    let height = round_data.height;
+                    let round  = round_data.round;
+
+                    let mut hdr = PacketProposalChunkHeader {
+                        height, round, chunk_i: 0,
+                        proposal_id: round_data.proposal_id,
+                        valid_round: round_data.proposal_valid_round,
+                    };
+                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, height, round);
+
+                    if hdr.proposal_id != ValueId::NIL {
+                        for chunk_i in 0..PROPOSAL_CHUNKS_N {
+                            // send all of the proposal chunks we've seen
+                            if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
+                                hdr.chunk_i = chunk_i as u32;
+                                let chunk_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+
+                                send_buf1[0] = PACKET_TAG_PROPOSAL_CHUNK;
+                                let mut o = 1 + hdr.write_to(&mut send_buf1[1..]);
+                                o += round_data.proposal.0[chunk_o..chunk_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut send_buf1[o..]);
+                                let sig_o = o;
+                                o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
+
+                                if true {
+                                    let sig = match ed25519_zebra::Signature::from_slice(&round_data.proposal_sigs[chunk_i].0) { Ok(v)=>v, Err(err)=> {
+                                        eprintln!("{:05}: BFT FAULT: malformed proposal signature: {}", my_port, err);
+                                        continue;
+                                    }};
+                                    let vk = match ed25519_zebra::VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
+                                        eprintln!("{:05}: BFT FAULT: invalid proposal public key: {} ({})", my_port, proposer_pub_key, err);
+                                        continue;
+                                    }};
+                                    match vk.verify(&sig, &send_buf1[1..sig_o]) { Ok(_)=>{}, Err(err)=>{
+                                        eprintln!("{:05}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
+                                            my_port, proposer_pub_key, height, round, chunk_i, sig_o-1, hdr.proposal_id, err);
+                                        continue;
+                                    }}
+                                }
+
+                                for peer in &mut peers {
+                                    if let Some(peer_endpoint) = peer.endpoint &&
+                                       let Some(transport) = &mut peer.transport_state {
+                                           send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
+                                    }
+                                }
+                            }
+                        }
+
+                        for is_precommit in 0..2 {
+                            let mut packet = PacketVotes {
+                                tag: PACKET_TAG_PREVOTE_SIGNATURES + is_precommit,
+                                height, round,
+                                value_id: hdr.proposal_id,
+                                no_votes_n: 0, yes_votes_n: 0,
+                                votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
+                            };
+
+                            for roster_i in 0..round_data.msg_val_sigs.len() {
+                                let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
+                                if sig != TMSig::NIL {
+                                    let pub_key_sig = PubKeySig{ pub_key: roster[roster_i].pub_key, sig };
+
+                                    // add nos and yeses from opposite ends to avoid excess moves
+                                     if value_id == ValueId::NIL {
+                                        packet.votes[packet.no_votes_n as usize] = pub_key_sig;
+                                        packet.yes_votes_n += 1;
+                                    } else {
+                                        packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
+                                        packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
+                                    };
+
+                                    if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
+                                        // full evidence block; send it
+                                        // println!("{:05}: full block: {:#?}", my_port, packet);
+                                        let len1 = packet.write_to(&mut send_buf1[..]);
+                                        for peer in &mut peers {
+                                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
+                                            }
+                                        }
+
+                                        packet.no_votes_n  = 0;
+                                        packet.yes_votes_n = 0;
+                                        packet.votes       = [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ];
+                                    }
+                                }
+                            }
+
+                            // send any half-filled vote blocks
+                            if (packet.no_votes_n + packet.yes_votes_n) > 0 {
+                                // println!("{:05}: half-filled block pre-gap-close: {:#?}", my_port, packet);
+                                // move items from end to fill gap
+                                for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
+                                    packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i]
+                                }
+
+                                // println!("{:05}: half-filled block post-gap-close: {:#?}", my_port, packet);
+                                let len1 = packet.write_to(&mut send_buf1[..]);
+                                for peer in &mut peers {
+                                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                        send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let my_pub_key = PubKeyID(my_root_public_key.into());
                 let proposal_id = if TMState::proposer_from_height_round(&roster, bft_state.height(), bft_state.round).1 == my_pub_key {
