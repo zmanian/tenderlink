@@ -37,7 +37,7 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
     e == std::io::ErrorKind::WouldBlock || e == std::io::ErrorKind::TimedOut
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SortedRosterMember {
     pub_key: PubKeyID,
     stake: u64,
@@ -90,15 +90,18 @@ enum TMStatus {
 struct ValueId([u8; 32]);
 impl ValueId { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
+impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PubKeyID([u8; 32]);
 impl PubKeyID { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
+impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TMSig ([u8; 64]);
 impl TMSig { const NIL: Self = Self([0; 64]); }
+impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
 struct RoundData {
     height: u64,
@@ -112,6 +115,7 @@ struct RoundData {
     proposal_id: ValueId,
     proposal_checked_validity: TMStatus,
 
+    // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
     msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
 
     anys_n: usize,
@@ -244,7 +248,7 @@ impl TMState {
     /// Deterministic weighted round robin (hash & mod total zec on cumulative list)
     fn proposer_from_height_round(roster: &[SortedRosterMember], height: u64, round: u32) -> (Option<usize>, PubKeyID) {
         if roster.len() == 0 {
-            eprintln!("BFT ERROR: trying to get proposer from empty roster");
+            eprintln!("\x1b[91mBFT ERROR\x1b[0m: trying to get proposer from empty roster");
             return (None, PubKeyID::NIL); // TODO: is a fixed value here exploitable? Presumably nobody can sign for it?
         }
 
@@ -259,7 +263,7 @@ impl TMState {
         let last_included_i = active_roster_len(roster) - 1;
         let total_included_stake = roster[last_included_i].cumulative_stake;
         if total_included_stake == 0 {
-            eprintln!("BFT ERROR: all roster members have no stake");
+            eprintln!("\x1b[91mBFT ERROR\x1b[0m: all roster members have no stake");
             return (None, PubKeyID::NIL); // TODO: is a fixed value here exploitable? Presumably nobody can sign for it?
         }
 
@@ -267,7 +271,7 @@ impl TMState {
         let proposer_stake = hash_stake % total_included_stake;
 
         let roster_i = roster.partition_point(|m| m.cumulative_stake <= proposer_stake);
-        println!("proposer stake hash: {} ==u64=> {:016x} ==%{}=> {} ==i=> {}", hash, hash_stake, total_included_stake, proposer_stake, roster_i);
+        // println!("proposer stake hash: {} ==u64=> {:016x} ==%{}=> {} ==i=> {}", hash, hash_stake, total_included_stake, proposer_stake, roster_i);
         (Some(roster_i), roster[roster_i].pub_key)
     }
 
@@ -324,26 +328,26 @@ impl TMState {
 
         // check if in (active) roster
         let Some(roster_i) = roster_i_from_pub_key(roster, from_pub_key) else {
-            eprintln!("BFT FAULT at {}.{}: {} not on roster", height, round, from_pub_key);
+            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: {} not on roster", my_roster_i, height, round, from_pub_key);
             return TMStatus::Fail;
         };
         if roster_i >= active_roster_len(roster) {
-            eprintln!("BFT FAULT at {}.{}: {} is outside active roster: {}", height, round, from_pub_key, roster_i);
+            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: {} is outside active roster: {}", my_roster_i, height, round, from_pub_key, roster_i);
             return TMStatus::Fail;
         }
 
         // check if data was signed by pub key
         let sig = match ed25519_zebra::Signature::from_slice(sig_data) { Ok(v)=>v, Err(err)=> {
-            eprintln!("{:04?}: BFT FAULT: malformed {} signature: {}", my_roster_i, packet_name_from_tag(tag), err);
+            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m: malformed {} signature: {}", my_roster_i, packet_name_from_tag(tag), err);
             return TMStatus::Fail;
         }};
         let vk = match ed25519_zebra::VerificationKey::try_from(from_pub_key.0) { Ok(v)=>v, Err(err)=>{
-            eprintln!("{:04?}: BFT FAULT: invalid {} public key: {} ({})", my_roster_i, packet_name_from_tag(tag), from_pub_key, err);
+            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m: invalid {} public key: {} ({})", my_roster_i, packet_name_from_tag(tag), from_pub_key, err);
             return TMStatus::Fail;
         }};
         match vk.verify(&sig, signed_data) { Ok(_)=>{}, Err(err)=>{
-            eprintln!("{:04?}: BFT FAULT: invalid signature from {} for {} {}.{}.{}[..{}]: {}",
-                my_roster_i, from_pub_key, packet_name_from_tag(tag), height, round, chunk_i, signed_data.len(), err);
+            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m: invalid signature from {} ({}) for {} {}.{}.{}[..{}]: {} {}",
+                my_roster_i, roster_i, from_pub_key, packet_name_from_tag(tag), height, round, chunk_i, signed_data.len(), value_id, err);
             return TMStatus::Fail;
         }}
 
@@ -366,12 +370,12 @@ impl TMState {
                 {
                     if self.rounds_data[round_i].proposal_id != value_id {
                         // TODO: immediately class both as invalid
-                        eprintln!("BFT FAULT at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", height, round, chunk_i, roster_i);
+                        eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", my_roster_i, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
                     if self.rounds_data[round_i].proposal_valid_round != valid_round {
                         // TODO: immediately class both as invalid
-                        eprintln!("BFT FAULT at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", height, round, chunk_i, roster_i);
+                        eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", my_roster_i, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
                 }
@@ -388,7 +392,7 @@ impl TMState {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
                 } else if self.rounds_data[round_i].proposal_id != value_id {
-                    eprintln!("BFT FAULT at {}.{}: finalizer {} voted on non-proposed value. Ignoring...", height, round, roster_i);
+                    eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", my_roster_i, height, round, roster_i, value_id);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
@@ -396,7 +400,7 @@ impl TMState {
             }
 
             _ => {
-                eprintln!("BFT ERROR: unexpected case: {} ({})", packet_name_from_tag(tag), tag);
+                eprintln!("{:04?}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {} ({})", my_roster_i, packet_name_from_tag(tag), tag);
                 return TMStatus::Fail;
             }
         };
@@ -430,7 +434,7 @@ impl TMState {
                         // TODO: include signed prevote & precommit for self?
                     } else if round_data.proposal_sigs[chunk_i] != TMSig(sig.to_bytes()) { // TODO: check value/sig conformance
                                                                                            // TODO: treat this as a failed is_valid & early out before awaiting full proposal
-                        eprintln!("BFT FAULT at {}.{}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, chunk_i, roster_i);
+                        eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} signed 2 different values. Ignoring latest...", my_roster_i, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     } else {
                         return TMStatus::Pass; // already good
@@ -454,7 +458,7 @@ impl TMState {
 
                 if old_has_sigs[is_precommit] != 0 && old[is_precommit] != new[is_precommit] {
                     // TODO: do we want to allow for NIL updating to valid?
-                    eprintln!("BFT FAULT at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
+                    eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", my_roster_i, height, round, roster_i);
                     return TMStatus::Fail;
                 }
 
@@ -491,7 +495,7 @@ impl TMState {
             }
 
             _ => {
-                eprintln!("BFT ERROR: unexpected case: {} ({})", packet_name_from_tag(tag), tag);
+                eprintln!("{:04?}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {} ({})", my_roster_i, packet_name_from_tag(tag), tag);
                 return TMStatus::Fail;
             }
         }
@@ -1018,7 +1022,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                                 let src_roster_i = roster_i_from_pub_key(&roster, my_pub_key);
                                 let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
-                                println!("{:05}: {:?} sending proposal {}.{}.{} ({}) sig_o: {} to {:?}", my_port, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
+                                println!("{:05}: {:?} sending proposal {}.{}.{} (V_ID: {}) sig_o: {} to {:?}",
+                                my_port, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
                                 send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o])
                             }
                         }
@@ -1392,7 +1397,7 @@ impl PacketHeartbeat {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct PubKeySig {
     pub_key: PubKeyID,
     sig: TMSig,
@@ -1403,6 +1408,7 @@ struct PubKeySig {
 // agnostic to prevote/precommit - communicated elsewhere
 // NOTE: all votes for the same value_id (or nil)
 // #[repr(C)]
+#[derive(Debug)]
 struct PacketVotes {
     tag:         u8,
     no_votes_n:  u8,
