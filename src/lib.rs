@@ -755,14 +755,20 @@ fn contended_noise_is_initiator(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a_to_b_hash.as_bytes() <= b_to_a_hash.as_bytes()
 }
 
+fn nonce_is_ok2(nonce: u64, nonce_ack_latest: u64, nonce_ack_field: u64) -> bool {(
+    nonce_ack_latest <= nonce + 64 && // TODO: do we want to completely drop these or just exclude from heartbeat
+    nonce != nonce_ack_latest &&
+    nonce <= nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE &&
+    (nonce_ack_latest < nonce || nonce_ack_field >> (nonce_ack_latest - nonce) & 1 == 0)
+)}
+
 fn nonce_is_ok(nonce: u64, nonce_ack_latest: u64, nonce_ack_field: u64) -> bool {
-    let mut ok = true;
-    if nonce > nonce_ack_latest && nonce > nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { ok = false; }
-    if nonce == nonce_ack_latest { ok = false; }
-    if nonce + 64 < nonce_ack_latest { ok = false; }
-    // TODO: this can overflow
-    if nonce < nonce_ack_latest && 1_u64 << (nonce_ack_latest - nonce) & nonce_ack_field != 0 { ok = false; }
-    ok
+    if nonce > nonce_ack_latest && nonce > nonce_ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { return false; }
+    if nonce == nonce_ack_latest                                                           { return false; }
+    if nonce + 64 < nonce_ack_latest                                                       { return false; }
+    // NOTE: this shift can overflow if we don't return before
+    if nonce < nonce_ack_latest && nonce_ack_field >> (nonce_ack_latest - nonce) & 1 != 0  { return false; }
+    true
 }
 
 fn nonce_update(nonce: u64, nonce_ack_latest: &mut u64, nonce_ack_field: &mut u64) {
@@ -1443,6 +1449,13 @@ mod tests {
         }
         // let (Some(i), _) = TMState::proposer_from_height_round(&roster[..2], 100, heig) else { panic!(); };
         // println!("BFT Proposer at {}.{}: {}", 2, 2, i);
+    }
+
+    #[test]
+    fn check_nonce_is_ok() {
+        assert!(nonce_is_ok(124, 12, !0));
+        assert!(!nonce_is_ok(12, 124, !0));
+        assert!(nonce_is_ok(120, 124, 0xffff_ffff_ffff_ffef));
     }
 }
 
