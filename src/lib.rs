@@ -430,24 +430,41 @@ impl TMState {
                 let new_has_any_sigs = new_has_sigs[0] | new_has_sigs[1];
 
                 if old_has_sigs[is_precommit] != 0 && old[is_precommit] != new[is_precommit] {
+                    // TODO: do we want to allow for NIL updating to valid?
                     eprintln!("BFT FAULT at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", height, round, roster_i);
                     return TMStatus::Fail;
                 }
 
                 let mut old_status = [[0,0], [0,0]];
-                old_status[0][(old[0].0 != ValueId::NIL) as usize] = 1;
-                old_status[1][(old[1].0 != ValueId::NIL) as usize] = 1;
-                let mut new_status = [[0,0], [0,0]];
-                new_status[0][(new[0].0 != ValueId::NIL) as usize] = 1;
-                new_status[1][(new[1].0 != ValueId::NIL) as usize] = 1;
+                old_status[0][(old[0].0 != ValueId::NIL) as usize] = old_has_sigs[0];
+                old_status[1][(old[1].0 != ValueId::NIL) as usize] = old_has_sigs[1];
+                let mut new_status = old_status;//[[0,0], [0,0]];
+                new_status[0][(new[0].0 != ValueId::NIL) as usize] = new_has_sigs[0];
+                new_status[1][(new[1].0 != ValueId::NIL) as usize] = new_has_sigs[1];
+
 
                 // add 1 to counts that have been updated by this message
-                round_data.anys_n             += new_has_any_sigs - old_has_any_sigs;
-                round_data.prevotes_n         += new_has_sigs[0]  - old_has_sigs[0];
-                round_data.precommits_n       += new_has_sigs[1]  - old_has_sigs[1];
-                round_data.valid_prevotes_n   += new_status[0][1] as usize - old_status[0][1] as usize;
-                round_data.valid_precommits_n += new_status[1][1] as usize - old_status[1][1] as usize;
-                round_data.nil_prevotes_n     += new_status[0][0] as usize - old_status[0][0] as usize;
+                let d_anys_n             = new_has_any_sigs - old_has_any_sigs;
+                let d_prevotes_n         = new_has_sigs[0]  - old_has_sigs[0];
+                let d_precommits_n       = new_has_sigs[1]  - old_has_sigs[1];
+                let d_valid_prevotes_n   = new_status[0][1] - old_status[0][1];
+                let d_valid_precommits_n = new_status[1][1] - old_status[1][1];
+                let d_nil_prevotes_n     = new_status[0][0] - old_status[0][0];
+
+                println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
+                println!("    {} d_anys_n            ", d_anys_n);
+                println!("    {} d_prevotes_n        ", d_prevotes_n);
+                println!("    {} d_precommits_n      ", d_precommits_n);
+                println!("    {} d_valid_prevotes_n  ", d_valid_prevotes_n);
+                println!("    {} d_valid_precommits_n", d_valid_precommits_n);
+                println!("    {} d_nil_prevotes_n    ", d_nil_prevotes_n);
+
+                round_data.anys_n             += d_anys_n;
+                round_data.prevotes_n         += d_prevotes_n;
+                round_data.precommits_n       += d_precommits_n;
+                round_data.valid_prevotes_n   += d_valid_prevotes_n;
+                round_data.valid_precommits_n += d_valid_precommits_n;
+                round_data.nil_prevotes_n     += d_nil_prevotes_n;
             }
         }
 
@@ -952,7 +969,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         };
 
                         let sign_datas = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
-                        let sig        = my_root_private_key.sign(&sign_datas[0]);
+                        let sig        = my_root_private_key.sign(&sign_datas[1]);
                         packet.votes[0] = PubKeySig{ pub_key: PubKeyID(my_root_public_key.into()), sig: TMSig(sig.to_bytes()) };
                         packet.votes_n  = 1;
 
