@@ -107,7 +107,8 @@ struct RoundData {
     // TODO: keep parallel with each other, but be sparse in members
     proposal: BlockValue,
     proposal_valid_round: i64,
-    proposal_sig: TMSig,
+    proposal_sigs:  [TMSig; PROPOSAL_CHUNKS_N], // [ed25519_zebra::Signature; PROPOSAL_CHUNKS_N],
+    proposal_sigs_n: usize,
     proposal_id: ValueId,
     proposal_checked_validity: TMStatus,
 
@@ -130,7 +131,8 @@ impl RoundData {
         round: 0,
         proposal: BlockValue([0; PROPOSAL_BUF_SIZE]),
         proposal_valid_round: -1,
-        proposal_sig: TMSig([0; 64]),
+        proposal_sigs: [TMSig::NIL; PROPOSAL_CHUNKS_N],
+        proposal_sigs_n: 0,
         proposal_id: ValueId::NIL,
         proposal_checked_validity: TMStatus::Indeterminate,
         // TODO: probably put both step messages next to each other
@@ -148,8 +150,9 @@ impl RoundData {
 
     // auto-caching
     fn proposal_is_valid(&mut self) -> TMStatus {
+        // TODO: may want to start doing some of these on < PROPOSAL_CHUNKS_N, i.e. shortcut known-invalid
         if (self.proposal_checked_validity == TMStatus::Indeterminate &&
-            self.proposal_sig != TMSig::NIL) {
+            self.proposal_sigs_n == PROPOSAL_CHUNKS_N) {
             self.proposal_checked_validity = self.proposal.is_valid();
         }
         self.proposal_checked_validity
@@ -311,24 +314,41 @@ impl TMState {
         (n - 1) / 3
     }
 
-    fn check_and_incorporate_msg(&mut self, roster: &[SortedRosterMember], from_pub_key: PubKeyID, height: u64, round: u32, data: TMMsgData, sig: TMSig) -> TMStatus {
-        let is_an_invalid_signature = false; // TODO
-        if is_an_invalid_signature { return TMStatus::Fail; }
+    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], from_pub_key: PubKeyID, tag: u8, signed_data: &[u8], sig_data: &[u8]) -> TMStatus {
+        let my_roster_i = roster_i_from_pub_key(roster, self.my_pub_key);
 
-        let is_signed_by_non_roster_member = false; // TODO (account for roster at round)
-        if is_signed_by_non_roster_member { return TMStatus::Fail; }
+        if height != self.height() {
+            eprintln!("{:04?}: BFT: received {} for height {} when we're at {}", my_roster_i, packet_name_from_tag(tag), height, self.height());
+            return TMStatus::Fail;
+        }
 
-        // TODO: potentially track < self.height(), but we'll need to have historical roster info
-        if height != self.height() { return TMStatus::Fail; } // may be valid later if we're catching up
-
+        // check if in (active) roster
         let Some(roster_i) = roster_i_from_pub_key(roster, from_pub_key) else {
-            eprintln!("BFT ERROR at {}.{}: {} not on roster", height, round, from_pub_key);
+            eprintln!("BFT FAULT at {}.{}: {} not on roster", height, round, from_pub_key);
             return TMStatus::Fail;
         };
         if roster_i >= active_roster_len(roster) {
-            eprintln!("BFT ERROR at {}.{}: {} is outside active roster: {}", height, round, from_pub_key, roster_i);
+            eprintln!("BFT FAULT at {}.{}: {} is outside active roster: {}", height, round, from_pub_key, roster_i);
             return TMStatus::Fail;
         }
+
+        // check if data was signed by pub key
+        let sig = match ed25519_zebra::Signature::from_slice(sig_data) { Ok(v)=>v, Err(err)=> {
+            eprintln!("{:04?}: BFT FAULT: malformed {} signature: {}", my_roster_i, packet_name_from_tag(tag), err);
+            return TMStatus::Fail;
+        }};
+        let vk = match ed25519_zebra::VerificationKey::try_from(from_pub_key.0) { Ok(v)=>v, Err(err)=>{
+            eprintln!("{:04?}: BFT FAULT: invalid {} public key: {} ({})", my_roster_i, packet_name_from_tag(tag), from_pub_key, err);
+            return TMStatus::Fail;
+        }};
+        match vk.verify(&sig, signed_data) { Ok(_)=>{}, Err(err)=>{
+            eprintln!("{:04?}: BFT FAULT: invalid signature from {} for {} {}.{}.{}[..{}]: {}",
+                my_roster_i, from_pub_key, packet_name_from_tag(tag), height, round, chunk_i, signed_data.len(), err);
+            return TMStatus::Fail;
+        }}
+
+        eprintln!("{:04?}: valid signature in proposal {}.{}.{} from {:?} ({}) for value id: {}",
+        my_roster_i, height, round, chunk_i, roster_i, from_pub_key, value_id);
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -338,41 +358,46 @@ impl TMState {
             Err(round_i) => (false, round_i),
         };
 
-        let status = match data {
-            TMMsgData::Proposal(value, _valid_round) => {
-                // "is it the correct proposer?"
-                let (_, expected_proposer_pub_key) = Self::proposer_from_height_round(roster, height, round);
-                if from_pub_key != expected_proposer_pub_key {
-                    eprintln!("BFT at {}.{}: received proposal from non-proposer expected {} ({}), received from {}. Ignoring latest...", height, round, roster_i, expected_proposer_pub_key, from_pub_key);
-                    return TMStatus::Fail;
-                }
-
+        let status = match tag {
+            PACKET_TAG_PROPOSAL_CHUNK => {
                 // "have they previously proposed a different value?"
                 if (is_prev_seen_round &&
-                    self.rounds_data[round_i].proposal_sig != TMSig::NIL &&
-                    self.rounds_data[round_i].proposal_id  != Self::id_from_value(&value))
+                    self.rounds_data[round_i].proposal_sigs_n > 0)
                 {
-                    eprintln!("BFT at {}.{}: proposer {} proposed 2 different values. Ignoring latest...", height, round, roster_i);
-                    return TMStatus::Fail;
+                    if self.rounds_data[round_i].proposal_id != value_id {
+                        // TODO: immediately class both as invalid
+                        eprintln!("BFT FAULT at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", height, round, chunk_i, roster_i);
+                        return TMStatus::Fail;
+                    }
+                    if self.rounds_data[round_i].proposal_valid_round != valid_round {
+                        // TODO: immediately class both as invalid
+                        eprintln!("BFT FAULT at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", height, round, chunk_i, roster_i);
+                        return TMStatus::Fail;
+                    }
                 }
 
                 TMStatus::Pass
             }
 
-            TMMsgData::Prevote(v_id) | TMMsgData::Precommit(v_id) => {
-                // TODO: check if this person has previously voted differently
+            PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => {
+                // TODO: check if this person has previously voted differently; is this covered later?
 
-                if v_id == ValueId::NIL { // always legal
+                if value_id == ValueId::NIL { // always legal
                     TMStatus::Pass
-                } else if ! is_prev_seen_round || self.rounds_data[round_i].proposal_sig == TMSig::NIL {
+                } else if ! is_prev_seen_round || self.rounds_data[round_i].proposal_sigs_n == 0 {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
-                } else if self.rounds_data[round_i].proposal_id != v_id {
+                } else if self.rounds_data[round_i].proposal_id != value_id {
                     eprintln!("BFT FAULT at {}.{}: finalizer {} voted on non-proposed value. Ignoring...", height, round, roster_i);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
                 }
+            }
+
+            _ => {
+                eprintln!("BFT ERROR: unexpected case: {} ({})", packet_name_from_tag(tag), tag);
+                return TMStatus::Fail;
             }
         };
 
@@ -388,41 +413,38 @@ impl TMState {
         // TODO: amend knowledge of rounds & update metadata
             // TODO(code): collapse
 
-        match data {
-            TMMsgData::Proposal(value, valid_round) => {
+        match tag {
+            PACKET_TAG_PROPOSAL_CHUNK => {
                 // TODO: check expected proposer here if not above
+                let chunk_data = &signed_data[PacketProposalChunkHeader::SERIALIZED_SIZE..PacketProposalChunkHeader::SERIALIZED_SIZE+ PROPOSAL_CHUNK_DATA_SIZE];
 
                 if is_prev_seen_round { // element already in vector @ `round_i`
-                    let prev_value     = round_data.proposal;
-                    let prev_value_sig = round_data.proposal_sig;
+                    if round_data.proposal_sigs[chunk_i] == TMSig::NIL { // value chunk not seen before
+                        let o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+                        chunk_data.write_to(&mut round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
+                        round_data.proposal_sigs[chunk_i] = TMSig(sig.to_bytes());
+                        round_data.proposal_sigs_n       += 1;
+                        round_data.proposal_valid_round   = valid_round;
+                        round_data.proposal_id            = value_id;
 
-                    if prev_value_sig == TMSig::NIL { // votes but value not seen before
-                    } else if prev_value != value { // TODO: id
-                        // TODO: treat this as a failed is_valid & early out before awaiting full proposal
-                        eprintln!("BFT FAULT at {}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, roster_i);
+                        // TODO: include signed prevote & precommit for self?
+                    } else if round_data.proposal_sigs[chunk_i] != TMSig(sig.to_bytes()) { // TODO: check value/sig conformance
+                                                                                           // TODO: treat this as a failed is_valid & early out before awaiting full proposal
+                        eprintln!("BFT FAULT at {}.{}.{}: proposer {} signed 2 different values. Ignoring latest...", height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     } else {
                         return TMStatus::Pass; // already good
                     }
                 }
-
-                round_data.proposal             = value;
-                round_data.proposal_valid_round = valid_round;
-                round_data.proposal_sig         = sig;
-                round_data.proposal_id          = Self::id_from_value(&value);
-
-                // TODO: include signed prevote & precommit for self?
             }
 
-            TMMsgData::Prevote(v_id) | TMMsgData::Precommit(v_id) => {
-                let is_precommit = if let TMMsgData::Precommit(..) = data { 1 } else { 0 };
-
-                // TODO: check height
+            PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => {
+                let is_precommit = (tag - PACKET_TAG_PREVOTE_SIGNATURES) as usize;
 
                 // Add the signature to the list & update counts
                 let new = &mut round_data.msg_val_sigs[roster_i];
                 let old = *new;
-                new[is_precommit] = (v_id, sig);
+                new[is_precommit] = (value_id, TMSig(sig.to_bytes()));
 
 
                 let old_has_sigs     = [(old[0].1 != TMSig::NIL) as usize, (old[1].1 != TMSig::NIL) as usize];
@@ -467,6 +489,11 @@ impl TMState {
                 round_data.valid_precommits_n += d_valid_precommits_n;
                 round_data.nil_prevotes_n     += d_nil_prevotes_n;
             }
+
+            _ => {
+                eprintln!("BFT ERROR: unexpected case: {} ({})", packet_name_from_tag(tag), tag);
+                return TMStatus::Fail;
+            }
         }
 
         status
@@ -494,7 +521,7 @@ impl TMState {
             // > while step_p = propose do
             // TODO: merge conditionals with below, they massively overlap
             if (is_current_height_and_round &&
-                self.rounds_data[i].proposal_sig != TMSig::NIL && // we have received the proposal value
+                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N && // we have received the proposal value
                 self.rounds_data[i].proposal_valid_round != -1 &&
                 self.step == TMStep::Propose)
             {
@@ -514,7 +541,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, vr> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, vr, id(v)>
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
-                self.rounds_data[i].proposal_sig != TMSig::NIL &&
+                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
                 2*f+1 <= self.rounds_data[i].valid_prevotes_n &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
@@ -545,7 +572,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, ∗> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, round_p, id(v)>
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
-                self.rounds_data[i].proposal_sig != TMSig::NIL &&
+                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
                 2*f+1 <= self.rounds_data[i].valid_prevotes_n &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
@@ -581,7 +608,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, r, v, ∗> from proposer(h_p, r) AND 2f+1 <PRECOMMIT, h_p, r, id(v)>
             // > while decision_p[h_p] = nil do
             if (self.height() == self.rounds_data[i].height && // any round
-                self.rounds_data[i].proposal_sig != TMSig::NIL &&
+                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
                 2*f+1 <= self.rounds_data[i].precommits_n &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
@@ -663,7 +690,7 @@ impl SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 impl SliceWrite for i64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&i64::to_le_bytes(*self)); 8 } }
 impl SliceWrite for u32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..4].copy_from_slice(&u32::to_le_bytes(*self)); 4 } }
 impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..2].copy_from_slice(&u16::to_le_bytes(*self)); 2 } }
-impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                       1 } }
+impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                      1 } }
 impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);   self.len() } }
 
 
@@ -1274,44 +1301,16 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
 
                 PACKET_TAG_PROPOSAL_CHUNK => if msg.len() == PROPOSAL_CHUNK_SIZE {
-                    let mut cur = Cursor::new(&msg[1..]);
-                    let hdr = match PacketProposalChunkHeader::read_from(&mut cur) {
-                        Ok(hdr)  => hdr,
-                        Err(err) => { eprintln!("{:05}: couldn't read proposal chunk: {}", my_port, err); continue; }
-                    };
-
-                    if hdr.height != bft_state.height() {
-                        eprintln!("{:05}: BFT FAULT: received proposal for height {} when we're at {}", my_port, hdr.height, bft_state.height());
-                    }
-
-                    let data_o = 1 + cur.position() as usize;
-                    let sig_o  = data_o + PROPOSAL_CHUNK_DATA_SIZE;
-                    let signed_data = &msg[1..sig_o];
-                    let sig = match ed25519_zebra::Signature::from_slice(&msg[sig_o..sig_o + 64]) {
-                        Ok(v)=>v, Err(err)=>{ eprintln!("{:05}: BFT FAULT: malformed proposal signature: {}", my_port, err); continue; }
-                    };
-
+                    let hdr = match PacketProposalChunkHeader::read_from(&msg[1..]) { Ok(v)=>v, Err(err)=>{
+                        eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
+                        continue;
+                    }};
+                    // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
+                    // ALT:  cache proposer for *current* round
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round);
-                    let vk = match ed25519_zebra::VerificationKey::try_from(proposer_pub_key.0) {
-                        Ok(vk)   => vk,
-                        Err(err) => {
-                            eprintln!("{:05}: BFT ERROR: invalid proposer public key: {} ({})", my_port, proposer_pub_key, err);
-                            continue;
-                        }
-                    };
-
-                    match vk.verify(&sig, signed_data) {
-                        Ok(_)    => {},
-                        Err(err) => {
-                            eprintln!("{:05}: BFT FAULT: invalid signature from {} for proposal chunk {}.{}.{}[1..{}]: {}",
-                                my_port, proposer_pub_key, hdr.height, hdr.round, hdr.chunk_i, sig_o, err);
-                            continue;
-                        }
-                    }
-                    let roster_i = roster_i_from_pub_key(&roster, proposer_pub_key);
-                    eprintln!("{:05}: valid signature in proposal {}.{}.{} from {:?} ({}) for value id: {}",
-                    my_port, hdr.height, hdr.round, hdr.chunk_i, roster_i, proposer_pub_key, hdr.proposal_id);
-                    // bft_state.check_and_incorporate_msg(&roster, proposer_pub_key, hdr.height, hdr.round, TMMSgData::Proposal(..), TMSig(sig.to_bytes()));
+                    let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
+                    bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
+                        &roster, proposer_pub_key, tag, &msg[1..sig_o], &msg[sig_o..]);
                 } else {
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
@@ -1323,29 +1322,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let value_ids    = [ ValueId::NIL, packet.value_id ];
 
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-                            // NOTE: whether this is a pub_key on the roster is currently checked later
-                            let (pub_key, sig) = (packet.votes[vote_i].pub_key, packet.votes[vote_i].sig);
-                            let signature = &ed25519_zebra::Signature::from_bytes(&sig.0);
-                            let vk = match ed25519_zebra::VerificationKey::try_from(pub_key.0) {
-                                Ok(vk)   => vk,
-                                Err(err) => {
-                                    eprintln!("{:05}: invalid public key for {}: {} ({})", my_port, packet_name_from_tag(tag), pub_key, err);
-                                    continue;
-                                }
-                            };
-
-                            let sign_data_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                            let value_id = if vk.verify(signature, &sign_datas[sign_data_i]).is_ok() {
-                                value_ids[sign_data_i]
-                            } else {
-                                eprintln!("{:05}: invalid signature for value id", my_port);
-                                continue;
-                            };
-                            let msg = if tag == PACKET_TAG_PREVOTE_SIGNATURES { TMMsgData::Prevote(value_id) } else { TMMsgData::Precommit(value_id) };
-
-                            let roster_i = roster_i_from_pub_key(&roster, pub_key);
-                            eprintln!("{:05}: valid signature in {}.{} {} from {:?} ({}) for value id: {}", my_port, packet.height, packet.round, packet_name_from_tag(tag), roster_i, pub_key, value_id);
-                            bft_state.check_and_incorporate_msg(&roster, pub_key, packet.height, packet.round, msg, sig);
+                            let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                            bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
+                                &roster, packet.votes[vote_i].pub_key, tag, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
                         }
                     }
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(tag), err),
@@ -1496,6 +1475,8 @@ struct PacketProposalChunkHeader {
     // proposer_signature: TMSig,
 }
 impl PacketProposalChunkHeader {
+    const SERIALIZED_SIZE: usize = 56;
+
     fn write_to(&self, buf: &mut [u8]) -> usize {
         self.chunk_i      .write_to(&mut buf[   0..]);
         self.round        .write_to(&mut buf[   4..]);
@@ -1504,7 +1485,7 @@ impl PacketProposalChunkHeader {
         self.proposal_id.0.write_to(&mut buf[  24..]);
         // self.data                .write_to(&mut buf[48..]);
         // self.proposer_signature.0.write_to(&mut buf[1135..]);
-        56
+        Self::SERIALIZED_SIZE
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
