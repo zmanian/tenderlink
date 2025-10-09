@@ -1011,18 +1011,19 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             height: bft_state.height(),
                             round:  bft_state.round,
                             value_id: proposal_id,
-                            votes_n: 0,
+                            no_votes_n: 0,
+                            yes_votes_n: 0,
                             votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
                         };
 
-                        let sign_datas = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
-                        let sig        = my_root_private_key.sign(&sign_datas[1]);
-                        packet.votes[0] = PubKeySig{ pub_key: my_pub_key, sig: TMSig(sig.to_bytes()) };
-                        packet.votes_n  = 1;
+                        let sign_datas     = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
+                        let sig            = my_root_private_key.sign(&sign_datas[1]);
+                        packet.votes[0]    = PubKeySig{ pub_key: my_pub_key, sig: TMSig(sig.to_bytes()) };
+                        packet.yes_votes_n = 1;
 
                         let src_roster_i = roster_i_from_pub_key(&roster, packet.votes[0].pub_key);
                         let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
-                        println!("{:05}: {:?} sending {} prevote sigs to {:?}", my_port, src_roster_i, packet.votes_n, dst_roster_i);
+                        println!("{:05}: {:?} sending {}/{} prevote sigs to {:?}", my_port, src_roster_i, packet.no_votes_n, packet.yes_votes_n, dst_roster_i);
                         let len1 = packet.write_to(&mut send_buf1[..]);
                         send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1])
                     }
@@ -1319,8 +1320,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
                         let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
+                        let value_ids    = [ ValueId::NIL, packet.value_id ];
 
-                        for vote_i in 0..packet.votes_n as usize {
+                        for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             // NOTE: whether this is a pub_key on the roster is currently checked later
                             let (pub_key, sig) = (packet.votes[vote_i].pub_key, packet.votes[vote_i].sig);
                             let signature = &ed25519_zebra::Signature::from_bytes(&sig.0);
@@ -1332,12 +1334,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
                             };
 
-                            let value_id = if vk.verify(signature, &sign_datas[1]).is_ok() { packet.value_id }
-                                else       if vk.verify(signature, &sign_datas[0]).is_ok() { ValueId::NIL }
-                                else {
-                                    eprintln!("{:05}: invalid signature for value id", my_port);
-                                    continue;
-                                };
+                            let sign_data_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                            let value_id = if vk.verify(signature, &sign_datas[sign_data_i]).is_ok() {
+                                value_ids[sign_data_i]
+                            } else {
+                                eprintln!("{:05}: invalid signature for value id", my_port);
+                                continue;
+                            };
                             let msg = if tag == PACKET_TAG_PREVOTE_SIGNATURES { TMMsgData::Prevote(value_id) } else { TMMsgData::Precommit(value_id) };
 
                             let roster_i = roster_i_from_pub_key(&roster, pub_key);
@@ -1422,8 +1425,9 @@ struct PubKeySig {
 // NOTE: all votes for the same value_id (or nil)
 // #[repr(C)]
 struct PacketVotes {
-    tag:      u8,
-    votes_n:  u8, // ALT: split yes_votes, no_votes
+    tag:         u8,
+    no_votes_n:  u8,
+    yes_votes_n: u8,
     // pad_:     u16, // TODO: useful?
     round:    u32,
     height:   u64,
@@ -1436,14 +1440,15 @@ const_assert!(size_of::<PacketVotes>() == 1200); // TODO(azmr): exactly how much
 
 impl PacketVotes {
     fn write_to(&self, buf: &mut [u8]) -> usize {
-        self.tag       .write_to(&mut buf[ 0..]);
-        self.votes_n   .write_to(&mut buf[ 1..]);
-        self.round     .write_to(&mut buf[ 2..]);
-        self.height    .write_to(&mut buf[ 6..]);
-        self.value_id.0.write_to(&mut buf[14..]);
-        let mut o = 46;
+        self.tag        .write_to(&mut buf[ 0..]);
+        self.no_votes_n .write_to(&mut buf[ 1..]);
+        self.yes_votes_n.write_to(&mut buf[ 2..]);
+        self.round      .write_to(&mut buf[ 3..]);
+        self.height     .write_to(&mut buf[ 7..]);
+        self.value_id.0 .write_to(&mut buf[15..]);
+        let mut o = 47;
         // NOTE(azmr): slight saving of bytes-on-wire if unused? i.e. initial few times each
-        for i in 0..self.votes_n as usize {
+        for i in 0..(self.no_votes_n + self.yes_votes_n) as usize {
             o += &self.votes[i].pub_key.0.write_to(&mut buf[o..]);
             o += &self.votes[i].sig    .0.write_to(&mut buf[o..]);
         }
@@ -1452,16 +1457,17 @@ impl PacketVotes {
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = PacketVotes {
-            tag: 0, votes_n: 0, round: 0, height: 0,
+            tag: 0, no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
             value_id: ValueId::NIL,
             votes: [PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12],
         };
-        packet.tag     = r.read_u8()?;
-        packet.votes_n = r.read_u8()?;
-        packet.round   = r.read_u32::<LittleEndian>()?;
-        packet.height  = r.read_u64::<LittleEndian>()?;
+        packet.tag         = r.read_u8()?;
+        packet.no_votes_n  = r.read_u8()?;
+        packet.yes_votes_n = r.read_u8()?;
+        packet.round       = r.read_u32::<LittleEndian>()?;
+        packet.height      = r.read_u64::<LittleEndian>()?;
         r.read_exact(&mut packet.value_id.0)?;
-        for i in 0..packet.votes_n as usize {
+        for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
             r.read_exact(&mut packet.votes[i].pub_key.0)?;
             r.read_exact(&mut packet.votes[i].sig.0)?;
         }
