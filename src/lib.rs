@@ -266,7 +266,7 @@ impl TMState {
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
                         height, round, chunk_i, hdr.proposal_id, hdr.valid_round,
-                        roster, self.my_pub_key, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &buf[o..]
+                        roster, self.my_pub_key, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &buf[o..o+64]
                     );
                 }
 
@@ -479,6 +479,8 @@ impl TMState {
                         round_data.proposal_valid_round   = valid_round;
                         round_data.proposal_id            = value_id;
 
+                        println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, PROPOSAL_CHUNKS_N);
+
                         // TODO: include signed prevote & precommit for self?
                     } else if round_data.proposal_sigs[chunk_i] != TMSig(sig.to_bytes()) { // TODO: check value/sig conformance
                                                                                            // TODO: treat this as a failed is_valid & early out before awaiting full proposal
@@ -540,6 +542,22 @@ impl TMState {
                 round_data.valid_prevotes_n   += d_valid_prevotes_n;
                 round_data.valid_precommits_n += d_valid_precommits_n;
                 round_data.nil_prevotes_n     += d_nil_prevotes_n;
+
+                if (d_anys_n             |
+                    d_prevotes_n         |
+                    d_precommits_n       |
+                    d_valid_prevotes_n   |
+                    d_valid_precommits_n |
+                    d_nil_prevotes_n) != 0 {
+                    println!("{}: update to a:{} v:{} c:{}, vv:{} nv:{} vp:{}", ctx_str,
+                        round_data.anys_n,
+                        round_data.prevotes_n,
+                        round_data.precommits_n,
+                        round_data.valid_prevotes_n,
+                        round_data.nil_prevotes_n,
+                        round_data.valid_precommits_n,
+                    );
+                }
             }
 
             _ => {
@@ -583,8 +601,10 @@ impl TMState {
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal)) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
+                    println!("{:4?}: in condition 22-0: receive first proposal this height", roster_i_from_pub_key(roster, self.my_pub_key));
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
+                    println!("{:4?}: in condition 22-1: receive first proposal this height", roster_i_from_pub_key(roster, self.my_pub_key));
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -602,8 +622,10 @@ impl TMState {
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal))
                 {
+                    println!("{:4?}: in condition 28-0: received 2f+1 prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
+                    println!("{:4?}: in condition 28-1: received 2f+1 prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -616,6 +638,7 @@ impl TMState {
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
+                println!("{:4?}: in condition 34: last orders on prevote period", roster_i_from_pub_key(roster, self.my_pub_key));
                 self.rounds_data[i].timeout_triggered[0] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Prevote));
             }
@@ -629,7 +652,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
+                println!("{:4?}: in condition 36: seen 2f+1 valid prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
                 if self.step == TMStep::Prevote {
+                    println!("{:4?}: in condition 36-0: seen 2f+1 valid prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
                     self.locked_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
@@ -643,6 +668,7 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].nil_prevotes_n &&
                 self.step == TMStep::Prevote)
             {
+                println!("{:4?}: in condition 44: seen 2f+1 nil prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
                 self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
             }
 
@@ -652,6 +678,7 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].precommits_n &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
+                println!("{:4?}: in condition 47: last orders on precommit period", roster_i_from_pub_key(roster, self.my_pub_key));
                 self.rounds_data[i].timeout_triggered[1] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Precommit));
             }
@@ -664,6 +691,7 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].precommits_n &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
+                println!("{:4?}: in condition 49: value decided", roster_i_from_pub_key(roster, self.my_pub_key));
                 self.decisions.push(TMDecision {
                     value: self.rounds_data[i].proposal,
                     // value_sig: self.rounds_data[i].proposal_sig,
@@ -677,6 +705,7 @@ impl TMState {
                 self.round    <  self.rounds_data[i].round  &&
                 f+1 <= self.rounds_data[i].anys_n)
             {
+                println!("{:4?}: in condition 55: round catchup", roster_i_from_pub_key(roster, self.my_pub_key));
                 self.start_round(roster, now, self.rounds_data[i].round)
             }
 
@@ -689,12 +718,17 @@ impl TMState {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
+                        println!("{:4?}: hit timeout propose", roster_i_from_pub_key(roster, self.my_pub_key));
                         self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
+                        println!("{:4?}: hit timeout prevote", roster_i_from_pub_key(roster, self.my_pub_key));
                         self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
                     },
-                    TMStep::Precommit => self.start_round(roster, now, self.round + 1),
+                    TMStep::Precommit => {
+                        println!("{:4?}: hit timeout precommit", roster_i_from_pub_key(roster, self.my_pub_key));
+                        self.start_round(roster, now, self.round + 1)
+                    },
                 }
             }
         }
@@ -1032,6 +1066,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
+                // TODO: loop rounds at current height
                 if let Ok(round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), bft_state.round), |el| (el.height, el.round)) {
                     let round_data = &bft_state.rounds_data[round_i];
                     let height = round_data.height;
@@ -1092,6 +1127,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 no_votes_n: 0, yes_votes_n: 0,
                                 votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
                             };
+                            let mut sent_c = 0;
 
                             for roster_i in 0..round_data.msg_val_sigs.len() {
                                 let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
@@ -1108,6 +1144,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     };
 
                                     if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
+                                        sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                         // full evidence block; send it
                                         // println!("{:05}: full block: {:#?}", my_port, packet);
                                         let len1 = packet.write_to(&mut send_buf1[..]);
@@ -1126,6 +1163,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                             // send any half-filled vote blocks
                             if (packet.no_votes_n + packet.yes_votes_n) > 0 {
+                                sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                 // println!("{:05}: half-filled block pre-gap-close: {:#?}", my_port, packet);
                                 // move items from end to fill gap
                                 for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
@@ -1140,78 +1178,85 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     }
                                 }
                             }
+
+                            println!("{:05}: {:?} sent {} {}", my_port, &roster_i_from_pub_key(&roster, bft_state.my_pub_key), sent_c, ["prevotes", "precommits"][is_precommit as usize]);
                         }
                     }
                 }
 
-                let my_pub_key = PubKeyID(my_root_public_key.into());
-                let proposal_id = if TMState::proposer_from_height_round(&roster, bft_state.height(), bft_state.round).1 == my_pub_key {
-                    let mut proposal = BlockValue([((bft_state.height() << 4) as u32 ^ bft_state.round) as u8; PROPOSAL_BUF_SIZE]);
-                    [0; PROPOSAL_BUF_SIZE - PROPOSAL_SEM_SIZE].write_to(&mut proposal.0[PROPOSAL_SEM_SIZE..]);
+                if false {
+                    let my_pub_key = PubKeyID(my_root_public_key.into());
+                    // let proposal_id = if TMState::proposer_from_height_round(&roster, bft_state.height(), bft_state.round).1 == my_pub_key
+                    {
+                        let mut proposal = BlockValue([((bft_state.height() << 4) as u32 ^ bft_state.round) as u8; PROPOSAL_BUF_SIZE]);
+                        [0; PROPOSAL_BUF_SIZE - PROPOSAL_SEM_SIZE].write_to(&mut proposal.0[PROPOSAL_SEM_SIZE..]);
 
-                    my_pub_key.0.write_to(&mut proposal.0[..]);
-                    let mut hdr = PacketProposalChunkHeader {
-                        height:      bft_state.height(),
-                        round:       bft_state.round,
-                        proposal_id: TMState::id_from_value(&proposal),
-                        valid_round: bft_state.valid_value_round.1,
-                        chunk_i:     0,
-                    };
-                    send_buf1[0] = PACKET_TAG_PROPOSAL_CHUNK;
+                        my_pub_key.0.write_to(&mut proposal.0[..]);
+                        let mut hdr = PacketProposalChunkHeader {
+                            height:      bft_state.height(),
+                            round:       bft_state.round,
+                            proposal_id: TMState::id_from_value(&proposal),
+                            valid_round: bft_state.valid_value_round.1,
+                            chunk_i:     0,
+                        };
+                        send_buf1[0] = PACKET_TAG_PROPOSAL_CHUNK;
 
-                    // TODO: spread out sending
-                    // TODO: filter on full connection?
-                    for peer_i in 0..peers.len() {
-                        let peer = &mut peers[peer_i];
-                        for chunk_i in 0..PROPOSAL_CHUNKS_N {
-                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                // @testing
-                                hdr.chunk_i = chunk_i as u32;
-                                let mut o = 1 + hdr.write_to(&mut send_buf1[1..]);
+                        // TODO: spread out sending
+                        // TODO: filter on full connection?
+                        for peer_i in 0..peers.len() {
+                            let peer = &mut peers[peer_i];
+                            for chunk_i in 0..PROPOSAL_CHUNKS_N {
+                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                    // @testing
+                                    hdr.chunk_i = chunk_i as u32;
+                                    let mut o = 1 + hdr.write_to(&mut send_buf1[1..]);
 
-                                let chunk_bgn_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
-                                o += proposal.0[chunk_bgn_o..chunk_bgn_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut send_buf1[o..]);
+                                    let chunk_bgn_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+                                    o += proposal.0[chunk_bgn_o..chunk_bgn_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut send_buf1[o..]);
 
-                                let sig_o = o;
-                                let sig = my_root_private_key.sign(&send_buf1[1..sig_o]);
-                                o += sig.to_bytes().write_to(&mut send_buf1[o..]);
+                                    let sig_o = o;
+                                    let sig = my_root_private_key.sign(&send_buf1[1..sig_o]);
+                                    o += sig.to_bytes().write_to(&mut send_buf1[o..]);
 
-                                let src_roster_i = roster_i_from_pub_key(&roster, my_pub_key);
-                                let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
-                                println!("{:05}: {:?} sending proposal {}.{}.{} (V_ID: {}) sig_o: {} to {:?}",
-                                my_port, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
-                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o])
+                                    let src_roster_i = roster_i_from_pub_key(&roster, my_pub_key);
+                                    let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
+                                    println!("{:05}: {:?} sending proposal {}.{}.{} (V_ID: {}) sig_o: {} to {:?}",
+                                    my_port, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
+                                    send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o])
+                                }
                             }
                         }
+
+                        // hdr.proposal_id
                     }
+                    // else { break; };
+                    // else { ValueId([0xab; 32]) };
 
-                    hdr.proposal_id
-                } else { ValueId([0xab; 32]) };
+                    // send out updates
+                    for peer in &mut peers {
+                        if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                            // @testing
+                            let mut packet = PacketVotes {
+                                tag: PACKET_TAG_PREVOTE_SIGNATURES,
+                                height: bft_state.height(),
+                                round:  bft_state.round,
+                                value_id: proposal_id,
+                                no_votes_n: 0,
+                                yes_votes_n: 0,
+                                votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
+                            };
 
-                // send out updates
-                for peer in &mut peers {
-                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                        // @testing
-                        let mut packet = PacketVotes {
-                            tag: PACKET_TAG_PREVOTE_SIGNATURES,
-                            height: bft_state.height(),
-                            round:  bft_state.round,
-                            value_id: proposal_id,
-                            no_votes_n: 0,
-                            yes_votes_n: 0,
-                            votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
-                        };
+                            let sign_datas     = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
+                            let sig            = my_root_private_key.sign(&sign_datas[1]);
+                            packet.votes[0]    = PubKeySig{ pub_key: my_pub_key, sig: TMSig(sig.to_bytes()) };
+                            packet.yes_votes_n = 1;
 
-                        let sign_datas     = make_vote_sign_datas(0, packet.height, packet.round, packet.value_id);
-                        let sig            = my_root_private_key.sign(&sign_datas[1]);
-                        packet.votes[0]    = PubKeySig{ pub_key: my_pub_key, sig: TMSig(sig.to_bytes()) };
-                        packet.yes_votes_n = 1;
-
-                        let src_roster_i = roster_i_from_pub_key(&roster, packet.votes[0].pub_key);
-                        let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
-                        println!("{:05}: {:?} sending {}/{} prevote sigs to {:?}", my_port, src_roster_i, packet.no_votes_n, packet.yes_votes_n, dst_roster_i);
-                        let len1 = packet.write_to(&mut send_buf1[..]);
-                        send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1])
+                            let src_roster_i = roster_i_from_pub_key(&roster, packet.votes[0].pub_key);
+                            let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
+                            println!("{:05}: {:?} sending {}/{} prevote sigs to {:?}", my_port, src_roster_i, packet.no_votes_n, packet.yes_votes_n, dst_roster_i);
+                            let len1 = packet.write_to(&mut send_buf1[..]);
+                            send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1])
+                        }
                     }
                 }
 
@@ -1469,7 +1514,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round);
                     let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
                     bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                        &roster, proposer_pub_key, tag, &msg[1..sig_o], &msg[sig_o..]);
+                        &roster, proposer_pub_key, tag, &msg[1..sig_o], &msg[sig_o..sig_o+64]);
                 } else {
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
