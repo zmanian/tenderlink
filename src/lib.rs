@@ -320,39 +320,42 @@ impl TMState {
 
     fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], from_pub_key: PubKeyID, tag: u8, signed_data: &[u8], sig_data: &[u8]) -> TMStatus {
         let my_roster_i = roster_i_from_pub_key(roster, self.my_pub_key);
+        let me_str      = format!("{:04?}.{}.{}", my_roster_i, self.height(), self.round);
+        let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(tag), height, round, chunk_i);
 
         if height != self.height() {
-            eprintln!("{:04?}: BFT: received {} for height {} when we're at {}", my_roster_i, packet_name_from_tag(tag), height, self.height());
+            eprintln!("{}: BFT: received [{}] when we're at height {}", me_str, pkt_str, self.height());
             return TMStatus::Fail;
         }
 
         // check if in (active) roster
         let Some(roster_i) = roster_i_from_pub_key(roster, from_pub_key) else {
-            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: {} not on roster", my_roster_i, height, round, from_pub_key);
+            eprintln!("{} [{}]: \x1b[91mBFT FAULT\x1b[0m: {} not on roster", me_str, pkt_str, from_pub_key);
             return TMStatus::Fail;
         };
         if roster_i >= active_roster_len(roster) {
-            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: {} is outside active roster: {}", my_roster_i, height, round, from_pub_key, roster_i);
+            eprintln!("{} [{}]: \x1b[91mBFT FAULT\x1b[0m: {} is outside active roster: {}", me_str, pkt_str, from_pub_key, roster_i);
             return TMStatus::Fail;
         }
 
+        // pkt_str += &format!(" from {} ({})", roster_i, from_pub_key);
+        let ctx_str = format!("{} [{} from {} ({:.4}...)]", me_str, pkt_str, roster_i, from_pub_key);
+
         // check if data was signed by pub key
         let sig = match ed25519_zebra::Signature::from_slice(sig_data) { Ok(v)=>v, Err(err)=> {
-            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m: malformed {} signature: {}", my_roster_i, packet_name_from_tag(tag), err);
+            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: malformed signature: {}", ctx_str, err);
             return TMStatus::Fail;
         }};
         let vk = match ed25519_zebra::VerificationKey::try_from(from_pub_key.0) { Ok(v)=>v, Err(err)=>{
-            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m: invalid {} public key: {} ({})", my_roster_i, packet_name_from_tag(tag), from_pub_key, err);
+            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid public key: {} ({})", ctx_str, from_pub_key, err);
             return TMStatus::Fail;
         }};
         match vk.verify(&sig, signed_data) { Ok(_)=>{}, Err(err)=>{
-            eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m: invalid signature from {} ({}) for {} {}.{}.{}[..{}]: {} {}",
-                my_roster_i, roster_i, from_pub_key, packet_name_from_tag(tag), height, round, chunk_i, signed_data.len(), value_id, err);
+            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid signature[..{}]: {} {}", ctx_str, signed_data.len(), value_id, err);
             return TMStatus::Fail;
         }}
 
-        eprintln!("{:04?}: valid signature in proposal {}.{}.{} from {:?} ({}) for value id: {}",
-        my_roster_i, height, round, chunk_i, roster_i, from_pub_key, value_id);
+        eprintln!("{}: valid signature for value id: {}", ctx_str, value_id);
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -370,12 +373,12 @@ impl TMState {
                 {
                     if self.rounds_data[round_i].proposal_id != value_id {
                         // TODO: immediately class both as invalid
-                        eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", my_roster_i, height, round, chunk_i, roster_i);
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
                     if self.rounds_data[round_i].proposal_valid_round != valid_round {
                         // TODO: immediately class both as invalid
-                        eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", my_roster_i, height, round, chunk_i, roster_i);
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
                 }
@@ -392,7 +395,7 @@ impl TMState {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
                 } else if self.rounds_data[round_i].proposal_id != value_id {
-                    eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", my_roster_i, height, round, roster_i, value_id);
+                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", ctx_str, height, round, roster_i, value_id);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
@@ -400,7 +403,7 @@ impl TMState {
             }
 
             _ => {
-                eprintln!("{:04?}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {} ({})", my_roster_i, packet_name_from_tag(tag), tag);
+                eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {}", ctx_str, tag);
                 return TMStatus::Fail;
             }
         };
@@ -434,7 +437,7 @@ impl TMState {
                         // TODO: include signed prevote & precommit for self?
                     } else if round_data.proposal_sigs[chunk_i] != TMSig(sig.to_bytes()) { // TODO: check value/sig conformance
                                                                                            // TODO: treat this as a failed is_valid & early out before awaiting full proposal
-                        eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} signed 2 different values. Ignoring latest...", my_roster_i, height, round, chunk_i, roster_i);
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
                         return TMStatus::Fail;
                     } else {
                         return TMStatus::Pass; // already good
@@ -458,7 +461,7 @@ impl TMState {
 
                 if old_has_sigs[is_precommit] != 0 && old[is_precommit] != new[is_precommit] {
                     // TODO: do we want to allow for NIL updating to valid?
-                    eprintln!("{:04?}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", my_roster_i, height, round, roster_i);
+                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", ctx_str, height, round, roster_i);
                     return TMStatus::Fail;
                 }
 
@@ -495,7 +498,7 @@ impl TMState {
             }
 
             _ => {
-                eprintln!("{:04?}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {} ({})", my_roster_i, packet_name_from_tag(tag), tag);
+                eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {}", ctx_str, tag);
                 return TMStatus::Fail;
             }
         }
@@ -770,14 +773,14 @@ impl EndpointEvidence {
 }
 
 fn fmt_byte_str(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
-    for b in bytes { write!(f, "{:02x}", b)?; }
+    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
+    for i in 0..n { write!(f, "{:02x}", bytes[i])?; }
     Ok(())
 }
 
 fn fmt_prefixed_byte_str(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
     write!(f, "{}", pre)?;
-    for b in bytes { write!(f, "{:02x}", b)?; }
-    Ok(())
+    fmt_byte_str(f, bytes)
 }
 
 impl std::fmt::Debug for StaticDHKeyPair {
@@ -1572,7 +1575,7 @@ impl PacketVotes {
 const PROPOSAL_SEM_SIZE:        usize = 6000;
 const PROPOSAL_CHUNK_SIZE:      usize = 1200;
 const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_CHUNK_SIZE - (1 + 56 + 64);
-const PROPOSAL_CHUNKS_N:        usize = (PROPOSAL_SEM_SIZE + PROPOSAL_CHUNK_DATA_SIZE - 1) / PROPOSAL_CHUNK_DATA_SIZE; // ceil div
+const PROPOSAL_CHUNKS_N:        usize = PROPOSAL_SEM_SIZE.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
 const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
 const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
 
