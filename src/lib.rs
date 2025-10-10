@@ -993,19 +993,17 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         peer.watch_dog                          = Instant::now();
                     }
 
-                    if let Some(peer_endpoint) = peer.endpoint {
-                        if let Some(transport) = &mut peer.transport_state {
-                            if peer.connection_is_unknown {
-                                // Gossip evidence in order to trigger upgrade
-                                if let Some(evidence) = my_endpoint_evidence {
-                                    send_buf1[0] = PACKET_TAG_ENDPOINT_EVIDENCE;
-                                    let len1 = 1 + evidence.write_to(&mut send_buf1[1..]);
-                                    send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
-                                }
+                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                        if peer.connection_is_unknown {
+                            // Gossip evidence in order to trigger upgrade
+                            if let Some(evidence) = my_endpoint_evidence {
+                                send_buf1[0] = PACKET_TAG_ENDPOINT_EVIDENCE;
+                                let len1 = 1 + evidence.write_to(&mut send_buf1[1..]);
+                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                             }
-                            else {
-                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &[PACKET_TAG_HEARTBEAT]);
-                            }
+                        }
+                        else {
+                            send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &[PACKET_TAG_HEARTBEAT]);
                         }
                     }
                 }
@@ -1022,12 +1020,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             peer.outgoing_handshake_state = Some(outgoing_state);
                         }
 
-                        if let Some(transport) = &mut peer.transport_state {
-                            if let Some(evidence) = roster_endpoint_evidence.choose(&mut base_rng) {
-                                send_buf1[0] = PACKET_TAG_ENDPOINT_EVIDENCE;
-                                let len1     = 1 + evidence.write_to(&mut send_buf1[1..]);
-                                send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
-                            }
+                        if let (Some(transport), Some(evidence)) =
+                            (&mut peer.transport_state, roster_endpoint_evidence.choose(&mut base_rng)) {
+                            send_buf1[0] = PACKET_TAG_ENDPOINT_EVIDENCE;
+                            let len1     = 1 + evidence.write_to(&mut send_buf1[1..]);
+                            send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                         }
                     }
                 }
@@ -1048,19 +1045,22 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, height, round);
 
                     if hdr.proposal_id != ValueId::NIL {
+                        eprintln!("{:05}: {:?} sending {} proposal chunks", my_port, &roster_i_from_pub_key(&roster, bft_state.my_pub_key), PROPOSAL_CHUNKS_N);
+
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
                             // send all of the proposal chunks we've seen
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
-                                hdr.chunk_i = chunk_i as u32;
-                                let chunk_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
-
                                 send_buf1[0] = PACKET_TAG_PROPOSAL_CHUNK;
+
+                                hdr.chunk_i = chunk_i as u32;
                                 let mut o = 1 + hdr.write_to(&mut send_buf1[1..]);
+
+                                let chunk_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
                                 o += round_data.proposal.0[chunk_o..chunk_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut send_buf1[o..]);
                                 let sig_o = o;
                                 o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
-                                if true {
+                                if true { // self-check signatures as sanity check
                                     let sig = match ed25519_zebra::Signature::from_slice(&round_data.proposal_sigs[chunk_i].0) { Ok(v)=>v, Err(err)=> {
                                         eprintln!("{:05}: BFT FAULT: malformed proposal signature: {}", my_port, err);
                                         continue;
@@ -1077,9 +1077,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
 
                                 for peer in &mut peers {
-                                    if let Some(peer_endpoint) = peer.endpoint &&
-                                       let Some(transport) = &mut peer.transport_state {
-                                           send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
+                                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                        send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
                                     }
                                 }
                             }
@@ -1165,9 +1164,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     for peer_i in 0..peers.len() {
                         let peer = &mut peers[peer_i];
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
-                            if let Some(peer_endpoint) = peer.endpoint &&
-                               let Some(transport)     = &mut peer.transport_state
-                            {
+                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
                                 // @testing
                                 hdr.chunk_i = chunk_i as u32;
                                 let mut o = 1 + hdr.write_to(&mut send_buf1[1..]);
@@ -1193,9 +1190,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                 // send out updates
                 for peer in &mut peers {
-                    if let Some(peer_endpoint) = peer.endpoint &&
-                       let Some(transport)     = &mut peer.transport_state
-                    {
+                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
                         // @testing
                         let mut packet = PacketVotes {
                             tag: PACKET_TAG_PREVOTE_SIGNATURES,
