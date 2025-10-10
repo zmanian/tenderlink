@@ -199,6 +199,7 @@ fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 struct TMState {
+    my_signing_key: SigningKey,
     my_pub_key: PubKeyID,
     round: u32,
     step: TMStep,
@@ -214,8 +215,9 @@ struct TMState {
     rounds_data: Vec<RoundData>,
 }
 impl TMState {
-    fn init(my_pub_key: PubKeyID) -> Self {
+    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID) -> Self {
         Self {
+            my_signing_key,
             my_pub_key,
             round: 0,
             step: TMStep::Propose,
@@ -232,17 +234,59 @@ impl TMState {
     }
 
 
-    fn broadcast(&self, step: TMStep, msg: TMMsgData) -> TMStep {
-        self.height();
-        self.round;
-        msg;
-        // TODO: sign msg data
+    // NOTE: we just add our info to our round data & have it become equivalent to everyone else's...
+    fn broadcast(&mut self, roster: &[SortedRosterMember], round_i: usize, msg: TMMsgData) -> TMStep {
         // TODO: can we get away with not signing the step or separately signing the step?
-        let _sig = [1; 64];
+        let mut buf = [0u8; 2048];
         // TODO: send to self
         // TODO: send to (some) others
-        todo!();
-        step
+        let height = self.rounds_data[round_i].height;
+        let round  = self.rounds_data[round_i].round;
+        match msg {
+            TMMsgData::Proposal(proposal, valid_round) => {
+                let mut hdr = PacketProposalChunkHeader {
+                    height, round, chunk_i: 0,
+                    proposal_id: Self::id_from_value(&proposal),
+                    valid_round,
+                };
+
+                for chunk_i in 0..PROPOSAL_CHUNKS_N { // NOTE: excluding tag // TODO: check this
+                    let round_data = &mut self.rounds_data[round_i];
+
+                    hdr.chunk_i = chunk_i as u32;
+                    let mut o = hdr.write_to(&mut buf[0..]);
+
+                    let chunk_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+                    o += round_data.proposal.0[chunk_o..chunk_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut buf[o..]);
+
+                    // NOTE: we *DON'T* want to write it immediately to our proper store because it
+                    // will confuse check_and_incorporate_msg
+                    self.my_signing_key.sign(&buf[..o]).to_bytes().write_to(&mut buf[o..]);
+
+                    // NOTE: we're faulty if we give our pub key for this if it's not our proposal
+                    self.check_and_incorporate_msg(
+                        height, round, chunk_i, hdr.proposal_id, hdr.valid_round,
+                        roster, self.my_pub_key, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &buf[o..]
+                    );
+                }
+
+                TMStep::Propose
+            }
+
+            TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
+                let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
+                let tag         = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit;
+                let signed_data = make_vote_sign_datas(is_precommit, height, round, value_id)[1];
+                let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
+
+                self.check_and_incorporate_msg(
+                    height, round, 0, value_id, -2,
+                    roster, self.my_pub_key, tag, &signed_data, &sig
+                );
+
+                [TMStep::Prevote, TMStep::Precommit][is_precommit as usize]
+            },
+        }
     }
 
     /// Deterministic weighted round robin (hash & mod total zec on cumulative list)
@@ -275,19 +319,24 @@ impl TMState {
         (Some(roster_i), roster[roster_i].pub_key)
     }
 
-    fn insert_round(&mut self, insert_i: usize, round: u32, roster_n: usize) -> &mut RoundData {
+    fn insert_round(&mut self, insert_i: usize, round: u32, roster_n: usize) -> usize {
         self.rounds_data.insert(insert_i, RoundData{
             height: self.height(),
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
             ..RoundData::EMPTY
         });
-        &mut self.rounds_data[insert_i]
+        insert_i
     }
 
     fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
         self.round = round;
         // self.active_proposal_value_round = (None, -1);
+
+        let round_i = match self.rounds_data.binary_search_by_key(&(self.height(), round), |el| (el.height, el.round)) {
+            Ok(round_i)  => round_i,
+            Err(round_i) => self.insert_round(round_i, round, active_roster_len(roster))
+        };
 
         if Self::proposer_from_height_round(roster, self.height(), round).1 == self.my_pub_key {
             let proposal = if let Some(valid_value) = self.valid_value_round.0 {
@@ -298,14 +347,10 @@ impl TMState {
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
-            self.step = self.broadcast(TMStep::Propose, TMMsgData::Proposal(proposal, self.valid_value_round.1));
+            self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, self.valid_value_round.1));
         } else {
             self.step = TMStep::Propose;
-
-            match self.rounds_data.binary_search_by_key(&(self.height(), round), |el| (el.height, el.round)) {
-                Ok(round_i)  => &mut self.rounds_data[round_i],
-                Err(round_i) => self.insert_round(round_i, round, active_roster_len(roster))
-            }.active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Propose));
+            self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Propose));
         }
     }
 
@@ -538,9 +583,9 @@ impl TMState {
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal)) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
-                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
 
@@ -557,9 +602,9 @@ impl TMState {
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal))
                 {
-                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
 
@@ -586,7 +631,7 @@ impl TMState {
             {
                 if self.step == TMStep::Prevote {
                     self.locked_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
-                    self.step = self.broadcast(TMStep::Precommit, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                    self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
                 self.valid_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
             }
@@ -598,7 +643,7 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].nil_prevotes_n &&
                 self.step == TMStep::Prevote)
             {
-                self.step = self.broadcast(TMStep::Precommit, TMMsgData::Precommit(ValueId::NIL));
+                self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
             }
 
             // line 47: last orders on precommit period
@@ -644,10 +689,10 @@ impl TMState {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
-                        self.step = self.broadcast(TMStep::Prevote, TMMsgData::Prevote(ValueId::NIL));
+                        self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
-                        self.step = self.broadcast(TMStep::Precommit, TMMsgData::Precommit(ValueId::NIL));
+                        self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
                     },
                     TMStep::Precommit => self.start_round(roster, now, self.round + 1),
                 }
@@ -892,7 +937,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     }
     println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
 
-    let mut bft_state = TMState::init(PubKeyID(my_root_public_key.into())); // TODO: double-check this is the right key
+    // TODO: only convert private to public in 1 location
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into())); // TODO: double-check this is the right key
+    bft_state.start_round(&roster, Instant::now(), 0);
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {
         Some(roster_endpoint_evidence[i])
