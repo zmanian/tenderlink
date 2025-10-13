@@ -1091,7 +1091,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
                 // TODO: loop rounds at current height
-                if let Ok(round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), bft_state.round), |el| (el.height, el.round)) {
+                // if let Ok(round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                for round_i in 0..bft_state.rounds_data.len()
+                {
                     let round_data = &bft_state.rounds_data[round_i];
                     let height = round_data.height;
                     let round  = round_data.round;
