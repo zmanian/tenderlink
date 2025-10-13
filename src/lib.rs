@@ -207,6 +207,7 @@ fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 #[derive(Debug)]
 struct TMState {
+    my_port: u16,
     my_signing_key: SigningKey,
     my_pub_key: PubKeyID,
     round: u32,
@@ -223,8 +224,9 @@ struct TMState {
     rounds_data: Vec<RoundData>,
 }
 impl TMState {
-    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID) -> Self {
+    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16) -> Self {
         Self {
+            my_port,
             my_signing_key,
             my_pub_key,
             round: 0,
@@ -281,7 +283,7 @@ impl TMState {
 
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
-                println!("{:?} {} on {}", self.my_pub_key, ["prevoting", "precommitting"][is_precommit as usize], value_id);
+                println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id);
                 let tag         = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(is_precommit, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
@@ -351,7 +353,7 @@ impl TMState {
             } else {
                 get_bft_value(self)
             };
-            println!("about to propose: {:?}", proposal);
+            println!("{} about to propose: {:?}", self.ctx_str(roster), proposal);
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
@@ -372,12 +374,11 @@ impl TMState {
     }
 
     fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], from_pub_key: PubKeyID, tag: u8, signed_data: &[u8], sig_data: &[u8]) -> TMStatus {
-        let my_roster_i = roster_i_from_pub_key(roster, self.my_pub_key);
-        let me_str      = format!("{:04?}.{}.{}", my_roster_i, self.height(), self.round);
+        let me_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(tag), height, round, chunk_i);
 
         if height != self.height() {
-            eprintln!("{}: BFT: received [{}] when we're at height {}", me_str, pkt_str, self.height());
+            // eprintln!("{}: BFT: received [{}] when we're at height {}", me_str, pkt_str, self.height());
             return TMStatus::Fail;
         }
 
@@ -583,17 +584,22 @@ impl TMState {
         todo!();
     }
 
+    fn ctx_str(&self, roster: &[SortedRosterMember]) -> String {
+        format!("{:05}-{:?}-{:?}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height(), self.round, format!("{:?}", self.step))
+    }
 
     fn bft_update(&mut self, roster: &[SortedRosterMember]) {
         let now = Instant::now();
         let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
+        let ctx_str = self.ctx_str(roster);
 
         for i in 0..self.rounds_data.len() {
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
-            println!("{:?}.{:?} {is_current_height_and_round}, {}/{PROPOSAL_CHUNKS_N}, {}", self.my_pub_key,
-                self.step,
+            println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
+                ["!","="][is_current_height_and_round as usize],
+                self.rounds_data[i].height, self.rounds_data[i].round,
                 self.rounds_data[i].proposal_sigs_n,
                 self.rounds_data[i].proposal_valid_round
             );
@@ -616,10 +622,10 @@ impl TMState {
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal)) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
-                    println!("{:4?}: in condition 22-0: receive first proposal this height", roster_i_from_pub_key(roster, self.my_pub_key));
+                    println!("{}: in condition 22-0: receive first proposal this height", ctx_str);
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    println!("{:4?}: in condition 22-1: receive first proposal this height", roster_i_from_pub_key(roster, self.my_pub_key));
+                    println!("{}: in condition 22-1: receive first proposal this height", ctx_str);
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -637,10 +643,10 @@ impl TMState {
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal))
                 {
-                    println!("{:4?}: in condition 28-0: received 2f+1 prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
+                    println!("{}: in condition 28-0: received 2f+1 prevotes", ctx_str);
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    println!("{:4?}: in condition 28-1: received 2f+1 prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
+                    println!("{}: in condition 28-1: received 2f+1 prevotes", ctx_str);
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -653,7 +659,7 @@ impl TMState {
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
-                println!("{:4?}: in condition 34: last orders on prevote period", roster_i_from_pub_key(roster, self.my_pub_key));
+                println!("{}: in condition 34: last orders on prevote period", ctx_str);
                 self.rounds_data[i].timeout_triggered[0] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Prevote));
             }
@@ -667,9 +673,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
-                println!("{:4?}: in condition 36: seen 2f+1 valid prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
+                println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str);
                 if self.step == TMStep::Prevote {
-                    println!("{:4?}: in condition 36-0: seen 2f+1 valid prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
+                    println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str);
                     self.locked_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
@@ -683,7 +689,7 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].nil_prevotes_n &&
                 self.step == TMStep::Prevote)
             {
-                println!("{:4?}: in condition 44: seen 2f+1 nil prevotes", roster_i_from_pub_key(roster, self.my_pub_key));
+                println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str);
                 self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
             }
 
@@ -693,7 +699,7 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].precommits_n &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
-                println!("{:4?}: in condition 47: last orders on precommit period", roster_i_from_pub_key(roster, self.my_pub_key));
+                println!("{}: in condition 47: last orders on precommit period", ctx_str);
                 self.rounds_data[i].timeout_triggered[1] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Precommit));
             }
@@ -706,12 +712,15 @@ impl TMState {
                 2*f+1 <= self.rounds_data[i].precommits_n &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
-                println!("{:4?}: in condition 49: value decided", roster_i_from_pub_key(roster, self.my_pub_key));
+                println!("{}: in condition 49: value decided", ctx_str);
                 self.decisions.push(TMDecision {
                     value: self.rounds_data[i].proposal,
                     // value_sig: self.rounds_data[i].proposal_sig,
                     // votes: self.rounds_data[i].msg_val_sigs
                 });
+                self.locked_value_round = (None, -1);
+                self.valid_value_round = (None, -1);
+                self.start_round(roster, now, 0);
             }
 
             // line 55: round catchup
@@ -720,7 +729,7 @@ impl TMState {
                 self.round    <  self.rounds_data[i].round  &&
                 f+1 <= self.rounds_data[i].anys_n)
             {
-                println!("{:4?}: in condition 55: round catchup", roster_i_from_pub_key(roster, self.my_pub_key));
+                println!("{}: in condition 55: round catchup", ctx_str);
                 self.start_round(roster, now, self.rounds_data[i].round)
             }
 
@@ -733,15 +742,15 @@ impl TMState {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
-                        println!("{:4?}: hit timeout propose", roster_i_from_pub_key(roster, self.my_pub_key));
+                        println!("{}: hit timeout propose", ctx_str);
                         self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
-                        println!("{:4?}: hit timeout prevote", roster_i_from_pub_key(roster, self.my_pub_key));
+                        println!("{}: hit timeout prevote", ctx_str);
                         self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
                     },
                     TMStep::Precommit => {
-                        println!("{:4?}: hit timeout precommit", roster_i_from_pub_key(roster, self.my_pub_key));
+                        println!("{}: hit timeout precommit", ctx_str);
                         self.start_round(roster, now, self.round + 1)
                     },
                 }
@@ -987,7 +996,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
 
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into())); // TODO: double-check this is the right key
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port); // TODO: double-check this is the right key
     bft_state.start_round(&roster, Instant::now(), 0);
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {
@@ -1094,8 +1103,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     };
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, height, round);
 
+                    let ctx_str = bft_state.ctx_str(&roster);
+
                     if hdr.proposal_id != ValueId::NIL {
-                        eprintln!("{:05}: {:?} sending {} proposal chunks", my_port, &roster_i_from_pub_key(&roster, bft_state.my_pub_key), PROPOSAL_CHUNKS_N);
+                        eprintln!("{} sending {} proposal chunks", ctx_str, PROPOSAL_CHUNKS_N);
 
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
                             // send all of the proposal chunks we've seen
@@ -1112,16 +1123,16 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                                 if true { // self-check signatures as sanity check
                                     let sig = match ed25519_zebra::Signature::from_slice(&round_data.proposal_sigs[chunk_i].0) { Ok(v)=>v, Err(err)=> {
-                                        eprintln!("{:05}: BFT FAULT: malformed proposal signature: {}", my_port, err);
+                                        eprintln!("{}: BFT FAULT: malformed proposal signature: {}", ctx_str, err);
                                         continue;
                                     }};
                                     let vk = match ed25519_zebra::VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
-                                        eprintln!("{:05}: BFT FAULT: invalid proposal public key: {} ({})", my_port, proposer_pub_key, err);
+                                        eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
                                         continue;
                                     }};
                                     match vk.verify(&sig, &send_buf1[1..sig_o]) { Ok(_)=>{}, Err(err)=>{
-                                        eprintln!("{:05}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
-                                            my_port, proposer_pub_key, height, round, chunk_i, sig_o-1, hdr.proposal_id, err);
+                                        eprintln!("{}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
+                                            ctx_str, proposer_pub_key, height, round, chunk_i, sig_o-1, hdr.proposal_id, err);
                                         continue;
                                     }}
                                 }
@@ -1148,7 +1159,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
                                 if sig != TMSig::NIL {
                                     let pub_key_sig = PubKeySig{ pub_key: roster[roster_i].pub_key, sig };
-                                    // println!("{:05} {}: packing in sig from {}", my_port, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
+                                    // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
                                     // add nos and yeses from opposite ends to avoid excess moves
                                      if value_id == ValueId::NIL {
@@ -1162,7 +1173,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                         sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                         // full evidence block; send it
-                                        // println!("{:05}: full block: {:#?}", my_port, packet);
+                                        // println!("{}: full block: {:#?}", ctx_str, packet);
                                         let len1 = packet.write_to(&mut send_buf1[..]);
                                         for peer in &mut peers {
                                             if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
@@ -1180,13 +1191,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             // send any half-filled vote blocks
                             if (packet.no_votes_n + packet.yes_votes_n) > 0 {
                                 sent_c += (packet.no_votes_n + packet.yes_votes_n);
-                                // println!("{:05}: half-filled block pre-gap-close: {:#?}", my_port, packet);
+                                // println!("{}: half-filled block pre-gap-close: {:#?}", ctx_str, packet);
                                 // move items from end to fill gap
                                 for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
                                     packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                                 }
 
-                                // println!("{:05}: half-filled block post-gap-close: {:#?}", my_port, packet);
+                                // println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet);
                                 let len1 = packet.write_to(&mut send_buf1[..]);
                                 for peer in &mut peers {
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
@@ -1196,7 +1207,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             }
 
                             if sent_c > 0{
-                                println!("{:05}: {:?} sent {} {}", my_port, &roster_i_from_pub_key(&roster, bft_state.my_pub_key), sent_c, ["prevotes", "precommits"][is_precommit as usize]);
+                                println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
                             }
                         }
                     }
@@ -1238,8 +1249,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                 //                     let src_roster_i = roster_i_from_pub_key(&roster, my_pub_key);
                 //                     let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
-                //                     println!("{:05}: {:?} sending proposal {}.{}.{} (V_ID: {}) sig_o: {} to {:?}",
-                //                     my_port, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
+                //                     println!("{}: {:?} sending proposal {}.{}.{} (V_ID: {}) sig_o: {} to {:?}",
+                //                     ctx_str, src_roster_i, hdr.height, hdr.round, hdr.chunk_i, hdr.proposal_id, sig_o, dst_roster_i);
                 //                     send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o])
                 //                 }
                 //             }
@@ -1271,7 +1282,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                 //             let src_roster_i = roster_i_from_pub_key(&roster, packet.votes[0].pub_key);
                 //             let dst_roster_i = roster_i_from_pub_key(&roster, PubKeyID(peer.root_public_key));
-                //             println!("{:05}: {:?} sending {}/{} prevote sigs to {:?}", my_port, src_roster_i, packet.no_votes_n, packet.yes_votes_n, dst_roster_i);
+                //             println!("{}: {:?} sending {}/{} prevote sigs to {:?}", ctx_str, src_roster_i, packet.no_votes_n, packet.yes_votes_n, dst_roster_i);
                 //             let len1 = packet.write_to(&mut send_buf1[..]);
                 //             send_noise_msg(transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1])
                 //         }
