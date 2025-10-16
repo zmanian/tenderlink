@@ -3,6 +3,16 @@ name = "stuff"
 version = "0.1.0"
 edition = "2024"
 
+[profile.dev]
+opt-level = 0            # no optimizations
+debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)
+debug-assertions = true
+overflow-checks = true
+incremental = false      # incremental confuses symbol mapping
+codegen-units = 1        # easier to debug single unit
+split-debuginfo = "unpacked"  # produce separate .pdb files
+lto = false
+
 [dependencies]
 blake3 = "1.8.2"
 byteorder = "1.5.0"
