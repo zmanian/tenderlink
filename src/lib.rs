@@ -124,12 +124,7 @@ struct RoundData {
     // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
     msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
 
-    anys_n: usize,
-    prevotes_n: usize,
-    precommits_n: usize,
-    valid_prevotes_n: usize,
-    valid_precommits_n: usize,
-    nil_prevotes_n: usize,
+    counts: ConsensusCounts,
     // TODO: can probably do this from whether *our* node has a valid value
     // TODO: by round or for whole state?
     active_timeout: Option<Timeout>,
@@ -147,12 +142,7 @@ impl RoundData {
         proposal_checked_validity: TMStatus::Indeterminate,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
-        valid_prevotes_n: 0,
-        valid_precommits_n: 0,
-        nil_prevotes_n: 0,
-        prevotes_n: 0,
-        precommits_n: 0,
-        anys_n: 0,
+        counts: ConsensusCounts::ZERO,
 
         active_timeout: None,
         timeout_triggered: [false;2],
@@ -179,6 +169,79 @@ struct TMMsg {
     round: u32,
     data: TMMsgData, // ALT: byteslice + step distinguisher
     sig: TMSig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ConsensusCounts {
+    anys: usize,
+    prevotes: usize,
+    precommits: usize,
+    valid_prevotes: usize,
+    valid_precommits: usize,
+    nil_prevotes: usize,
+}
+impl ConsensusCounts {
+    const ZERO: Self = Self {
+        anys: 0,
+        prevotes: 0,
+        precommits: 0,
+        valid_prevotes: 0,
+        valid_precommits: 0,
+        nil_prevotes: 0,
+    };
+
+    fn from_slice(slice: &[[(ValueId, TMSig); 2]]) -> Self {
+        let mut counts = Self::ZERO;
+        for el in slice {
+            counts = counts + ConsensusCounts::from(el);
+        }
+        counts
+    }
+}
+impl std::ops::Add for ConsensusCounts {
+    type Output = Self;
+    fn add(self, rhs: ConsensusCounts) -> ConsensusCounts {
+        ConsensusCounts {
+            anys:             self.anys             + rhs.anys,
+            prevotes:         self.prevotes         + rhs.prevotes,
+            precommits:       self.precommits       + rhs.precommits,
+            valid_prevotes:   self.valid_prevotes   + rhs.valid_prevotes,
+            valid_precommits: self.valid_precommits + rhs.valid_precommits,
+            nil_prevotes:     self.nil_prevotes     + rhs.nil_prevotes,
+        }
+    }
+}
+impl std::ops::Sub for ConsensusCounts {
+    type Output = Self;
+    fn sub(self, rhs: ConsensusCounts) -> ConsensusCounts {
+        ConsensusCounts {
+            anys:             self.anys             - rhs.anys,
+            prevotes:         self.prevotes         - rhs.prevotes,
+            precommits:       self.precommits       - rhs.precommits,
+            valid_prevotes:   self.valid_prevotes   - rhs.valid_prevotes,
+            valid_precommits: self.valid_precommits - rhs.valid_precommits,
+            nil_prevotes:     self.nil_prevotes     - rhs.nil_prevotes,
+        }
+    }
+}
+impl From<&[(ValueId, TMSig); 2]> for ConsensusCounts {
+    fn from(val: &[(ValueId, TMSig); 2]) -> ConsensusCounts {
+        let has_sigs     = [(val[0].1 != TMSig::NIL) as usize, (val[1].1 != TMSig::NIL) as usize];
+        let has_any_sigs = has_sigs[0] | has_sigs[1]; // TODO: confirm prevote + precommit from the same person counts as 1
+
+        let mut status = [[0,0], [0,0]];
+        status[0][(val[0].0 != ValueId::NIL) as usize] = has_sigs[0];
+        status[1][(val[1].0 != ValueId::NIL) as usize] = has_sigs[1];
+
+        ConsensusCounts {
+            anys: has_any_sigs,
+            prevotes: has_sigs[0],
+            precommits: has_sigs[1],
+            valid_prevotes: status[0][1],
+            valid_precommits: status[1][1],
+            nil_prevotes: status[0][0],
+        }
+    }
 }
 
 fn roster_i_from_pub_key(roster: &[SortedRosterMember], pub_key: PubKeyID) -> Option<usize> {
@@ -396,7 +459,7 @@ impl TMState {
         let ctx_str = format!("{} [{} from {} ({:.4}...)]", me_str, pkt_str, roster_i, from_pub_key);
 
         // check if data was signed by pub key
-        let sig = match ed25519_zebra::Signature::from_slice(sig_data) { Ok(v)=>v, Err(err)=> {
+        let signature = match ed25519_zebra::Signature::from_slice(sig_data) { Ok(v)=>v, Err(err)=> {
             eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: malformed signature: {}", ctx_str, err);
             return TMStatus::Fail;
         }};
@@ -404,10 +467,11 @@ impl TMState {
             eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid public key: {} ({})", ctx_str, from_pub_key, err);
             return TMStatus::Fail;
         }};
-        match vk.verify(&sig, signed_data) { Ok(_)=>{}, Err(err)=>{
+        match vk.verify(&signature, signed_data) { Ok(_)=>{}, Err(err)=>{
             eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid signature[..{}]: {} {}", ctx_str, signed_data.len(), value_id, err);
             return TMStatus::Fail;
         }}
+        let sig = TMSig(signature.to_bytes());
 
         // eprintln!("{}: valid signature for value id: {}", ctx_str, value_id);
 
@@ -443,7 +507,8 @@ impl TMState {
             PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => {
                 // TODO: check if this person has previously voted differently; is this covered later?
 
-                if value_id == ValueId::NIL { // always legal
+                // TODO: better double-vote handling
+                if value_id == ValueId::NIL { // always legal // TODO NOT TRUE
                     TMStatus::Pass
                 } else if ! is_prev_seen_round || self.rounds_data[round_i].proposal_sigs_n == 0 {
                     // if we don't have a real proposal yet we can't check for validity
@@ -477,28 +542,46 @@ impl TMState {
         match tag {
             PACKET_TAG_PROPOSAL_CHUNK => {
                 // TODO: check expected proposer here if not above
-                let chunk_data = &signed_data[PacketProposalChunkHeader::SERIALIZED_SIZE..PacketProposalChunkHeader::SERIALIZED_SIZE+ PROPOSAL_CHUNK_DATA_SIZE];
+                let chunk_data = &signed_data[PacketProposalChunkHeader::SERIALIZED_SIZE..PacketProposalChunkHeader::SERIALIZED_SIZE+PROPOSAL_CHUNK_DATA_SIZE];
 
-                if is_prev_seen_round { // element already in vector @ `round_i`
-                    if round_data.proposal_sigs[chunk_i] == TMSig::NIL { // value chunk not seen before
-                        let o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
-                        chunk_data.write_to(&mut round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
-                        round_data.proposal_sigs[chunk_i] = TMSig(sig.to_bytes());
-                        round_data.proposal_sigs_n       += 1;
-                        round_data.proposal_valid_round   = valid_round;
-                        round_data.proposal_id            = value_id;
+                // TODO: more thoughtful handling
+                if round_data.proposal_sigs[chunk_i] == TMSig::NIL { // value chunk not seen before
+                    let o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+                    chunk_data.write_to(&mut round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
+                    round_data.proposal_sigs[chunk_i] = sig;
+                    round_data.proposal_sigs_n       += 1;
+                    round_data.proposal_valid_round   = valid_round;
+                    if round_data.proposal_id == ValueId::NIL { // first time we've seen any proposal chunks
+                        round_data.proposal_id = value_id;
 
-                        println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, PROPOSAL_CHUNKS_N);
-                        // println!("{}: chunk data:\n{:?}", ctx_str, &round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
+                        let mut has_fault = false;
+                        // check whether speculative adds to round data were for the actual proposal
+                        for roster_i in 0..round_data.msg_val_sigs.len() {
+                            let msg_val: &mut [(ValueId, TMSig); 2] = &mut round_data.msg_val_sigs[roster_i];
+                            for is_precommit in 0..2 {
+                                if msg_val[is_precommit].0 != ValueId::NIL && msg_val[is_precommit].0 != value_id {
+                                    has_fault = true;
+                                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} {} on non-proposed value {}. Ignoring...", ctx_str, height, round, roster_i, ["prevoted","precommitted"][is_precommit], value_id);
+                                    msg_val[is_precommit] = (ValueId::NIL, TMSig::NIL);
+                                }
+                            }
+                        }
 
-                        // TODO: include signed prevote & precommit for self?
-                    } else if round_data.proposal_sigs[chunk_i] != TMSig(sig.to_bytes()) { // TODO: check value/sig conformance
-                                                                                           // TODO: treat this as a failed is_valid & early out before awaiting full proposal
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
-                        return TMStatus::Fail;
-                    } else {
-                        return TMStatus::Pass; // already good
+                        if has_fault { // recompute from scratch
+                            round_data.counts = ConsensusCounts::from_slice(&round_data.msg_val_sigs);
+                        }
                     }
+
+                    println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, PROPOSAL_CHUNKS_N);
+                    // println!("{}: chunk data:\n{:?}", ctx_str, &round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
+
+                    // TODO: include signed prevote & precommit for self?
+                } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
+                                                                                       // TODO: treat this as a failed is_valid & early out before awaiting full proposal
+                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
+                    return TMStatus::Fail;
+                } else {
+                    return TMStatus::Pass; // already good
                 }
             }
 
@@ -508,71 +591,49 @@ impl TMState {
                 // Add the signature to the list & update counts
                 let new = &mut round_data.msg_val_sigs[roster_i];
                 let old = *new;
-                new[is_precommit] = (value_id, TMSig(sig.to_bytes()));
+                new[is_precommit] = (value_id, sig);
 
-
-                let old_has_sigs     = [(old[0].1 != TMSig::NIL) as usize, (old[1].1 != TMSig::NIL) as usize];
-                let new_has_sigs     = [(new[0].1 != TMSig::NIL) as usize, (new[1].1 != TMSig::NIL) as usize];
-                let old_has_any_sigs = old_has_sigs[0] | old_has_sigs[1];
-                let new_has_any_sigs = new_has_sigs[0] | new_has_sigs[1];
-
-                if old_has_sigs[is_precommit] != 0 && old[is_precommit] != new[is_precommit] {
+                if old[is_precommit].1 != TMSig::NIL && old[is_precommit] != new[is_precommit] {
                     // TODO: do we want to allow for NIL updating to valid?
                     eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", ctx_str, height, round, roster_i);
                     return TMStatus::Fail;
                 }
 
-                let mut old_status = [[0,0], [0,0]];
-                old_status[0][(old[0].0 != ValueId::NIL) as usize] = old_has_sigs[0];
-                old_status[1][(old[1].0 != ValueId::NIL) as usize] = old_has_sigs[1];
-                let mut new_status = old_status;//[[0,0], [0,0]];
-                new_status[0][(new[0].0 != ValueId::NIL) as usize] = new_has_sigs[0];
-                new_status[1][(new[1].0 != ValueId::NIL) as usize] = new_has_sigs[1];
+                let old_cs = ConsensusCounts::from(&old);
+                let new_cs = ConsensusCounts::from(&*new);
+                let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
+                round_data.counts = round_data.counts + d;
 
-
-                // add 1 to counts that have been updated by this message
-                let d_anys_n             = new_has_any_sigs - old_has_any_sigs;
-                let d_prevotes_n         = new_has_sigs[0]  - old_has_sigs[0];
-                let d_precommits_n       = new_has_sigs[1]  - old_has_sigs[1];
-                let d_valid_prevotes_n   = new_status[0][1] - old_status[0][1];
-                let d_valid_precommits_n = new_status[1][1] - old_status[1][1];
-                let d_nil_prevotes_n     = new_status[0][0] - old_status[0][0];
-
-                // println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
-                // println!("    {} d_anys_n            ", d_anys_n);
-                // println!("    {} d_prevotes_n        ", d_prevotes_n);
-                // println!("    {} d_precommits_n      ", d_precommits_n);
-                // println!("    {} d_valid_prevotes_n  ", d_valid_prevotes_n);
-                // println!("    {} d_valid_precommits_n", d_valid_precommits_n);
-                // println!("    {} d_nil_prevotes_n    ", d_nil_prevotes_n);
-
-                round_data.anys_n             += d_anys_n;
-                round_data.prevotes_n         += d_prevotes_n;
-                round_data.precommits_n       += d_precommits_n;
-                round_data.valid_prevotes_n   += d_valid_prevotes_n;
-                round_data.valid_precommits_n += d_valid_precommits_n;
-                round_data.nil_prevotes_n     += d_nil_prevotes_n;
-
-                if (d_anys_n             |
-                    d_prevotes_n         |
-                    d_precommits_n       |
-                    d_valid_prevotes_n   |
-                    d_valid_precommits_n |
-                    d_nil_prevotes_n) != 0 {
+                if (d.anys             |
+                    d.prevotes         |
+                    d.precommits       |
+                    d.valid_prevotes   |
+                    d.valid_precommits |
+                    d.nil_prevotes) != 0
+                {
                     println!("{}: update to a:{} v:{} c:{}, vv:{} nv:{} vp:{}", ctx_str,
-                        round_data.anys_n,
-                        round_data.prevotes_n,
-                        round_data.precommits_n,
-                        round_data.valid_prevotes_n,
-                        round_data.nil_prevotes_n,
-                        round_data.valid_precommits_n,
+                        round_data.counts.anys,
+                        round_data.counts.prevotes,
+                        round_data.counts.precommits,
+                        round_data.counts.valid_prevotes,
+                        round_data.counts.nil_prevotes,
+                        round_data.counts.valid_precommits,
                     );
+                    // println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
+                    println!("    d: {:?}", d);
                 }
             }
 
             _ => {
                 eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {}", ctx_str, tag);
                 return TMStatus::Fail;
+            }
+        }
+
+        if true {
+            let check_counts = ConsensusCounts::from_slice(&round_data.msg_val_sigs);
+            if check_counts != round_data.counts {
+                eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: counts don't match: incremental: {:?}, absolute: {:?}", ctx_str, round_data.counts, check_counts);
             }
         }
 
@@ -594,6 +655,7 @@ impl TMState {
         let ctx_str = self.ctx_str(roster);
 
         for i in 0..self.rounds_data.len() {
+            let counts = self.rounds_data[i].counts.clone();
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
@@ -635,7 +697,7 @@ impl TMState {
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= self.rounds_data[i].valid_prevotes_n &&
+                2*f+1 <= counts.valid_prevotes &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
             {
@@ -655,7 +717,7 @@ impl TMState {
             // > upon 2f+1 <PREVOTE, h_p, round_p, ∗> while step_p = prevote for the first time do
             if (is_current_height_and_round &&
                 // don't need the proposal itself
-                2*f+1 <= self.rounds_data[i].prevotes_n &&
+                2*f+1 <= counts.prevotes &&
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
@@ -669,7 +731,7 @@ impl TMState {
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= self.rounds_data[i].valid_prevotes_n &&
+                2*f+1 <= counts.valid_prevotes &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
@@ -686,7 +748,7 @@ impl TMState {
             // > upon 2f+1 <PREVOTE, h_p, round_p, nil>
             // > while step_p = prevote do
             if (is_current_height_and_round &&
-                2*f+1 <= self.rounds_data[i].nil_prevotes_n &&
+                2*f+1 <= counts.nil_prevotes &&
                 self.step == TMStep::Prevote)
             {
                 println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str);
@@ -696,7 +758,7 @@ impl TMState {
             // line 47: last orders on precommit period
             // > upon 2f+1 <PRECOMMIT, h_p, round_p, ∗> for the first time do
             if (is_current_height_and_round &&
-                2*f+1 <= self.rounds_data[i].precommits_n &&
+                2*f+1 <= counts.precommits &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
                 println!("{}: in condition 47: last orders on precommit period", ctx_str);
@@ -709,7 +771,7 @@ impl TMState {
             // > while decision_p[h_p] = nil do
             if (self.height() == self.rounds_data[i].height && // any round
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= self.rounds_data[i].precommits_n &&
+                2*f+1 <= counts.precommits &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
                 println!("{}: in condition 49: value decided", ctx_str);
@@ -727,7 +789,7 @@ impl TMState {
             // > upon f+1 <∗, h_p, round, ∗, ∗> with round > round_p do
             if (self.height() == self.rounds_data[i].height &&
                 self.round    <  self.rounds_data[i].round  &&
-                f+1 <= self.rounds_data[i].anys_n)
+                f+1 <= counts.anys)
             {
                 println!("{}: in condition 55: round catchup", ctx_str);
                 self.start_round(roster, now, self.rounds_data[i].round)
