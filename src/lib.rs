@@ -1735,10 +1735,51 @@ fn hook_fail_on_panic() {
     }))
 }
 
+pub fn run_instances() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let static_private_keys : Vec<_> = (0..4).map(|_| {
+        let mut crypto_rng = ChaCha20Rng::seed_from_u64(rand::rng().next_u64());
+        // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
+        let mut secret_key = [0u8; 32];
+        crypto_rng.fill_bytes(&mut secret_key);
+        ed25519_zebra::SigningKey::from(secret_key)
+    }).collect();
+    let mut cumulative_stake = 0;
+    let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
+        let stake = 2000 * (static_private_keys.len() - 1 - i) as u64;
+        cumulative_stake += stake;
+        SortedRosterMember { pub_key: PubKeyID(sk.verification_key().into()), stake, cumulative_stake }
+    }).collect();
+    assert!(roster.is_sorted_by(|a,b| a.stake >= b.stake)); // descending
+
+    let static_keypair_zero = {
+        let kp = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).generate_keypair().unwrap();
+        StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
+    };
+
+    let endpoint_zero : SecureUdpEndpoint = {
+        let ip = "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped();
+        let port : u16 = 3030;
+        SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public }
+    };
+
+    let evidence_zero = {
+        EndpointEvidence { endpoint: endpoint_zero, root_public_key: static_private_keys[0].verification_key().into() }
+    };
+
+    let _joins = [
+        rt.spawn(instance(static_private_keys[0], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None)),
+        rt.spawn(instance(static_private_keys[1], None, None, roster.clone(), vec![evidence_zero], None)),
+        rt.spawn(instance(static_private_keys[2], None, None, roster.clone(), vec![evidence_zero], None)),
+        rt.spawn(instance(static_private_keys[3], None, None, roster.clone(), vec![evidence_zero], None)),
+    ];
+
+    rt.block_on(std::future::pending::<()>())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use super::*;
 
     // #[ignore]
@@ -1762,48 +1803,10 @@ mod tests {
 
     #[test]
     fn single_rt() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let static_private_keys : Vec<_> = (0..4).map(|_| {
-            let mut crypto_rng = ChaCha20Rng::seed_from_u64(rand::rng().next_u64());
-            // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
-            let mut secret_key = [0u8; 32];
-            crypto_rng.fill_bytes(&mut secret_key);
-            ed25519_zebra::SigningKey::from(secret_key)
-        }).collect();
-        let mut cumulative_stake = 0;
-        let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
-            let stake = 2000 * (static_private_keys.len() - 1 - i) as u64;
-            cumulative_stake += stake;
-            SortedRosterMember { pub_key: PubKeyID(sk.verification_key().into()), stake, cumulative_stake }
-        }).collect();
-        assert!(roster.is_sorted_by(|a,b| a.stake >= b.stake)); // descending
-
-        let static_keypair_zero = {
-            let kp = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).generate_keypair().unwrap();
-            StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
-        };
-
-        let endpoint_zero : SecureUdpEndpoint = {
-            let ip = "127.0.0.1".parse::<Ipv4Addr>().unwrap().to_ipv6_mapped();
-            let port : u16 = 3030;
-            SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public }
-        };
-
-        let evidence_zero = {
-            EndpointEvidence { endpoint: endpoint_zero, root_public_key: static_private_keys[0].verification_key().into() }
-        };
-
-        let _joins = [
-            rt.spawn(instance(static_private_keys[0], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None)),
-            rt.spawn(instance(static_private_keys[1], None, None, roster.clone(), vec![evidence_zero], None)),
-            rt.spawn(instance(static_private_keys[2], None, None, roster.clone(), vec![evidence_zero], None)),
-            rt.spawn(instance(static_private_keys[3], None, None, roster.clone(), vec![evidence_zero], None)),
-        ];
-
-        rt.block_on(std::future::pending::<()>())
+        run_instances();
     }
 
+    #[ignore]
     #[test]
     fn check_proposer_from_height_round() {
         let roster_ = [
