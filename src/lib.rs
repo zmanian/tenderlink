@@ -840,6 +840,8 @@ struct Peer {
     transport_state: Option<StatelessTransportState>,
     watch_dog: Instant,
 
+    ack_height: u64,
+
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
     on_send_next_nonce: u64,
@@ -855,6 +857,8 @@ impl Default for Peer {
             pending_client_ack_transport_state: None,
             transport_state: None,
             watch_dog: Instant::now(),
+
+            ack_height: 0,
 
             nonce_ack_latest: 0,
             nonce_ack_field: 0,
@@ -1082,6 +1086,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
     let mut unknown_peers: Vec<UnknownPeer> = Vec::new();
 
+    let mut bytes_sent: usize = 0;
+
     let mut recv_buf1 = [0; 2048];
     let mut recv_buf2 = [0; 2048];
     let mut send_buf1 = [0; 2048];
@@ -1167,7 +1173,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
 
-                fn broadcast_round_data(round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket) {
+                fn broadcast_round_data(bft_state: &TMState, round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1211,7 +1217,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
 
                                 for peer in &mut peers[..] {
+                                    if peer.ack_height > height {
+                                        continue;
+                                    }
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                        *bytes_sent += o;
                                         send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
                                     }
                                 }
@@ -1222,6 +1232,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             let mut packet = PacketVotes {
                                 tag: PACKET_TAG_PREVOTE_SIGNATURES + is_precommit,
                                 height, round,
+                                ack_height: bft_state.height(),
                                 value_id: hdr.proposal_id,
                                 no_votes_n: 0, yes_votes_n: 0,
                                 votes: [ PubKeySig::NIL; 18 ],
@@ -1249,7 +1260,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         // println!("{}: full block: {:#?}", ctx_str, packet);
                                         let len1 = packet.write_to(&mut send_buf1[..]);
                                         for peer in &mut peers[..] {
+                                            if peer.ack_height > height {
+                                                continue;
+                                            }
                                             if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                                *bytes_sent += len1;
                                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..len1]);
                                             }
                                         }
@@ -1273,7 +1288,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 // println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet);
                                 let len1 = packet.write_to(&mut send_buf1[..]);
                                 for peer in &mut peers[..] {
+                                    if peer.ack_height > height {
+                                        continue;
+                                    }
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                        *bytes_sent += len1;
                                         send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
                                     }
                                 }
@@ -1289,12 +1308,26 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // TODO: loop rounds at current height
                 // if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
                 // for round_i in 0..bft_state.rounds_data.len()
-                for decision_i in 0..bft_state.decisions.len()
+                for height in 0..bft_state.decisions.len()
                 {
-                    let round_i = bft_state.decisions[decision_i].round_i;
+                    let mut min_ack_height_of_all_peers: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+                    for peer in &peers[..] {
+                        if min_ack_height_of_all_peers > peer.ack_height {
+                            min_ack_height_of_all_peers = peer.ack_height;
+                        }
+                    }
+
+                    if height < min_ack_height_of_all_peers as usize {
+                        // don't need to send info
+                        // println!("SKIPPING!");
+                        continue;
+                    }
+
+                    let round_i = bft_state.decisions[height].round_i;
                     let round_data = &bft_state.rounds_data[round_i];
 
-                    broadcast_round_data(&round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock);
+                    broadcast_round_data(&bft_state, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                 }
 
                 if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
@@ -1303,11 +1336,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     {
                         let round_data = &bft_state.rounds_data[round_i];
 
-                        broadcast_round_data(&round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock);
+                        broadcast_round_data(&bft_state, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 } else {
                     todo!();
                 }
+
+                // println!("Total bytes sent: {}", bytes_sent);
 
                 break;
             }
@@ -1575,6 +1610,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
                         let value_ids    = [ ValueId::NIL, packet.value_id ];
 
+                        if peer.ack_height < packet.ack_height {
+                           peer.ack_height = packet.ack_height;
+                        }
+
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
                             bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
@@ -1667,25 +1706,28 @@ struct PacketVotes {
     no_votes_n:  u8,
     yes_votes_n: u8,
     // pad_:     u16, // TODO: useful?
-    round:    u32,
-    height:   u64,
-    value_id: ValueId,
+    round:      u32,
+    height:     u64,
+    ack_height: u64, // TODO: @SignThisData
+    value_id:   ValueId,
     // TODO: use u16 roster_idxs instead of pub_keys
     votes:    [PubKeySig; 18],
 }
-const_assert!(size_of::<PacketVotes>() == 1240); // TODO(azmr): exactly how much space is left
+const_assert!(size_of::<PacketVotes>() == 1248); // TODO(azmr): exactly how much space is left
                                                  // after noise/nonce/ECC/...?
                                                  // TODO(phil): figure out the padding here
 
 impl PacketVotes {
     fn write_to(&self, buf: &mut [u8]) -> usize {
-        self.tag        .write_to(&mut buf[ 0..]);
-        self.no_votes_n .write_to(&mut buf[ 1..]);
-        self.yes_votes_n.write_to(&mut buf[ 2..]);
-        self.round      .write_to(&mut buf[ 3..]);
-        self.height     .write_to(&mut buf[ 7..]);
-        self.value_id.0 .write_to(&mut buf[15..]);
-        let mut o = 47;
+        let mut o = 0;
+        o += self.tag        .write_to(&mut buf[o..]);
+        o += self.no_votes_n .write_to(&mut buf[o..]);
+        o += self.yes_votes_n.write_to(&mut buf[o..]);
+        o += self.round      .write_to(&mut buf[o..]);
+        o += self.height     .write_to(&mut buf[o..]);
+        o += self.ack_height .write_to(&mut buf[o..]);
+        o += self.value_id.0 .write_to(&mut buf[o..]);
+        // let mut o = 47;
         // NOTE(azmr): slight saving of bytes-on-wire if unused? i.e. initial few times each
         for i in 0..(self.no_votes_n + self.yes_votes_n) as usize {
             o += &self.votes[i].roster_i.write_to(&mut buf[o..]);
@@ -1697,6 +1739,7 @@ impl PacketVotes {
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = PacketVotes {
             tag: 0, no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
+            ack_height: 0,
             value_id: ValueId::NIL,
             votes: [PubKeySig::NIL; 18],
         };
@@ -1705,6 +1748,7 @@ impl PacketVotes {
         packet.yes_votes_n = r.read_u8()?;
         packet.round       = r.read_u32::<LittleEndian>()?;
         packet.height      = r.read_u64::<LittleEndian>()?;
+        packet.ack_height  = r.read_u64::<LittleEndian>()?;
         r.read_exact(&mut packet.value_id.0)?;
         for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
             packet.votes[i].roster_i = r.read_u16::<LittleEndian>()?;
