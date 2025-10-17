@@ -1810,10 +1810,17 @@ fn hook_fail_on_panic() {
 pub fn run_instances(i: usize) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    const N: usize = 11;
+    let seed: u64 = if i == usize::MAX {
+        rand::rng().next_u64()
+    } else {
+        const MOCK_RNG_SEED_FOR_MULTIPROCESS: u64 = 0xdeadbeef12345;
+        MOCK_RNG_SEED_FOR_MULTIPROCESS
+    };
 
+    const N: usize = 4;
+
+    let mut crypto_rng = ChaCha20Rng::seed_from_u64(seed);
     let static_private_keys : Vec<_> = (0..N).map(|_| {
-        let mut crypto_rng = ChaCha20Rng::seed_from_u64(rand::rng().next_u64());
         // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
         let mut secret_key = [0u8; 32];
         crypto_rng.fill_bytes(&mut secret_key);
@@ -1826,6 +1833,8 @@ pub fn run_instances(i: usize) {
         SortedRosterMember { pub_key: PubKeyID(sk.verification_key().into()), stake, cumulative_stake }
     }).collect();
     assert!(roster.is_sorted_by(|a,b| a.stake >= b.stake)); // descending
+
+    println!("{:?}", roster);
 
     let static_keypair_zero = {
         let kp = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).generate_keypair().unwrap();
