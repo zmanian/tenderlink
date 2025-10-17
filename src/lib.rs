@@ -313,8 +313,12 @@ impl TMState {
         let mut buf = [0u8; 2048];
         // TODO: send to self
         // TODO: send to (some) others
-        let height = self.rounds_data[round_i].height;
-        let round  = self.rounds_data[round_i].round;
+        let height   = self.rounds_data[round_i].height;
+        let round    = self.rounds_data[round_i].round;
+        let Some(roster_i) = roster_i_from_pub_key(&roster, self.my_pub_key) else {
+            eprintln!("\x1b[91mBFT ERROR\x1b[0m: failed to find my own public key in the roster");
+            return self.step;
+        };
         match msg {
             TMMsgData::Proposal(proposal, valid_round) => {
                 let mut hdr = PacketProposalChunkHeader {
@@ -337,7 +341,7 @@ impl TMState {
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
                         height, round, chunk_i, hdr.proposal_id, hdr.valid_round,
-                        roster, self.my_pub_key, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &buf[o..o+64]
+                        roster, roster_i, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &buf[o..o+64]
                     );
                 }
 
@@ -353,7 +357,7 @@ impl TMState {
 
                 self.check_and_incorporate_msg(
                     height, round, 0, value_id, -2,
-                    roster, self.my_pub_key, tag, &signed_data, &sig
+                    roster, roster_i, tag, &signed_data, &sig
                 );
 
                 [TMStep::Prevote, TMStep::Precommit][is_precommit as usize]
@@ -436,7 +440,7 @@ impl TMState {
         (n - 1) / 3
     }
 
-    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], from_pub_key: PubKeyID, tag: u8, signed_data: &[u8], sig_data: &[u8]) -> TMStatus {
+    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, tag: u8, signed_data: &[u8], sig_data: &[u8]) -> TMStatus {
         let me_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(tag), height, round, chunk_i);
 
@@ -446,14 +450,12 @@ impl TMState {
         }
 
         // check if in (active) roster
-        let Some(roster_i) = roster_i_from_pub_key(roster, from_pub_key) else {
-            eprintln!("{} [{}]: \x1b[91mBFT FAULT\x1b[0m: {} not on roster", me_str, pkt_str, from_pub_key);
-            return TMStatus::Fail;
-        };
         if roster_i >= active_roster_len(roster) {
-            eprintln!("{} [{}]: \x1b[91mBFT FAULT\x1b[0m: {} is outside active roster: {}", me_str, pkt_str, from_pub_key, roster_i);
+            eprintln!("{} [{}]: \x1b[91mBFT FAULT\x1b[0m: {} is not in the active roster.", me_str, pkt_str, roster_i);
             return TMStatus::Fail;
         }
+
+        let from_pub_key = roster[roster_i].pub_key;
 
         // pkt_str += &format!(" from {} ({})", roster_i, from_pub_key);
         let ctx_str = format!("{} [{} from {} ({:.4}...)]", me_str, pkt_str, roster_i, from_pub_key);
@@ -473,7 +475,7 @@ impl TMState {
         }}
         let sig = TMSig(signature.to_bytes());
 
-        eprintln!("{}: valid signature for value id: {}", ctx_str, value_id);
+        // eprintln!("{}: valid signature for value id: {}", ctx_str, value_id);
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -659,12 +661,12 @@ impl TMState {
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
-            println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
-                ["!","="][is_current_height_and_round as usize],
-                self.rounds_data[i].height, self.rounds_data[i].round,
-                self.rounds_data[i].proposal_sigs_n,
-                self.rounds_data[i].proposal_valid_round
-            );
+            // println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
+            //     ["!","="][is_current_height_and_round as usize],
+            //     self.rounds_data[i].height, self.rounds_data[i].round,
+            //     self.rounds_data[i].proposal_sigs_n,
+            //     self.rounds_data[i].proposal_valid_round
+            // );
 
             // line 11: init proposal period
             // (done elsewhere)
@@ -1217,14 +1219,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 height, round,
                                 value_id: hdr.proposal_id,
                                 no_votes_n: 0, yes_votes_n: 0,
-                                votes: [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ],
+                                votes: [ PubKeySig::NIL; 18 ],
                             };
                             let mut sent_c = 0;
 
                             for roster_i in 0..round_data.msg_val_sigs.len() {
                                 let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
                                 if sig != TMSig::NIL {
-                                    let pub_key_sig = PubKeySig{ pub_key: roster[roster_i].pub_key, sig };
+                                    let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
                                     // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
                                     // add nos and yeses from opposite ends to avoid excess moves
@@ -1249,7 +1251,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                                         packet.no_votes_n  = 0;
                                         packet.yes_votes_n = 0;
-                                        packet.votes       = [ PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12 ];
+                                        packet.votes       = [ PubKeySig::NIL; 18 ];
                                     }
                                 }
                             }
@@ -1530,10 +1532,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     }};
                     // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
                     // ALT:  cache proposer for *current* round
-                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round);
-                    let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
-                    bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                        &roster, proposer_pub_key, tag, &msg[1..sig_o], &msg[sig_o..sig_o+64]);
+                    if let (Some(roster_i), proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round) {
+                        let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
+                        bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
+                            &roster, roster_i, tag, &msg[1..sig_o], &msg[sig_o..sig_o+64]);
+                    };
                 } else {
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
@@ -1547,7 +1550,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
                             bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                &roster, packet.votes[vote_i].pub_key, tag, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
+                                &roster, packet.votes[vote_i].roster_i as usize, tag, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
                         }
                     }
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(tag), err),
@@ -1617,8 +1620,12 @@ impl PacketHeartbeat {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct PubKeySig {
-    pub_key: PubKeyID,
+    roster_i: u16,
     sig: TMSig,
+}
+
+impl PubKeySig {
+    const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL };
 }
 
 // ALT: common packet header: tag, height, round, value_id
@@ -1636,10 +1643,11 @@ struct PacketVotes {
     height:   u64,
     value_id: ValueId,
     // TODO: use u16 roster_idxs instead of pub_keys
-    votes:    [PubKeySig; 12],
+    votes:    [PubKeySig; 18],
 }
-const_assert!(size_of::<PacketVotes>() == 1200); // TODO(azmr): exactly how much space is left
+const_assert!(size_of::<PacketVotes>() == 1240); // TODO(azmr): exactly how much space is left
                                                  // after noise/nonce/ECC/...?
+                                                 // TODO(phil): figure out the padding here
 
 impl PacketVotes {
     fn write_to(&self, buf: &mut [u8]) -> usize {
@@ -1652,8 +1660,8 @@ impl PacketVotes {
         let mut o = 47;
         // NOTE(azmr): slight saving of bytes-on-wire if unused? i.e. initial few times each
         for i in 0..(self.no_votes_n + self.yes_votes_n) as usize {
-            o += &self.votes[i].pub_key.0.write_to(&mut buf[o..]);
-            o += &self.votes[i].sig    .0.write_to(&mut buf[o..]);
+            o += &self.votes[i].roster_i.write_to(&mut buf[o..]);
+            o += &self.votes[i].sig   .0.write_to(&mut buf[o..]);
         }
         o
     }
@@ -1662,7 +1670,7 @@ impl PacketVotes {
         let mut packet = PacketVotes {
             tag: 0, no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
             value_id: ValueId::NIL,
-            votes: [PubKeySig{ pub_key: PubKeyID::NIL, sig: TMSig::NIL }; 12],
+            votes: [PubKeySig::NIL; 18],
         };
         packet.tag         = r.read_u8()?;
         packet.no_votes_n  = r.read_u8()?;
@@ -1671,7 +1679,7 @@ impl PacketVotes {
         packet.height      = r.read_u64::<LittleEndian>()?;
         r.read_exact(&mut packet.value_id.0)?;
         for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-            r.read_exact(&mut packet.votes[i].pub_key.0)?;
+            packet.votes[i].roster_i = r.read_u16::<LittleEndian>()?;
             r.read_exact(&mut packet.votes[i].sig.0)?;
         }
         Ok(packet)
@@ -1802,7 +1810,9 @@ fn hook_fail_on_panic() {
 pub fn run_instances(i: usize) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let static_private_keys : Vec<_> = (0..4).map(|_| {
+    const N: usize = 11;
+
+    let static_private_keys : Vec<_> = (0..N).map(|_| {
         let mut crypto_rng = ChaCha20Rng::seed_from_u64(rand::rng().next_u64());
         // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
         let mut secret_key = [0u8; 32];
@@ -1833,14 +1843,20 @@ pub fn run_instances(i: usize) {
     };
 
     if i == usize::MAX {
-        let _joins = [
-            rt.spawn(instance(static_private_keys[0], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None)),
-            rt.spawn(instance(static_private_keys[1], None, None, roster.clone(), vec![evidence_zero], None)),
-            rt.spawn(instance(static_private_keys[2], None, None, roster.clone(), vec![evidence_zero], None)),
-            rt.spawn(instance(static_private_keys[3], None, None, roster.clone(), vec![evidence_zero], None)),
-        ];
+        // let _joins: [; N];
+        for j in 0..N {
+            if j == 0 {
+                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
+            } else {
+                rt.spawn(instance(static_private_keys[j], None, None, roster.clone(), vec![evidence_zero], None));
+            }
+        }
     } else {
-        todo!();
+        if i == 0 {
+            rt.spawn(instance(static_private_keys[i], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
+        } else {
+            rt.spawn(instance(static_private_keys[i], None, None, roster.clone(), vec![evidence_zero], None));
+        }
     }
     rt.block_on(std::future::pending::<()>())
 }
