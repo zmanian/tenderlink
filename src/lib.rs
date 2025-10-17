@@ -20,7 +20,11 @@ const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
 const FAKE_FAIL_RATIO: f64 = 0.9;
 // const FAKE_FAIL_DISTR: rand::distr::Bernoulli = rand::distr::Bernoulli::new(FAKE_FAIL_RATIO).unwrap();
 
+// NOTE(Phil): On Windows, you can adjust packet ping/loss in realtime using the Clumsy app:
+//             https://jagt.github.io/clumsy/download.html
 fn should_fake_fail(rng: &mut SimRng) -> bool {
+    return false;
+
     if std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() / 10 % 2 == 0 {
         return false;
     }
@@ -54,6 +58,7 @@ enum TMStep {
 
 #[derive(Debug)]
 struct TMDecision {
+    round_i: usize,
     value: BlockValue,
     //signatures: Vec<TMSig>, // ability to prove to others e.g. those catching up
 }
@@ -656,6 +661,7 @@ impl TMState {
         let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
         let ctx_str = self.ctx_str(roster);
 
+        // TODO: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
         for i in 0..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
             // TODO: don't spam "while" messages repeatedly
@@ -778,6 +784,7 @@ impl TMState {
             {
                 println!("{}: in condition 49: value decided", ctx_str);
                 self.decisions.push(TMDecision {
+                    round_i: i,
                     value: self.rounds_data[i].proposal,
                     // value_sig: self.rounds_data[i].proposal_sig,
                     // votes: self.rounds_data[i].msg_val_sigs
@@ -1084,6 +1091,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         let ctx_str = bft_state.ctx_str(&roster);
 
         fn send_sock_msg(ctx_str: &str, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8]) {
+            // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
             match sock.try_send_to(msg, addr) {
                 Ok(_) => (),
@@ -1158,11 +1166,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
-                // TODO: loop rounds at current height
-                // if let Ok(round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
-                for round_i in 0..bft_state.rounds_data.len()
-                {
-                    let round_data = &bft_state.rounds_data[round_i];
+
+                fn broadcast_round_data(round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1205,9 +1210,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     }}
                                 }
 
-                                for peer in &mut peers {
+                                for peer in &mut peers[..] {
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
+                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
                                     }
                                 }
                             }
@@ -1243,9 +1248,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         // full evidence block; send it
                                         // println!("{}: full block: {:#?}", ctx_str, packet);
                                         let len1 = packet.write_to(&mut send_buf1[..]);
-                                        for peer in &mut peers {
+                                        for peer in &mut peers[..] {
                                             if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
+                                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..len1]);
                                             }
                                         }
 
@@ -1267,18 +1272,41 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                                 // println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet);
                                 let len1 = packet.write_to(&mut send_buf1[..]);
-                                for peer in &mut peers {
+                                for peer in &mut peers[..] {
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
+                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
                                     }
                                 }
                             }
 
-                            if sent_c > 0{
+                            if sent_c > 0 {
                                 // println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
                             }
                         }
                     }
+                }
+
+                // TODO: loop rounds at current height
+                // if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                // for round_i in 0..bft_state.rounds_data.len()
+                for decision_i in 0..bft_state.decisions.len()
+                {
+                    let round_i = bft_state.decisions[decision_i].round_i;
+                    let round_data = &bft_state.rounds_data[round_i];
+
+                    broadcast_round_data(&round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock);
+                }
+
+                if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                {
+                    for round_i in current_round_i..bft_state.rounds_data.len()
+                    {
+                        let round_data = &bft_state.rounds_data[round_i];
+
+                        broadcast_round_data(&round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock);
+                    }
+                } else {
+                    todo!();
                 }
 
                 break;
