@@ -125,6 +125,8 @@ struct RoundData {
     proposal_sigs_n: usize,
     proposal_id: ValueId,
     proposal_checked_validity: TMStatus,
+    // TODO: handle early outs because of this
+    proposal_is_faulty: bool,
 
     // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
     msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
@@ -136,7 +138,7 @@ struct RoundData {
     timeout_triggered: [bool; 2],
 }
 impl RoundData {
-    const EMPTY: RoundData = RoundData{
+    const EMPTY: RoundData = RoundData {
         height: 0,
         round: 0,
         proposal: BlockValue([0; PROPOSAL_BUF_SIZE]),
@@ -145,6 +147,7 @@ impl RoundData {
         proposal_sigs_n: 0,
         proposal_id: ValueId::NIL,
         proposal_checked_validity: TMStatus::Indeterminate,
+        proposal_is_faulty: false,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
         counts: ConsensusCounts::ZERO,
@@ -540,7 +543,7 @@ impl TMState {
                         }
 
                         if prev_sig_had_fault { // recompute from scratch
-                            // NOTE: this does NOT imply the current packet is faulty, so we should continue with it
+                            // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
                             round_data.counts = ConsensusCounts::from_slice(&round_data.msg_val_sigs);
                         }
                     }
@@ -551,6 +554,7 @@ impl TMState {
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
                     // TODO: treat this as a failed is_valid & early out before awaiting full proposal
+                    round_data.proposal_is_faulty = true;
                     eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
                     return TMStatus::Fail;
                 } else {
