@@ -1990,7 +1990,7 @@ mod tests {
 
     #[test]
     fn single_rt() {
-        run_instances();
+        run_instances(usize::MAX);
     }
 
     #[ignore]
