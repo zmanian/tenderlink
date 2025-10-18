@@ -181,8 +181,8 @@ struct ConsensusCounts {
     anys: usize,
     prevotes: usize,
     precommits: usize,
-    valid_prevotes: usize,
-    valid_precommits: usize,
+    yes_prevotes: usize,
+    yes_precommits: usize,
     nil_prevotes: usize,
 }
 impl ConsensusCounts {
@@ -190,8 +190,8 @@ impl ConsensusCounts {
         anys: 0,
         prevotes: 0,
         precommits: 0,
-        valid_prevotes: 0,
-        valid_precommits: 0,
+        yes_prevotes: 0,
+        yes_precommits: 0,
         nil_prevotes: 0,
     };
 
@@ -207,12 +207,12 @@ impl std::ops::Add for ConsensusCounts {
     type Output = Self;
     fn add(self, rhs: ConsensusCounts) -> ConsensusCounts {
         ConsensusCounts {
-            anys:             self.anys             + rhs.anys,
-            prevotes:         self.prevotes         + rhs.prevotes,
-            precommits:       self.precommits       + rhs.precommits,
-            valid_prevotes:   self.valid_prevotes   + rhs.valid_prevotes,
-            valid_precommits: self.valid_precommits + rhs.valid_precommits,
-            nil_prevotes:     self.nil_prevotes     + rhs.nil_prevotes,
+            anys:           self.anys           + rhs.anys,
+            prevotes:       self.prevotes       + rhs.prevotes,
+            precommits:     self.precommits     + rhs.precommits,
+            yes_prevotes:   self.yes_prevotes   + rhs.yes_prevotes,
+            yes_precommits: self.yes_precommits + rhs.yes_precommits,
+            nil_prevotes:   self.nil_prevotes   + rhs.nil_prevotes,
         }
     }
 }
@@ -220,12 +220,12 @@ impl std::ops::Sub for ConsensusCounts {
     type Output = Self;
     fn sub(self, rhs: ConsensusCounts) -> ConsensusCounts {
         ConsensusCounts {
-            anys:             self.anys             - rhs.anys,
-            prevotes:         self.prevotes         - rhs.prevotes,
-            precommits:       self.precommits       - rhs.precommits,
-            valid_prevotes:   self.valid_prevotes   - rhs.valid_prevotes,
-            valid_precommits: self.valid_precommits - rhs.valid_precommits,
-            nil_prevotes:     self.nil_prevotes     - rhs.nil_prevotes,
+            anys:           self.anys           - rhs.anys,
+            prevotes:       self.prevotes       - rhs.prevotes,
+            precommits:     self.precommits     - rhs.precommits,
+            yes_prevotes:   self.yes_prevotes   - rhs.yes_prevotes,
+            yes_precommits: self.yes_precommits - rhs.yes_precommits,
+            nil_prevotes:   self.nil_prevotes   - rhs.nil_prevotes,
         }
     }
 }
@@ -242,8 +242,8 @@ impl From<&[(ValueId, TMSig); 2]> for ConsensusCounts {
             anys: has_any_sigs,
             prevotes: has_sigs[0],
             precommits: has_sigs[1],
-            valid_prevotes: status[0][1],
-            valid_precommits: status[1][1],
+            yes_prevotes: status[0][1],
+            yes_precommits: status[1][1],
             nil_prevotes: status[0][0],
         }
     }
@@ -598,20 +598,20 @@ impl TMState {
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
 
-                if (d.anys             |
-                    d.prevotes         |
-                    d.precommits       |
-                    d.valid_prevotes   |
-                    d.valid_precommits |
+                if (d.anys           |
+                    d.prevotes       |
+                    d.precommits     |
+                    d.yes_prevotes   |
+                    d.yes_precommits |
                     d.nil_prevotes) != 0
                 {
                     println!("{}: update to a:{} v:{} c:{}, vv:{} nv:{} vp:{}", ctx_str,
                         round_data.counts.anys,
                         round_data.counts.prevotes,
                         round_data.counts.precommits,
-                        round_data.counts.valid_prevotes,
+                        round_data.counts.yes_prevotes,
                         round_data.counts.nil_prevotes,
-                        round_data.counts.valid_precommits,
+                        round_data.counts.yes_precommits,
                     );
                     // println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
                     println!("    d: {:?}", d);
@@ -693,7 +693,7 @@ impl TMState {
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.valid_prevotes &&
+                2*f+1 <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
             {
@@ -727,7 +727,7 @@ impl TMState {
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.valid_prevotes &&
+                2*f+1 <= counts.yes_prevotes &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
@@ -767,7 +767,7 @@ impl TMState {
             // > while decision_p[h_p] = nil do
             if (self.height() == self.rounds_data[i].height && // any round
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.valid_precommits &&
+                2*f+1 <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
                 println!("{}: in condition 49: value decided", ctx_str);
