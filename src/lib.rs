@@ -21,8 +21,8 @@ use rand_pcg::Lcg128CmDxsm64 as SimRng;
 use snow::{resolvers::CryptoResolver, HandshakeState, StatelessTransportState};
 use tokio::time::Instant;
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(200);
-const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(800);
+const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
 
 const FAKE_FAIL_RATIO: f64 = 0.9;
@@ -283,9 +283,11 @@ impl Timeout {
     fn new(now: Instant, height: u64, round: u32, step: TMStep) -> Timeout {
         use std::time::Duration;
         let timeout = match step {
-            TMStep::Propose   => Duration::from_secs(3) + round * Duration::from_millis(500),
-            TMStep::Prevote   => Duration::from_secs(3) + round * Duration::from_millis(500),
-            TMStep::Precommit => Duration::from_secs(3) + round * Duration::from_millis(500),
+            // Note(Sam): These timeout should be tuned to match the maximum network load block time. An additional
+            // virtue of a short block time that I had not considered is that it hides round stalls better.
+            TMStep::Propose   => Duration::from_millis(2000) + round * Duration::from_millis(500),
+            TMStep::Prevote   => Duration::from_millis(2000) + round * Duration::from_millis(500),
+            TMStep::Precommit => Duration::from_millis(2000) + round * Duration::from_millis(500),
         };
 
         Timeout{ time: now + timeout, height, round, step }
@@ -1199,8 +1201,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     };
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(roster, height, round);
 
-                    // Note(Sam): Andrew says hmmm, this should maybe be based on whether there is a signature... I, Sam, do not know what he means.
-                    if hdr.proposal_id != ValueId::NIL || round_data.active_timeout.is_some() {
+                    // Note(Sam): This is a bug fix against situations where the proposer is offline.
+                    // if hdr.proposal_id != ValueId::NIL {
+                    let should_send_prevotes = true; // Goofy fix for now. And it does fix the total stall situation of starting 3 processes manually with a roster of 4.
+                    {
                         if PRINT_OUTGOING { eprintln!("{} sending {} proposal chunks", ctx_str, round_data.proposal_sigs_n); }
 
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
@@ -1331,19 +1335,20 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // for round_i in 0..bft_state.rounds_data.len()
                 for height in 0..bft_state.decisions.len()
                 {
-                    let mut min_ack_height_of_all_peers: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-
-                    for peer in &peers[..] {
-                        if min_ack_height_of_all_peers > peer.ack_height {
-                            min_ack_height_of_all_peers = peer.ack_height;
-                        }
-                    }
-
-                    if height < min_ack_height_of_all_peers as usize {
-                        // don't need to send info
-                        // println!("SKIPPING!");
-                        continue;
-                    }
+                    // Note(Sam): Temporary disable in order to test resyncing. @temp_sync
+                    // let mut min_ack_height_of_all_peers: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+                    // 
+                    // for peer in &peers[..] {
+                    //     if min_ack_height_of_all_peers > peer.ack_height {
+                    //         min_ack_height_of_all_peers = peer.ack_height;
+                    //     }
+                    // }
+                    //
+                    // if height < min_ack_height_of_all_peers as usize {
+                    //     // don't need to send info
+                    //     // println!("SKIPPING!");
+                    //     continue;
+                    // }
 
                     let round_i = bft_state.decisions[height].round_i;
                     let round_data = &bft_state.rounds_data[round_i];
@@ -1633,9 +1638,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
                         let value_ids    = [ ValueId::NIL, packet.value_id ];
 
-                        if peer.ack_height < packet.ack_height {
+                        // @temp_sync
+                        //if peer.ack_height < packet.ack_height {
                            peer.ack_height = packet.ack_height;
-                        }
+                        //}
 
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
