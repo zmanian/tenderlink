@@ -125,6 +125,8 @@ struct RoundData {
     proposal_sigs_n: usize,
     proposal_id: ValueId,
     proposal_checked_validity: TMStatus,
+    // TODO: handle early outs because of this
+    proposal_is_faulty: bool,
 
     // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
     msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
@@ -136,7 +138,7 @@ struct RoundData {
     timeout_triggered: [bool; 2],
 }
 impl RoundData {
-    const EMPTY: RoundData = RoundData{
+    const EMPTY: RoundData = RoundData {
         height: 0,
         round: 0,
         proposal: BlockValue([0; PROPOSAL_BUF_SIZE]),
@@ -145,6 +147,7 @@ impl RoundData {
         proposal_sigs_n: 0,
         proposal_id: ValueId::NIL,
         proposal_checked_validity: TMStatus::Indeterminate,
+        proposal_is_faulty: false,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
         counts: ConsensusCounts::ZERO,
@@ -176,22 +179,22 @@ struct TMMsg {
     sig: TMSig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct ConsensusCounts {
     anys: usize,
     prevotes: usize,
-    precommits: usize,
-    valid_prevotes: usize,
-    valid_precommits: usize,
     nil_prevotes: usize,
+    yes_prevotes: usize,
+    precommits: usize,
+    yes_precommits: usize,
 }
 impl ConsensusCounts {
     const ZERO: Self = Self {
         anys: 0,
         prevotes: 0,
         precommits: 0,
-        valid_prevotes: 0,
-        valid_precommits: 0,
+        yes_prevotes: 0,
+        yes_precommits: 0,
         nil_prevotes: 0,
     };
 
@@ -207,12 +210,12 @@ impl std::ops::Add for ConsensusCounts {
     type Output = Self;
     fn add(self, rhs: ConsensusCounts) -> ConsensusCounts {
         ConsensusCounts {
-            anys:             self.anys             + rhs.anys,
-            prevotes:         self.prevotes         + rhs.prevotes,
-            precommits:       self.precommits       + rhs.precommits,
-            valid_prevotes:   self.valid_prevotes   + rhs.valid_prevotes,
-            valid_precommits: self.valid_precommits + rhs.valid_precommits,
-            nil_prevotes:     self.nil_prevotes     + rhs.nil_prevotes,
+            anys:           self.anys           + rhs.anys,
+            prevotes:       self.prevotes       + rhs.prevotes,
+            nil_prevotes:   self.nil_prevotes   + rhs.nil_prevotes,
+            yes_prevotes:   self.yes_prevotes   + rhs.yes_prevotes,
+            precommits:     self.precommits     + rhs.precommits,
+            yes_precommits: self.yes_precommits + rhs.yes_precommits,
         }
     }
 }
@@ -220,12 +223,12 @@ impl std::ops::Sub for ConsensusCounts {
     type Output = Self;
     fn sub(self, rhs: ConsensusCounts) -> ConsensusCounts {
         ConsensusCounts {
-            anys:             self.anys             - rhs.anys,
-            prevotes:         self.prevotes         - rhs.prevotes,
-            precommits:       self.precommits       - rhs.precommits,
-            valid_prevotes:   self.valid_prevotes   - rhs.valid_prevotes,
-            valid_precommits: self.valid_precommits - rhs.valid_precommits,
-            nil_prevotes:     self.nil_prevotes     - rhs.nil_prevotes,
+            anys:           self.anys           - rhs.anys,
+            prevotes:       self.prevotes       - rhs.prevotes,
+            nil_prevotes:   self.nil_prevotes   - rhs.nil_prevotes,
+            yes_prevotes:   self.yes_prevotes   - rhs.yes_prevotes,
+            precommits:     self.precommits     - rhs.precommits,
+            yes_precommits: self.yes_precommits - rhs.yes_precommits,
         }
     }
 }
@@ -241,13 +244,26 @@ impl From<&[(ValueId, TMSig); 2]> for ConsensusCounts {
         ConsensusCounts {
             anys: has_any_sigs,
             prevotes: has_sigs[0],
-            precommits: has_sigs[1],
-            valid_prevotes: status[0][1],
-            valid_precommits: status[1][1],
             nil_prevotes: status[0][0],
+            yes_prevotes: status[0][1],
+            precommits: has_sigs[1],
+            yes_precommits: status[1][1],
         }
     }
 }
+impl std::fmt::Debug for ConsensusCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Counts {{ a:{}  v:{} (nv:{} yv:{})  c:{} (yc:{}) }}",
+            self.anys,
+            self.prevotes,
+            self.nil_prevotes,
+            self.yes_prevotes,
+            self.precommits,
+            self.yes_precommits,
+        )
+    }
+}
+
 
 fn roster_i_from_pub_key(roster: &[SortedRosterMember], pub_key: PubKeyID) -> Option<usize> {
     roster.iter().position(|m| m.pub_key == pub_key)
@@ -490,28 +506,27 @@ impl TMState {
             Err(round_i) => (false, round_i),
         };
 
+        if ! is_prev_seen_round {
+            self.insert_round(round_i, round, active_roster_len(roster));
+        }
+        let round_data = &mut self.rounds_data[round_i];
+
         match tag {
             PACKET_TAG_PROPOSAL_CHUNK => {
                 // "have they previously proposed a different value?"
-                if (is_prev_seen_round &&
-                    self.rounds_data[round_i].proposal_sigs_n > 0)
-                {
-                    if self.rounds_data[round_i].proposal_id != value_id {
+                if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
+                    if round_data.proposal_id != value_id {
                         // TODO: immediately class both as invalid
                         eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
-                    if self.rounds_data[round_i].proposal_valid_round != valid_round {
+                    if round_data.proposal_valid_round != valid_round {
                         // TODO: immediately class both as invalid
                         eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
                 }
 
-                if ! is_prev_seen_round {
-                    self.insert_round(round_i, round, active_roster_len(roster));
-                }
-                let round_data = &mut self.rounds_data[round_i];
                 // Preliminary checks now finished (although not infallible from here) //////////////////////////
 
                 // TODO: check expected proposer here if not above
@@ -540,7 +555,7 @@ impl TMState {
                         }
 
                         if prev_sig_had_fault { // recompute from scratch
-                            // NOTE: this does NOT imply the current packet is faulty, so we should continue with it
+                            // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
                             round_data.counts = ConsensusCounts::from_slice(&round_data.msg_val_sigs);
                         }
                     }
@@ -551,6 +566,7 @@ impl TMState {
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
                     // TODO: treat this as a failed is_valid & early out before awaiting full proposal
+                    round_data.proposal_is_faulty = true;
                     eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
                     return TMStatus::Fail;
                 } else {
@@ -567,20 +583,17 @@ impl TMState {
 
                 let status = if value_id == ValueId::NIL { // always legal (except for duplicate checked later)
                     TMStatus::Pass
-                } else if ! is_prev_seen_round || self.rounds_data[round_i].proposal_sigs_n == 0 {
+                } else if round_data.proposal_sigs_n == 0 {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
-                } else if self.rounds_data[round_i].proposal_id != value_id {
+                } else if round_data.proposal_id != value_id {
                     eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", ctx_str, height, round, roster_i, value_id);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
                 };
 
-                if ! is_prev_seen_round {
-                    self.insert_round(round_i, round, active_roster_len(roster));
-                }
-                let round_data = &mut self.rounds_data[round_i];
+                // TODO: check if specified valid_round had a different value_id
 
                 let old_val_sig = round_data.msg_val_sigs[roster_i][is_precommit];
                 let new_val_sig = (value_id, sig);
@@ -598,23 +611,13 @@ impl TMState {
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
 
-                if (d.anys             |
-                    d.prevotes         |
-                    d.precommits       |
-                    d.valid_prevotes   |
-                    d.valid_precommits |
-                    d.nil_prevotes) != 0
-                {
-                    println!("{}: update to a:{} v:{} c:{}, vv:{} nv:{} vp:{}", ctx_str,
-                        round_data.counts.anys,
-                        round_data.counts.prevotes,
-                        round_data.counts.precommits,
-                        round_data.counts.valid_prevotes,
-                        round_data.counts.nil_prevotes,
-                        round_data.counts.valid_precommits,
-                    );
-                    // println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
-                    println!("    d: {:?}", d);
+                if (d.anys           |
+                    d.prevotes       |
+                    d.precommits     |
+                    d.yes_prevotes   |
+                    d.yes_precommits |
+                    d.nil_prevotes) != 0 {
+                    println!("{}: update to {:?} (d: {:?})", ctx_str, round_data.counts, d);
                 }
 
                 if true {
@@ -693,7 +696,7 @@ impl TMState {
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.valid_prevotes &&
+                2*f+1 <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
             {
@@ -727,7 +730,7 @@ impl TMState {
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.valid_prevotes &&
+                2*f+1 <= counts.yes_prevotes &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
@@ -767,7 +770,7 @@ impl TMState {
             // > while decision_p[h_p] = nil do
             if (self.height() == self.rounds_data[i].height && // any round
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.precommits &&
+                2*f+1 <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
                 println!("{}: in condition 49: value decided", ctx_str);
@@ -1081,6 +1084,22 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
+        fn write_tag_and_maybe_status(tag: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8]) -> usize {
+            send_buf1[0] = tag;
+            let mut o = 1;
+            if include_status {
+                send_buf1[0] |= PACKET_TAG_STATUS_FLAG;
+                // TODO: scope down required ranges
+                let status = PacketStatus {
+                    my_height: bft_state.height(),
+                    my_round: bft_state.round,
+                    need_proposal_chunk_rngs: [[0, PROPOSAL_CHUNKS_N as u32]],
+                    need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
+                };
+                o += status.write_to(&mut send_buf1[1..]);
+            }
+            o
+        }
         fn send_sock_msg(ctx_str: &str, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8]) {
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
@@ -1126,9 +1145,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 let len1 = 1 + evidence.write_to(&mut send_buf1[1..]);
                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                             }
-                        }
-                        else {
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &[PACKET_TAG_HEARTBEAT]);
+                        } else {
+                            let len1 = write_tag_and_maybe_status(PACKET_TAG_EMPTY, true, &bft_state, &roster, &mut send_buf1[..]);
+                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                         }
                     }
                 }
@@ -1215,8 +1234,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                         let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
                         for is_precommit in vote_start..2 {
+                            let tag = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit; // TODO: maybe include status
                             let mut packet = PacketVotes {
-                                tag: PACKET_TAG_PREVOTE_SIGNATURES + is_precommit,
                                 height, round,
                                 ack_height: bft_state.height(),
                                 value_id: hdr.proposal_id,
@@ -1232,7 +1251,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
                                     // add nos and yeses from opposite ends to avoid excess moves
-                                     if value_id == ValueId::NIL {
+                                    if value_id == ValueId::NIL {
                                         packet.votes[packet.no_votes_n as usize] = pub_key_sig;
                                         packet.no_votes_n += 1;
                                     } else {
@@ -1244,7 +1263,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                         // full evidence block; send it
                                         // println!("{}: full block: {:#?}", ctx_str, packet);
-                                        let len1 = packet.write_to(&mut send_buf1[..]);
+                                        send_buf1[0] = tag;
+                                        // TODO: maybe status
+                                        let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
                                         for peer in &mut peers[..] {
                                             if peer.ack_height > height {
                                                 continue;
@@ -1272,7 +1293,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
 
                                 // println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet);
-                                let len1 = packet.write_to(&mut send_buf1[..]);
+                                send_buf1[0] = tag;
+                                // TODO: maybe status
+                                let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
                                 for peer in &mut peers[..] {
                                     if peer.ack_height > height {
                                         continue;
@@ -1520,7 +1543,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         if msg.is_none() { continue; }
         let msg: &[u8] = msg.unwrap();
         if msg.len() == 0 { continue; }
-        let tag = msg[0];
+        let tag        = msg[0] & PACKET_TAG_MASK;
+        let has_status = (msg[0] & PACKET_TAG_STATUS_FLAG) != 0;
 
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
@@ -1558,13 +1582,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             peer.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
 
+            // TODO: other TAGs should also cause this transition
+            if has_status && peer.connection_is_unknown {
+                println!("{:05}: Got a status, this means that the other side does not consider me unknown anymore!", my_port);
+                peer.connection_is_unknown = false;
+            }
+
             const_assert!(PACKET_TAG_PREVOTE_SIGNATURES + 1 == PACKET_TAG_PRECOMMIT_SIGNATURES);
             match tag {
-                PACKET_TAG_HEARTBEAT => if peer.connection_is_unknown {
-                    println!("{:05}: Got a heartbeat, this means that the other side does not consider me unknown anymore!", my_port);
-                    peer.connection_is_unknown = false;
-                }
-
                 PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
                         peers[i].endpoint = Some(evidence.endpoint);
@@ -1590,7 +1615,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
 
-                PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(msg) {
+                PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[1..]) {
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
                         let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
@@ -1609,6 +1634,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(tag), err),
                 }
 
+                PACKET_TAG_EMPTY => {}
                 _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
             }
             continue;
@@ -1617,56 +1643,118 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 }
 
 // network
-const PACKET_TAG_CLIENT_HELLO         : u8 =  0;
-const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  1;
-const PACKET_TAG_CLIENT_ACK           : u8 =  2;
-const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  3;
-const PACKET_TAG_SERVER_HELLO         : u8 =  4;
-const PACKET_TAG_HEARTBEAT            : u8 =  5;
-const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  6;
+const PACKET_TAG_EMPTY                : u8 =  0;
+const PACKET_TAG_CLIENT_HELLO         : u8 =  1;
+const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  2;
+const PACKET_TAG_CLIENT_ACK           : u8 =  3;
+const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  4;
+const PACKET_TAG_SERVER_HELLO         : u8 =  5;
+const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  7;
 // consensus
-const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  7;
-const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  8;
-const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 =  9;
-const PACKET_TAG_COUNT                : u8 = 10;
+const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  8;
+const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  9;
+const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 = 10;
+const PACKET_TAG_COUNT                : u8 = 11;
 
-const PACKET_TAG_NAMES: [&str; PACKET_TAG_COUNT as usize] = {
-    let mut names = ["<MISSING>"; PACKET_TAG_COUNT as usize];
-    names[PACKET_TAG_CLIENT_HELLO         as usize] = "CLIENT_HELLO";
-    names[PACKET_TAG_CLIENT_UNKNOWN_ACK   as usize] = "CLIENT_UNKNOWN_ACK";
-    names[PACKET_TAG_CLIENT_ACK           as usize] = "CLIENT_ACK";
-    names[PACKET_TAG_SERVER_UNKNOWN_HELLO as usize] = "SERVER_UNKNOWN_HELLO";
-    names[PACKET_TAG_SERVER_HELLO         as usize] = "SERVER_HELLO";
-    names[PACKET_TAG_HEARTBEAT            as usize] = "HEARTBEAT";
-    names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = "ENDPOINT_EVIDENCE";
-    names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = "PROPOSAL_CHUNK";
-    names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = "PREVOTE_SIGNATURES";
-    names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = "PRECOMMIT_SIGNATURES";
-    const_assert!(PACKET_TAG_COUNT == 10); // keep names array updated when adding other tags
+const PACKET_TAG_STATUS_SHIFT         : u8 = 7;
+const PACKET_TAG_STATUS_FLAG          : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
+
+const PACKET_TAG_MASK                 : u8 = ! PACKET_TAG_STATUS_FLAG;
+
+const PACKET_TAG_NAMES: [[&str; 2]; PACKET_TAG_COUNT as usize] = {
+    let mut names = [["<MISSING>"; 2]; PACKET_TAG_COUNT as usize];
+    names[PACKET_TAG_EMPTY                as usize] = ["<EMPTY>",              "STATUS"];
+    names[PACKET_TAG_CLIENT_HELLO         as usize] = ["CLIENT_HELLO",         "STATUS+CLIENT_HELLO"];
+    names[PACKET_TAG_CLIENT_UNKNOWN_ACK   as usize] = ["CLIENT_UNKNOWN_ACK",   "STATUS+CLIENT_UNKNOWN_ACK"];
+    names[PACKET_TAG_CLIENT_ACK           as usize] = ["CLIENT_ACK",           "STATUS+CLIENT_ACK"];
+    names[PACKET_TAG_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO", "STATUS+SERVER_UNKNOWN_HELLO"];
+    names[PACKET_TAG_SERVER_HELLO         as usize] = ["SERVER_HELLO",         "STATUS+SERVER_HELLO"];
+    names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = ["ENDPOINT_EVIDENCE",    "STATUS+ENDPOINT_EVIDENCE"];
+    names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",       "STATUS+PROPOSAL_CHUNK"];
+    names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
+    names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES", "STATUS+PRECOMMIT_SIGNATURES"];
+    const_assert!(PACKET_TAG_COUNT == 11); // keep names array updated when adding other tags
     names
 };
-fn packet_name_from_tag(tag: u8) -> &'static str { PACKET_TAG_NAMES.get(tag as usize).unwrap_or(&"<UNKNOWN>") }
+fn packet_name_from_tag(tag: u8) -> &'static str {
+    PACKET_TAG_NAMES.get(tag as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
+}
 
 // NOTE(azmr): could add packet sizes so we can check all sizes in 1 location
+
+// ALT: if we limit to u16 chunk indexes & have ~1KB chunk data per packet, we could have block sizes up to ~65MB
+// N.B. with ranges like this, we either want to be half-exclusive & not allow type::MAX values, or use a special value for empty (e.g. hi < lo)
+type ProposalRng = [u32; 2]; // [lo, hi)
+type VoteRng     = [u16; 2];
+const STATUS_PROPOSAL_RNGS_N: usize = 1;
+const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
+struct PacketStatus {
+    my_height: u64,
+    my_round:  u32, // as context for following request ranges
+    need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
+    need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
+}
+impl PacketStatus {
+    pub fn write_to(&self, buf: &mut[u8]) -> usize {
+        let mut o = self.my_height.write_to(&mut buf[..]);
+        o += self.my_round.write_to(&mut buf[o..]);
+        for chunk_rng in &self.need_proposal_chunk_rngs {
+            o += chunk_rng[0].write_to(&mut buf[o..]);
+            o += chunk_rng[1].write_to(&mut buf[o..]);
+        }
+        for is_precommit in 0..2 {
+            for vote_rng in &self.need_vote_rngs[is_precommit] {
+                o += vote_rng[0].write_to(&mut buf[o..]);
+                o += vote_rng[1].write_to(&mut buf[o..]);
+            }
+        }
+        o
+    }
+
+    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
+        let mut packet = Self {
+            my_height: 0, my_round: 0,
+            need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
+            need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
+        };
+        packet.my_height = r.read_u64::<LittleEndian>()?;
+        packet.my_round = r.read_u32::<LittleEndian>()?;
+        for chunk_rng in &mut packet.need_proposal_chunk_rngs {
+            chunk_rng[0] = r.read_u32::<LittleEndian>()?;
+            chunk_rng[1] = r.read_u32::<LittleEndian>()?;
+        }
+        for is_precommit in 0..2 {
+            for vote_rng in &mut packet.need_vote_rngs[is_precommit] {
+                vote_rng[0] = r.read_u16::<LittleEndian>()?;
+                vote_rng[1] = r.read_u16::<LittleEndian>()?;
+            }
+        }
+        Ok(packet)
+    }
+}
 
 // Note(Sam): Heart beat should be different by connection type or contain information regarding the connection type.
 struct PacketHeartbeat {
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
+    status: PacketStatus,
+    // followed by sig of sender
 }
 impl PacketHeartbeat {
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
         self.nonce_ack_latest.write_to(&mut buf[..]);
-        self.nonce_ack_field.write_to(&mut buf[64..]);
-        128
+        self.nonce_ack_field.write_to(&mut buf[8..]);
+        16 + self.status.write_to(&mut buf[16..])
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let nonce_ack_latest = r.read_u64::<LittleEndian>()?;
-        let nonce_ack_field = r.read_u64::<LittleEndian>()?;
+        let nonce_ack_field  = r.read_u64::<LittleEndian>()?;
+        let status           = PacketStatus::read_from(r)?;
         Ok(Self {
             nonce_ack_latest,
             nonce_ack_field,
+            status,
         })
     }
 }
@@ -1688,7 +1776,7 @@ impl PubKeySig {
 // #[repr(C)]
 #[derive(Debug)]
 struct PacketVotes {
-    tag:         u8,
+    // tag
     no_votes_n:  u8,
     yes_votes_n: u8,
     // pad_:     u16, // TODO: useful?
@@ -1706,7 +1794,6 @@ const_assert!(size_of::<PacketVotes>() == 1248); // TODO(azmr): exactly how much
 impl PacketVotes {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.tag        .write_to(&mut buf[o..]);
         o += self.no_votes_n .write_to(&mut buf[o..]);
         o += self.yes_votes_n.write_to(&mut buf[o..]);
         o += self.round      .write_to(&mut buf[o..]);
@@ -1724,12 +1811,11 @@ impl PacketVotes {
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = PacketVotes {
-            tag: 0, no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
+            no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
             ack_height: 0,
             value_id: ValueId::NIL,
             votes: [PubKeySig::NIL; 18],
         };
-        packet.tag         = r.read_u8()?;
         packet.no_votes_n  = r.read_u8()?;
         packet.yes_votes_n = r.read_u8()?;
         packet.round       = r.read_u32::<LittleEndian>()?;
