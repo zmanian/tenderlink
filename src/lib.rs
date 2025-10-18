@@ -2,6 +2,14 @@
 #![allow(unused_parens)]
 #![allow(clippy::never_loop)]
 
+#![allow(clippy::eq_op)]
+const PRINT_VALID_INCOMING: bool = 0 == 1;
+const PRINT_OUTGOING:       bool = 0 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
+const PRINT_BFT_UPDATE:     bool = 1 == 1;
+const PRINT_BFT_STATE:      bool = 0 == 1;
+const PRINT_BFT_CONDITIONS: bool = 1 == 1;
+const PRINT_BFT_TIMEOUTS:   bool = 1 == 1;
 
 use static_assertions::{const_assert};
 use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
@@ -441,7 +449,7 @@ impl TMState {
             } else {
                 get_bft_value(self)
             };
-            println!("{} about to propose: {:?}", self.ctx_str(roster), proposal);
+            if PRINT_BFT_PROPOSAL { println!("{} about to propose: {:?}", self.ctx_str(roster), proposal); }
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
@@ -496,7 +504,7 @@ impl TMState {
         }}
         let sig = TMSig(signature.to_bytes());
 
-        // eprintln!("{}: valid signature for value id: {}", ctx_str, value_id);
+        if PRINT_VALID_INCOMING { eprintln!("{}: valid signature for value id: {}", ctx_str, value_id); }
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -560,7 +568,7 @@ impl TMState {
                         }
                     }
 
-                    println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, PROPOSAL_CHUNKS_N);
+                    if PRINT_BFT_UPDATE { println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, PROPOSAL_CHUNKS_N); }
                     // println!("{}: chunk data:\n{:?}", ctx_str, &round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
 
                     // TODO: include signed prevote & precommit for self?
@@ -611,7 +619,8 @@ impl TMState {
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
 
-                if (d.anys           |
+                if PRINT_BFT_UPDATE && (
+                    d.anys           |
                     d.prevotes       |
                     d.precommits     |
                     d.yes_prevotes   |
@@ -658,12 +667,14 @@ impl TMState {
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
-            // println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
-            //     ["!","="][is_current_height_and_round as usize],
-            //     self.rounds_data[i].height, self.rounds_data[i].round,
-            //     self.rounds_data[i].proposal_sigs_n,
-            //     self.rounds_data[i].proposal_valid_round
-            // );
+            if PRINT_BFT_STATE {
+                println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
+                    ["!","="][is_current_height_and_round as usize],
+                    self.rounds_data[i].height, self.rounds_data[i].round,
+                    self.rounds_data[i].proposal_sigs_n,
+                    self.rounds_data[i].proposal_valid_round
+                );
+             }
 
             // line 11: init proposal period
             // (done elsewhere)
@@ -683,10 +694,10 @@ impl TMState {
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal)) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
-                    println!("{}: in condition 22-0: receive first proposal this height", ctx_str);
+                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 22-0: receive first proposal this height", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    println!("{}: in condition 22-1: receive first proposal this height", ctx_str);
+                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 22-1: receive first proposal this height", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -704,10 +715,10 @@ impl TMState {
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal))
                 {
-                    println!("{}: in condition 28-0: received 2f+1 prevotes", ctx_str);
+                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 28-0: received 2f+1 prevotes", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    println!("{}: in condition 28-1: received 2f+1 prevotes", ctx_str);
+                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 28-1: received 2f+1 prevotes", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -720,7 +731,7 @@ impl TMState {
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
-                println!("{}: in condition 34: last orders on prevote period", ctx_str);
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition 34: last orders on prevote period", ctx_str); }
                 self.rounds_data[i].timeout_triggered[0] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Prevote));
             }
@@ -734,9 +745,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
-                println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str);
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
                 if self.step == TMStep::Prevote {
-                    println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str);
+                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
                     self.locked_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
@@ -750,7 +761,7 @@ impl TMState {
                 2*f+1 <= counts.nil_prevotes &&
                 self.step == TMStep::Prevote)
             {
-                println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str);
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str); }
                 self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
             }
 
@@ -760,7 +771,7 @@ impl TMState {
                 2*f+1 <= counts.precommits &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
-                println!("{}: in condition 47: last orders on precommit period", ctx_str);
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition 47: last orders on precommit period", ctx_str); }
                 self.rounds_data[i].timeout_triggered[1] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Precommit));
             }
@@ -773,7 +784,7 @@ impl TMState {
                 2*f+1 <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
-                println!("{}: in condition 49: value decided", ctx_str);
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
                 self.decisions.push(TMDecision {
                     round_i: i,
                     value: self.rounds_data[i].proposal,
@@ -791,7 +802,7 @@ impl TMState {
                 self.round    <  self.rounds_data[i].round  &&
                 f+1 <= counts.anys)
             {
-                println!("{}: in condition 55: round catchup", ctx_str);
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition 55: round catchup", ctx_str); }
                 self.start_round(roster, now, self.rounds_data[i].round)
             }
 
@@ -804,15 +815,15 @@ impl TMState {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
-                        println!("{}: hit timeout propose", ctx_str);
+                        if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout propose", ctx_str); }
                         self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
-                        println!("{}: hit timeout prevote", ctx_str);
+                        if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout prevote", ctx_str); }
                         self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
                     },
                     TMStep::Precommit => {
-                        println!("{}: hit timeout precommit", ctx_str);
+                        if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout precommit", ctx_str); }
                         self.start_round(roster, now, self.round + 1)
                     },
                 }
@@ -1186,10 +1197,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         proposal_id: round_data.proposal_id,
                         valid_round: round_data.proposal_valid_round,
                     };
-                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&roster, height, round);
+                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(roster, height, round);
 
                     if hdr.proposal_id != ValueId::NIL {
-                        // eprintln!("{} sending {} proposal chunks", ctx_str, PROPOSAL_CHUNKS_N);
+                        if PRINT_OUTGOING { eprintln!("{} sending {} proposal chunks", ctx_str, round_data.proposal_sigs_n); }
 
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
                             // send all of the proposal chunks we've seen
@@ -1262,7 +1273,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                         sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                         // full evidence block; send it
-                                        // println!("{}: full block: {:#?}", ctx_str, packet);
+                                        // if PRINT_OUTGOING { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
                                         send_buf1[0] = tag;
                                         // TODO: maybe status
                                         let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
@@ -1292,7 +1303,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                                 }
 
-                                // println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet);
+                                // if PRINT_OUTGOING { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
                                 send_buf1[0] = tag;
                                 // TODO: maybe status
                                 let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
@@ -1307,8 +1318,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
                             }
 
-                            if sent_c > 0 {
-                                // println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
+                            if PRINT_OUTGOING && sent_c > 0 {
+                                println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
                             }
                         }
                     }
