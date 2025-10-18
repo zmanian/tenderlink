@@ -1200,8 +1200,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     };
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(roster, height, round);
 
-                    // Note(Sam): Andrew says hmmm, this should maybe be based on whether there is a signature... I, Sam, do not know what he means.
-                    if hdr.proposal_id != ValueId::NIL || round_data.active_timeout.is_some() {
+                    if round_data.proposal_sigs_n > 0 {
                         let mut sent_chunk_cs = 0;
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
                             // send all of the proposal chunks we've seen
@@ -1248,85 +1247,91 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         if PRINT_SEND_CS && sent_chunk_cs > 0 {
                             eprintln!("{} sent {} proposal chunks", ctx_str, sent_chunk_cs);
                         }
+                    }
 
-                        let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
-                        for is_precommit in vote_start..2 {
-                            let tag = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit; // TODO: maybe include status
-                            let mut packet = PacketVotes {
-                                height, round,
-                                ack_height: bft_state.height(),
-                                value_id: hdr.proposal_id,
-                                no_votes_n: 0, yes_votes_n: 0,
-                                votes: [ PubKeySig::NIL; 18 ],
-                            };
-                            let mut sent_c = 0;
+                    let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
+                    for is_precommit in vote_start..2 {
+                        if  (is_precommit == 0 && round_data.counts.prevotes   == 0) ||
+                            (is_precommit == 1 && round_data.counts.precommits == 0)
+                        {
+                            continue;
+                        }
 
-                            for roster_i in 0..round_data.msg_val_sigs.len() {
-                                let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
-                                if sig != TMSig::NIL {
-                                    let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
-                                    // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
+                        let tag = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit; // TODO: maybe include status
+                        let mut packet = PacketVotes {
+                            height, round,
+                            ack_height: bft_state.height(),
+                            value_id: hdr.proposal_id,
+                            no_votes_n: 0, yes_votes_n: 0,
+                            votes: [ PubKeySig::NIL; 18 ],
+                        };
+                        let mut sent_c = 0;
 
-                                    // add nos and yeses from opposite ends to avoid excess moves
-                                    if value_id == ValueId::NIL {
-                                        packet.votes[packet.no_votes_n as usize] = pub_key_sig;
-                                        packet.no_votes_n += 1;
-                                    } else {
-                                        packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
-                                        packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
-                                    };
+                        for roster_i in 0..round_data.msg_val_sigs.len() {
+                            let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
+                            if sig != TMSig::NIL {
+                                let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
+                                // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
-                                    if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
-                                        sent_c += (packet.no_votes_n + packet.yes_votes_n);
-                                        // full evidence block; send it
-                                        if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
-                                        send_buf1[0] = tag;
-                                        // TODO: maybe status
-                                        let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
-                                        for peer in &mut peers[..] {
-                                            if peer.ack_height > height {
-                                                continue;
-                                            }
-                                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                                *bytes_sent += len1;
-                                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..len1]);
-                                            }
+                                // add nos and yeses from opposite ends to avoid excess moves
+                                if value_id == ValueId::NIL {
+                                    packet.votes[packet.no_votes_n as usize] = pub_key_sig;
+                                    packet.no_votes_n += 1;
+                                } else {
+                                    packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
+                                    packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
+                                };
+
+                                if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
+                                    sent_c += (packet.no_votes_n + packet.yes_votes_n);
+                                    // full evidence block; send it
+                                    if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
+                                    send_buf1[0] = tag;
+                                    // TODO: maybe status
+                                    let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
+                                    for peer in &mut peers[..] {
+                                        if peer.ack_height > height {
+                                            continue;
                                         }
-
-                                        packet.no_votes_n  = 0;
-                                        packet.yes_votes_n = 0;
-                                        packet.votes       = [ PubKeySig::NIL; 18 ];
+                                        if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                            *bytes_sent += len1;
+                                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..len1]);
+                                        }
                                     }
+
+                                    packet.no_votes_n  = 0;
+                                    packet.yes_votes_n = 0;
+                                    packet.votes       = [ PubKeySig::NIL; 18 ];
                                 }
                             }
+                        }
 
-                            // send any half-filled vote blocks
-                            if (packet.no_votes_n + packet.yes_votes_n) > 0 {
-                                sent_c += (packet.no_votes_n + packet.yes_votes_n);
-                                // println!("{}: half-filled block pre-gap-close: {:#?}", ctx_str, packet);
-                                // move items from end to fill gap
-                                for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
-                                    packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
-                                }
-
-                                if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
-                                send_buf1[0] = tag;
-                                // TODO: maybe status
-                                let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
-                                for peer in &mut peers[..] {
-                                    if peer.ack_height > height {
-                                        continue;
-                                    }
-                                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        *bytes_sent += len1;
-                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
-                                    }
-                                }
+                        // send any half-filled vote blocks
+                        if (packet.no_votes_n + packet.yes_votes_n) > 0 {
+                            sent_c += (packet.no_votes_n + packet.yes_votes_n);
+                            // println!("{}: half-filled block pre-gap-close: {:#?}", ctx_str, packet);
+                            // move items from end to fill gap
+                            for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
+                                packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                             }
 
-                            if PRINT_SEND_CS && sent_c > 0 {
-                                println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
+                            if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
+                            send_buf1[0] = tag;
+                            // TODO: maybe status
+                            let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
+                            for peer in &mut peers[..] {
+                                if peer.ack_height > height {
+                                    continue;
+                                }
+                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                    *bytes_sent += len1;
+                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
+                                }
                             }
+                        }
+
+                        if PRINT_SEND_CS && sent_c > 0 {
+                            println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
                         }
                     }
                 }
