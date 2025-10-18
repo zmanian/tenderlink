@@ -1069,9 +1069,6 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         my_endpoint.map(|endpoint| EndpointEvidence { endpoint, root_public_key: my_root_public_key.into() })
     };
 
-    // Wait for others to start for testing.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     let mut unknown_peers: Vec<UnknownPeer> = Vec::new();
 
     let mut bytes_sent: usize = 0;
@@ -1161,7 +1158,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster);
 
-                fn broadcast_round_data(bft_state: &TMState, round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
+                fn broadcast_round_data(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1216,7 +1213,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             }
                         }
 
-                        for is_precommit in 0..2 {
+                        let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
+                        for is_precommit in vote_start..2 {
                             let mut packet = PacketVotes {
                                 tag: PACKET_TAG_PREVOTE_SIGNATURES + is_precommit,
                                 height, round,
@@ -1315,7 +1313,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     let round_i = bft_state.decisions[height].round_i;
                     let round_data = &bft_state.rounds_data[round_i];
 
-                    broadcast_round_data(&bft_state, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                    broadcast_round_data(&bft_state, false, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                 }
 
                 if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
@@ -1324,7 +1322,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     {
                         let round_data = &bft_state.rounds_data[round_i];
 
-                        broadcast_round_data(&bft_state, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        broadcast_round_data(&bft_state, true, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 } else {
                     todo!();
