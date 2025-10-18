@@ -506,28 +506,27 @@ impl TMState {
             Err(round_i) => (false, round_i),
         };
 
+        if ! is_prev_seen_round {
+            self.insert_round(round_i, round, active_roster_len(roster));
+        }
+        let round_data = &mut self.rounds_data[round_i];
+
         match tag {
             PACKET_TAG_PROPOSAL_CHUNK => {
                 // "have they previously proposed a different value?"
-                if (is_prev_seen_round &&
-                    self.rounds_data[round_i].proposal_sigs_n > 0)
-                {
-                    if self.rounds_data[round_i].proposal_id != value_id {
+                if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
+                    if round_data.proposal_id != value_id {
                         // TODO: immediately class both as invalid
                         eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
-                    if self.rounds_data[round_i].proposal_valid_round != valid_round {
+                    if round_data.proposal_valid_round != valid_round {
                         // TODO: immediately class both as invalid
                         eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
                         return TMStatus::Fail;
                     }
                 }
 
-                if ! is_prev_seen_round {
-                    self.insert_round(round_i, round, active_roster_len(roster));
-                }
-                let round_data = &mut self.rounds_data[round_i];
                 // Preliminary checks now finished (although not infallible from here) //////////////////////////
 
                 // TODO: check expected proposer here if not above
@@ -584,20 +583,17 @@ impl TMState {
 
                 let status = if value_id == ValueId::NIL { // always legal (except for duplicate checked later)
                     TMStatus::Pass
-                } else if ! is_prev_seen_round || self.rounds_data[round_i].proposal_sigs_n == 0 {
+                } else if round_data.proposal_sigs_n == 0 {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
-                } else if self.rounds_data[round_i].proposal_id != value_id {
+                } else if round_data.proposal_id != value_id {
                     eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", ctx_str, height, round, roster_i, value_id);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
                 };
 
-                if ! is_prev_seen_round {
-                    self.insert_round(round_i, round, active_roster_len(roster));
-                }
-                let round_data = &mut self.rounds_data[round_i];
+                // TODO: check if specified valid_round had a different value_id
 
                 let old_val_sig = round_data.msg_val_sigs[roster_i][is_precommit];
                 let new_val_sig = (value_id, sig);
@@ -1239,7 +1235,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
                                     // add nos and yeses from opposite ends to avoid excess moves
-                                     if value_id == ValueId::NIL {
+                                    if value_id == ValueId::NIL {
                                         packet.votes[packet.no_votes_n as usize] = pub_key_sig;
                                         packet.no_votes_n += 1;
                                     } else {
