@@ -767,7 +767,7 @@ impl TMState {
             // > while decision_p[h_p] = nil do
             if (self.height() == self.rounds_data[i].height && // any round
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
-                2*f+1 <= counts.precommits &&
+                2*f+1 <= counts.valid_precommits &&
                 self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
             {
                 println!("{}: in condition 49: value decided", ctx_str);
