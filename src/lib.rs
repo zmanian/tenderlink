@@ -4,7 +4,8 @@
 
 #![allow(clippy::eq_op)]
 const PRINT_VALID_INCOMING: bool = 0 == 1;
-const PRINT_OUTGOING:       bool = 0 == 1;
+const PRINT_SENDS:          bool = 0 == 1;
+const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
@@ -1201,8 +1202,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                     // Note(Sam): Andrew says hmmm, this should maybe be based on whether there is a signature... I, Sam, do not know what he means.
                     if hdr.proposal_id != ValueId::NIL || round_data.active_timeout.is_some() {
-                        if PRINT_OUTGOING { eprintln!("{} sending {} proposal chunks", ctx_str, round_data.proposal_sigs_n); }
-
+                        let mut sent_chunk_cs = 0;
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
                             // send all of the proposal chunks we've seen
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
@@ -1237,11 +1237,16 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         continue;
                                     }
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                        if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
+                                        sent_chunk_cs += 1;
                                         *bytes_sent += o;
                                         send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
                                     }
                                 }
                             }
+                        }
+                        if PRINT_SEND_CS && sent_chunk_cs > 0 {
+                            eprintln!("{} sent {} proposal chunks", ctx_str, sent_chunk_cs);
                         }
 
                         let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
@@ -1274,7 +1279,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                         sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                         // full evidence block; send it
-                                        // if PRINT_OUTGOING { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
+                                        if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
                                         send_buf1[0] = tag;
                                         // TODO: maybe status
                                         let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
@@ -1304,7 +1309,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                     packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                                 }
 
-                                // if PRINT_OUTGOING { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
+                                if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
                                 send_buf1[0] = tag;
                                 // TODO: maybe status
                                 let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
@@ -1319,7 +1324,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
                             }
 
-                            if PRINT_OUTGOING && sent_c > 0 {
+                            if PRINT_SEND_CS && sent_c > 0 {
                                 println!("{} sent {} {}", ctx_str, sent_c, ["prevotes", "precommits"][is_precommit as usize]);
                             }
                         }
