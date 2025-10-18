@@ -179,14 +179,14 @@ struct TMMsg {
     sig: TMSig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct ConsensusCounts {
     anys: usize,
     prevotes: usize,
-    precommits: usize,
-    yes_prevotes: usize,
-    yes_precommits: usize,
     nil_prevotes: usize,
+    yes_prevotes: usize,
+    precommits: usize,
+    yes_precommits: usize,
 }
 impl ConsensusCounts {
     const ZERO: Self = Self {
@@ -212,10 +212,10 @@ impl std::ops::Add for ConsensusCounts {
         ConsensusCounts {
             anys:           self.anys           + rhs.anys,
             prevotes:       self.prevotes       + rhs.prevotes,
-            precommits:     self.precommits     + rhs.precommits,
-            yes_prevotes:   self.yes_prevotes   + rhs.yes_prevotes,
-            yes_precommits: self.yes_precommits + rhs.yes_precommits,
             nil_prevotes:   self.nil_prevotes   + rhs.nil_prevotes,
+            yes_prevotes:   self.yes_prevotes   + rhs.yes_prevotes,
+            precommits:     self.precommits     + rhs.precommits,
+            yes_precommits: self.yes_precommits + rhs.yes_precommits,
         }
     }
 }
@@ -225,10 +225,10 @@ impl std::ops::Sub for ConsensusCounts {
         ConsensusCounts {
             anys:           self.anys           - rhs.anys,
             prevotes:       self.prevotes       - rhs.prevotes,
-            precommits:     self.precommits     - rhs.precommits,
-            yes_prevotes:   self.yes_prevotes   - rhs.yes_prevotes,
-            yes_precommits: self.yes_precommits - rhs.yes_precommits,
             nil_prevotes:   self.nil_prevotes   - rhs.nil_prevotes,
+            yes_prevotes:   self.yes_prevotes   - rhs.yes_prevotes,
+            precommits:     self.precommits     - rhs.precommits,
+            yes_precommits: self.yes_precommits - rhs.yes_precommits,
         }
     }
 }
@@ -244,13 +244,26 @@ impl From<&[(ValueId, TMSig); 2]> for ConsensusCounts {
         ConsensusCounts {
             anys: has_any_sigs,
             prevotes: has_sigs[0],
-            precommits: has_sigs[1],
-            yes_prevotes: status[0][1],
-            yes_precommits: status[1][1],
             nil_prevotes: status[0][0],
+            yes_prevotes: status[0][1],
+            precommits: has_sigs[1],
+            yes_precommits: status[1][1],
         }
     }
 }
+impl std::fmt::Debug for ConsensusCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Counts {{ a:{}  v:{} (nv:{} yv:{})  c:{} (yc:{}) }}",
+            self.anys,
+            self.prevotes,
+            self.nil_prevotes,
+            self.yes_prevotes,
+            self.precommits,
+            self.yes_precommits,
+        )
+    }
+}
+
 
 fn roster_i_from_pub_key(roster: &[SortedRosterMember], pub_key: PubKeyID) -> Option<usize> {
     roster.iter().position(|m| m.pub_key == pub_key)
@@ -607,18 +620,8 @@ impl TMState {
                     d.precommits     |
                     d.yes_prevotes   |
                     d.yes_precommits |
-                    d.nil_prevotes) != 0
-                {
-                    println!("{}: update to a:{} v:{} c:{}, vv:{} nv:{} vp:{}", ctx_str,
-                        round_data.counts.anys,
-                        round_data.counts.prevotes,
-                        round_data.counts.precommits,
-                        round_data.counts.yes_prevotes,
-                        round_data.counts.nil_prevotes,
-                        round_data.counts.yes_precommits,
-                    );
-                    // println!("{}: old_status: {:?}, new_status: {:?}", roster_i, old_status, new_status);
-                    println!("    d: {:?}", d);
+                    d.nil_prevotes) != 0 {
+                    println!("{}: update to {:?} (d: {:?})", ctx_str, round_data.counts, d);
                 }
 
                 if true {
