@@ -10,7 +10,7 @@ use ed25519_zebra::{SigningKey, VerificationKeyBytes};
 use rand::{seq::IndexedRandom, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
-use snow::{HandshakeState, StatelessTransportState};
+use snow::{resolvers::CryptoResolver, HandshakeState, StatelessTransportState};
 use tokio::time::Instant;
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1865,6 +1865,33 @@ fn hook_fail_on_panic() {
     }))
 }
 
+#[derive(Clone)]
+struct RustIsBadRngWrapper(ChaCha20Rng);
+impl snow::types::Random for RustIsBadRngWrapper {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
+        self.0.fill(dest);
+        Ok(())
+    }
+}
+struct SnowRngResolver {
+    pub rng: RustIsBadRngWrapper,
+}
+
+impl CryptoResolver for SnowRngResolver {
+    fn resolve_rng(&self) -> Option<Box<dyn snow::types::Random>> {
+        Some(Box::new(self.rng.clone()))
+    }
+    fn resolve_dh(&self, choice: &snow::params::DHChoice) -> Option<Box<dyn snow::types::Dh>> {
+        snow::resolvers::DefaultResolver::resolve_dh(&snow::resolvers::DefaultResolver, choice)
+    }
+    fn resolve_hash(&self, choice: &snow::params::HashChoice) -> Option<Box<dyn snow::types::Hash>> {
+        snow::resolvers::DefaultResolver::resolve_hash(&snow::resolvers::DefaultResolver, choice)
+    }
+    fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn snow::types::Cipher>> {
+        snow::resolvers::DefaultResolver::resolve_cipher(&snow::resolvers::DefaultResolver, choice)
+    }
+}
+
 pub fn run_instances(i: usize) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -1886,7 +1913,8 @@ pub fn run_instances(i: usize) {
     }).collect();
     let mut cumulative_stake = 0;
     let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
-        let stake = 2000 * (static_private_keys.len() - 1 - i) as u64;
+        //let stake = 2000 * (static_private_keys.len() - 1 - i) as u64;
+        let stake = 1;
         cumulative_stake += stake;
         SortedRosterMember { pub_key: PubKeyID(sk.verification_key().into()), stake, cumulative_stake }
     }).collect();
@@ -1895,7 +1923,7 @@ pub fn run_instances(i: usize) {
     println!("{:?}", roster);
 
     let static_keypair_zero = {
-        let kp = snow::Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).generate_keypair().unwrap();
+        let kp = snow::Builder::with_resolver("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(crypto_rng.clone()) })).generate_keypair().unwrap();
         StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
     };
 
@@ -1912,6 +1940,15 @@ pub fn run_instances(i: usize) {
     if i == usize::MAX {
         // let _joins: [; N];
         for j in 0..N {
+            if j == 0 {
+                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
+            } else {
+                rt.spawn(instance(static_private_keys[j], None, None, roster.clone(), vec![evidence_zero], None));
+            }
+        }
+    } else if i == 999 {
+        // let _joins: [; N];
+        for j in 0..N-1 {
             if j == 0 {
                 rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
             } else {
