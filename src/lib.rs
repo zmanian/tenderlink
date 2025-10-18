@@ -1084,6 +1084,22 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
+        fn write_tag_and_maybe_status(tag: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8]) -> usize {
+            send_buf1[0] = tag;
+            let mut o = 1;
+            if include_status {
+                send_buf1[0] |= PACKET_TAG_STATUS_FLAG;
+                // TODO: scope down required ranges
+                let status = PacketStatus {
+                    my_height: bft_state.height(),
+                    my_round: bft_state.round,
+                    need_proposal_chunk_rngs: [[0, PROPOSAL_CHUNKS_N as u32]],
+                    need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
+                };
+                o += status.write_to(&mut send_buf1[1..]);
+            }
+            o
+        }
         fn send_sock_msg(ctx_str: &str, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8]) {
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
@@ -1129,9 +1145,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 let len1 = 1 + evidence.write_to(&mut send_buf1[1..]);
                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                             }
-                        }
-                        else {
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &[PACKET_TAG_HEARTBEAT]);
+                        } else {
+                            let len1 = write_tag_and_maybe_status(PACKET_TAG_EMPTY, true, &bft_state, &roster, &mut send_buf1[..]);
+                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                         }
                     }
                 }
@@ -1218,8 +1234,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                         let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
                         for is_precommit in vote_start..2 {
+                            let tag = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit; // TODO: maybe include status
                             let mut packet = PacketVotes {
-                                tag: PACKET_TAG_PREVOTE_SIGNATURES + is_precommit,
                                 height, round,
                                 ack_height: bft_state.height(),
                                 value_id: hdr.proposal_id,
@@ -1247,7 +1263,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                         sent_c += (packet.no_votes_n + packet.yes_votes_n);
                                         // full evidence block; send it
                                         // println!("{}: full block: {:#?}", ctx_str, packet);
-                                        let len1 = packet.write_to(&mut send_buf1[..]);
+                                        send_buf1[0] = tag;
+                                        // TODO: maybe status
+                                        let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
                                         for peer in &mut peers[..] {
                                             if peer.ack_height > height {
                                                 continue;
@@ -1275,7 +1293,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 }
 
                                 // println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet);
-                                let len1 = packet.write_to(&mut send_buf1[..]);
+                                send_buf1[0] = tag;
+                                // TODO: maybe status
+                                let len1 = 1 + packet.write_to(&mut send_buf1[1..]);
                                 for peer in &mut peers[..] {
                                     if peer.ack_height > height {
                                         continue;
@@ -1523,7 +1543,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         if msg.is_none() { continue; }
         let msg: &[u8] = msg.unwrap();
         if msg.len() == 0 { continue; }
-        let tag = msg[0];
+        let tag        = msg[0] & PACKET_TAG_MASK;
+        let has_status = (msg[0] & PACKET_TAG_STATUS_FLAG) != 0;
 
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
@@ -1561,13 +1582,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             peer.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
 
+            // TODO: other TAGs should also cause this transition
+            if has_status && peer.connection_is_unknown {
+                println!("{:05}: Got a status, this means that the other side does not consider me unknown anymore!", my_port);
+                peer.connection_is_unknown = false;
+            }
+
             const_assert!(PACKET_TAG_PREVOTE_SIGNATURES + 1 == PACKET_TAG_PRECOMMIT_SIGNATURES);
             match tag {
-                PACKET_TAG_HEARTBEAT => if peer.connection_is_unknown {
-                    println!("{:05}: Got a heartbeat, this means that the other side does not consider me unknown anymore!", my_port);
-                    peer.connection_is_unknown = false;
-                }
-
                 PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
                         peers[i].endpoint = Some(evidence.endpoint);
@@ -1593,7 +1615,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
 
-                PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(msg) {
+                PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[1..]) {
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
                         let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
@@ -1612,6 +1634,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(tag), err),
                 }
 
+                PACKET_TAG_EMPTY => {}
                 _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
             }
             continue;
@@ -1620,13 +1643,12 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 }
 
 // network
-const PACKET_TAG_CLIENT_EMPTY         : u8 =  0;
+const PACKET_TAG_EMPTY                : u8 =  0;
 const PACKET_TAG_CLIENT_HELLO         : u8 =  1;
 const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  2;
 const PACKET_TAG_CLIENT_ACK           : u8 =  3;
 const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  4;
 const PACKET_TAG_SERVER_HELLO         : u8 =  5;
-const PACKET_TAG_HEARTBEAT            : u8 =  6;
 const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  7;
 // consensus
 const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  8;
@@ -1637,15 +1659,16 @@ const PACKET_TAG_COUNT                : u8 = 11;
 const PACKET_TAG_STATUS_SHIFT         : u8 = 7;
 const PACKET_TAG_STATUS_FLAG          : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
 
+const PACKET_TAG_MASK                 : u8 = ! PACKET_TAG_STATUS_FLAG;
+
 const PACKET_TAG_NAMES: [[&str; 2]; PACKET_TAG_COUNT as usize] = {
     let mut names = [["<MISSING>"; 2]; PACKET_TAG_COUNT as usize];
-    names[PACKET_TAG_CLIENT_EMPTY         as usize] = ["<EMPTY>",              "STATUS"];
+    names[PACKET_TAG_EMPTY                as usize] = ["<EMPTY>",              "STATUS"];
     names[PACKET_TAG_CLIENT_HELLO         as usize] = ["CLIENT_HELLO",         "STATUS+CLIENT_HELLO"];
     names[PACKET_TAG_CLIENT_UNKNOWN_ACK   as usize] = ["CLIENT_UNKNOWN_ACK",   "STATUS+CLIENT_UNKNOWN_ACK"];
     names[PACKET_TAG_CLIENT_ACK           as usize] = ["CLIENT_ACK",           "STATUS+CLIENT_ACK"];
     names[PACKET_TAG_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO", "STATUS+SERVER_UNKNOWN_HELLO"];
     names[PACKET_TAG_SERVER_HELLO         as usize] = ["SERVER_HELLO",         "STATUS+SERVER_HELLO"];
-    names[PACKET_TAG_HEARTBEAT            as usize] = ["HEARTBEAT",            "STATUS+HEARTBEAT"];
     names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = ["ENDPOINT_EVIDENCE",    "STATUS+ENDPOINT_EVIDENCE"];
     names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",       "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
@@ -1753,7 +1776,7 @@ impl PubKeySig {
 // #[repr(C)]
 #[derive(Debug)]
 struct PacketVotes {
-    tag:         u8,
+    // tag
     no_votes_n:  u8,
     yes_votes_n: u8,
     // pad_:     u16, // TODO: useful?
@@ -1771,7 +1794,6 @@ const_assert!(size_of::<PacketVotes>() == 1248); // TODO(azmr): exactly how much
 impl PacketVotes {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.tag        .write_to(&mut buf[o..]);
         o += self.no_votes_n .write_to(&mut buf[o..]);
         o += self.yes_votes_n.write_to(&mut buf[o..]);
         o += self.round      .write_to(&mut buf[o..]);
@@ -1789,12 +1811,11 @@ impl PacketVotes {
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = PacketVotes {
-            tag: 0, no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
+            no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
             ack_height: 0,
             value_id: ValueId::NIL,
             votes: [PubKeySig::NIL; 18],
         };
-        packet.tag         = r.read_u8()?;
         packet.no_votes_n  = r.read_u8()?;
         packet.yes_votes_n = r.read_u8()?;
         packet.round       = r.read_u32::<LittleEndian>()?;
