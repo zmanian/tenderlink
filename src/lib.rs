@@ -1617,56 +1617,118 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 }
 
 // network
-const PACKET_TAG_CLIENT_HELLO         : u8 =  0;
-const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  1;
-const PACKET_TAG_CLIENT_ACK           : u8 =  2;
-const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  3;
-const PACKET_TAG_SERVER_HELLO         : u8 =  4;
-const PACKET_TAG_HEARTBEAT            : u8 =  5;
-const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  6;
+const PACKET_TAG_CLIENT_EMPTY         : u8 =  0;
+const PACKET_TAG_CLIENT_HELLO         : u8 =  1;
+const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  2;
+const PACKET_TAG_CLIENT_ACK           : u8 =  3;
+const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  4;
+const PACKET_TAG_SERVER_HELLO         : u8 =  5;
+const PACKET_TAG_HEARTBEAT            : u8 =  6;
+const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  7;
 // consensus
-const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  7;
-const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  8;
-const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 =  9;
-const PACKET_TAG_COUNT                : u8 = 10;
+const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  8;
+const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  9;
+const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 = 10;
+const PACKET_TAG_COUNT                : u8 = 11;
 
-const PACKET_TAG_NAMES: [&str; PACKET_TAG_COUNT as usize] = {
-    let mut names = ["<MISSING>"; PACKET_TAG_COUNT as usize];
-    names[PACKET_TAG_CLIENT_HELLO         as usize] = "CLIENT_HELLO";
-    names[PACKET_TAG_CLIENT_UNKNOWN_ACK   as usize] = "CLIENT_UNKNOWN_ACK";
-    names[PACKET_TAG_CLIENT_ACK           as usize] = "CLIENT_ACK";
-    names[PACKET_TAG_SERVER_UNKNOWN_HELLO as usize] = "SERVER_UNKNOWN_HELLO";
-    names[PACKET_TAG_SERVER_HELLO         as usize] = "SERVER_HELLO";
-    names[PACKET_TAG_HEARTBEAT            as usize] = "HEARTBEAT";
-    names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = "ENDPOINT_EVIDENCE";
-    names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = "PROPOSAL_CHUNK";
-    names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = "PREVOTE_SIGNATURES";
-    names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = "PRECOMMIT_SIGNATURES";
-    const_assert!(PACKET_TAG_COUNT == 10); // keep names array updated when adding other tags
+const PACKET_TAG_STATUS_SHIFT         : u8 = 7;
+const PACKET_TAG_STATUS_FLAG          : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
+
+const PACKET_TAG_NAMES: [[&str; 2]; PACKET_TAG_COUNT as usize] = {
+    let mut names = [["<MISSING>"; 2]; PACKET_TAG_COUNT as usize];
+    names[PACKET_TAG_CLIENT_EMPTY         as usize] = ["<EMPTY>",              "STATUS"];
+    names[PACKET_TAG_CLIENT_HELLO         as usize] = ["CLIENT_HELLO",         "STATUS+CLIENT_HELLO"];
+    names[PACKET_TAG_CLIENT_UNKNOWN_ACK   as usize] = ["CLIENT_UNKNOWN_ACK",   "STATUS+CLIENT_UNKNOWN_ACK"];
+    names[PACKET_TAG_CLIENT_ACK           as usize] = ["CLIENT_ACK",           "STATUS+CLIENT_ACK"];
+    names[PACKET_TAG_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO", "STATUS+SERVER_UNKNOWN_HELLO"];
+    names[PACKET_TAG_SERVER_HELLO         as usize] = ["SERVER_HELLO",         "STATUS+SERVER_HELLO"];
+    names[PACKET_TAG_HEARTBEAT            as usize] = ["HEARTBEAT",            "STATUS+HEARTBEAT"];
+    names[PACKET_TAG_ENDPOINT_EVIDENCE    as usize] = ["ENDPOINT_EVIDENCE",    "STATUS+ENDPOINT_EVIDENCE"];
+    names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",       "STATUS+PROPOSAL_CHUNK"];
+    names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
+    names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES", "STATUS+PRECOMMIT_SIGNATURES"];
+    const_assert!(PACKET_TAG_COUNT == 11); // keep names array updated when adding other tags
     names
 };
-fn packet_name_from_tag(tag: u8) -> &'static str { PACKET_TAG_NAMES.get(tag as usize).unwrap_or(&"<UNKNOWN>") }
+fn packet_name_from_tag(tag: u8) -> &'static str {
+    PACKET_TAG_NAMES.get(tag as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
+}
 
 // NOTE(azmr): could add packet sizes so we can check all sizes in 1 location
+
+// ALT: if we limit to u16 chunk indexes & have ~1KB chunk data per packet, we could have block sizes up to ~65MB
+// N.B. with ranges like this, we either want to be half-exclusive & not allow type::MAX values, or use a special value for empty (e.g. hi < lo)
+type ProposalRng = [u32; 2]; // [lo, hi)
+type VoteRng     = [u16; 2];
+const STATUS_PROPOSAL_RNGS_N: usize = 1;
+const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
+struct PacketStatus {
+    my_height: u64,
+    my_round:  u32, // as context for following request ranges
+    need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
+    need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
+}
+impl PacketStatus {
+    pub fn write_to(&self, buf: &mut[u8]) -> usize {
+        let mut o = self.my_height.write_to(&mut buf[..]);
+        o += self.my_round.write_to(&mut buf[o..]);
+        for chunk_rng in &self.need_proposal_chunk_rngs {
+            o += chunk_rng[0].write_to(&mut buf[o..]);
+            o += chunk_rng[1].write_to(&mut buf[o..]);
+        }
+        for is_precommit in 0..2 {
+            for vote_rng in &self.need_vote_rngs[is_precommit] {
+                o += vote_rng[0].write_to(&mut buf[o..]);
+                o += vote_rng[1].write_to(&mut buf[o..]);
+            }
+        }
+        o
+    }
+
+    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
+        let mut packet = Self {
+            my_height: 0, my_round: 0,
+            need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
+            need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
+        };
+        packet.my_height = r.read_u64::<LittleEndian>()?;
+        packet.my_round = r.read_u32::<LittleEndian>()?;
+        for chunk_rng in &mut packet.need_proposal_chunk_rngs {
+            chunk_rng[0] = r.read_u32::<LittleEndian>()?;
+            chunk_rng[1] = r.read_u32::<LittleEndian>()?;
+        }
+        for is_precommit in 0..2 {
+            for vote_rng in &mut packet.need_vote_rngs[is_precommit] {
+                vote_rng[0] = r.read_u16::<LittleEndian>()?;
+                vote_rng[1] = r.read_u16::<LittleEndian>()?;
+            }
+        }
+        Ok(packet)
+    }
+}
 
 // Note(Sam): Heart beat should be different by connection type or contain information regarding the connection type.
 struct PacketHeartbeat {
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
+    status: PacketStatus,
+    // followed by sig of sender
 }
 impl PacketHeartbeat {
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
         self.nonce_ack_latest.write_to(&mut buf[..]);
-        self.nonce_ack_field.write_to(&mut buf[64..]);
-        128
+        self.nonce_ack_field.write_to(&mut buf[8..]);
+        16 + self.status.write_to(&mut buf[16..])
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let nonce_ack_latest = r.read_u64::<LittleEndian>()?;
-        let nonce_ack_field = r.read_u64::<LittleEndian>()?;
+        let nonce_ack_field  = r.read_u64::<LittleEndian>()?;
+        let status           = PacketStatus::read_from(r)?;
         Ok(Self {
             nonce_ack_latest,
             nonce_ack_field,
+            status,
         })
     }
 }
