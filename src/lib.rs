@@ -1199,7 +1199,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     };
                     let (_, proposer_pub_key) = TMState::proposer_from_height_round(roster, height, round);
 
-                    if hdr.proposal_id != ValueId::NIL {
+                    // Note(Sam): Andrew says hmmm, this should maybe be based on whether there is a signature... I, Sam, do not know what he means.
+                    if hdr.proposal_id != ValueId::NIL || round_data.active_timeout.is_some() {
                         if PRINT_OUTGOING { eprintln!("{} sending {} proposal chunks", ctx_str, round_data.proposal_sigs_n); }
 
                         for chunk_i in 0..PROPOSAL_CHUNKS_N {
@@ -1851,6 +1852,7 @@ const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
 // NOTE(azmr): this is:
 // - conservative in terms of max chunks, value_id, & arrival order
 // - assuming a fixed total proposal size
+#[derive(Debug)]
 struct PacketProposalChunkHeader {
     // tag
     chunk_i:     u32,
