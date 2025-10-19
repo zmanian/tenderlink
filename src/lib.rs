@@ -18,14 +18,14 @@ const PRINT_BFT_TIMEOUTS:   bool = 1 == 1;
 
 
 // MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
-const ETHERNET_FRAME_SIZE       : usize = 1500;
-const IPV6_HEADER_SIZE          : usize =   40;
-const UDP_HEADER_SIZE           : usize =    8;
-const PPPOE_HEADER_SIZE         : usize =    8;
-const WIREGUARD_HEADER_SIZE     : usize =   40;
-const VPN_HEADER_SIZE           : usize =   64; // relatively conservative(?) OpenVPN header overhead size
-const NOISE_NONCE_SIZE          : usize =    8;
-const NOISE_HEADER_SIZE         : usize =   16;
+const ETHERNET_FRAME_SIZE:   usize = 1500;
+const IPV6_HEADER_SIZE:      usize =   40;
+const UDP_HEADER_SIZE:       usize =    8;
+const PPPOE_HEADER_SIZE:     usize =    8;
+const WIREGUARD_HEADER_SIZE: usize =   40;
+const VPN_HEADER_SIZE:       usize =   64; // relatively conservative(?) OpenVPN header overhead size
+const NOISE_NONCE_SIZE:      usize =    8;
+const NOISE_HEADER_SIZE:     usize =   16;
 
 const MAX_PATH_HEADERS_SIZE: usize = (IPV6_HEADER_SIZE + UDP_HEADER_SIZE + WIREGUARD_HEADER_SIZE + VPN_HEADER_SIZE + NOISE_NONCE_SIZE + NOISE_HEADER_SIZE);
 
