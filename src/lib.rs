@@ -3,6 +3,7 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
+const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
@@ -528,12 +529,14 @@ impl TMState {
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
                     if round_data.proposal_id != value_id {
                         // TODO: immediately class both as invalid
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
                         return TMStatus::Fail;
                     }
                     if round_data.proposal_valid_round != valid_round {
                         // TODO: immediately class both as invalid
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds. Ignoring latest...", ctx_str, height, round, chunk_i, roster_i);
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
                         return TMStatus::Fail;
                     }
                 }
@@ -610,7 +613,7 @@ impl TMState {
                 let new_val_sig = (value_id, sig);
                 if old_val_sig.1 != TMSig::NIL && new_val_sig != old_val_sig {
                     // TODO: do we want to allow for NIL updating to valid?
-                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values. Ignoring latest...", ctx_str, height, round, roster_i);
+                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", ctx_str, height, round, roster_i, new_val_sig, old_val_sig);
                     return TMStatus::Fail;
                 }
                 // Checks now finished //////////////////////////
@@ -854,7 +857,7 @@ struct Peer {
 
     connection_is_unknown: bool,
 
-    request_height: Option<u64>,
+    latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
     fn default() -> Peer {
@@ -871,7 +874,7 @@ impl Default for Peer {
             on_send_next_nonce: 0,
 
             connection_is_unknown: false,
-            request_height: None,
+            latest_status: None,
         }
     }
 }
@@ -1100,6 +1103,18 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
+        fn read_tag_and_maybe_status(msg: &[u8]) -> std::io::Result<(u8, Option<PacketStatus>, usize)> {
+            let tag = msg[0] & PACKET_TAG_MASK;
+            let mut status = None;
+            let mut o = 1;
+            if (msg[0] & PACKET_TAG_STATUS_FLAG) != 0 {
+                // TODO: scope down required ranges
+                let mut cur = Cursor::new(&msg[1..]);
+                status = Some(PacketStatus::read_from(&mut cur)?);
+                o += cur.position() as usize;
+            }
+            Ok((tag, status, o))
+        }
         fn write_tag_and_maybe_status(tag: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8]) -> usize {
             send_buf1[0] = tag;
             let mut o = 1;
@@ -1107,8 +1122,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 send_buf1[0] |= PACKET_TAG_STATUS_FLAG;
                 // TODO: scope down required ranges
                 let status = PacketStatus {
-                    my_height: bft_state.height(),
-                    my_round: bft_state.round,
+                    height: bft_state.height(),
+                    round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, PROPOSAL_CHUNKS_N as u32]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
                 };
@@ -1330,17 +1345,22 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     }
                 }
 
+                if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|p|
+                        (PubKeyID(p.root_public_key), p.latest_status.clone(), p.connection_is_unknown)
+                ).collect::<Vec<_>>()); }
+
                 // TODO: loop rounds at current height
                 // if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
                 // for round_i in 0..bft_state.rounds_data.len()
                 //for height in 0..bft_state.decisions.len()
                 //{
                 for peer_i in 0..peers.len() {
-                    if let Some(height) = peers[peer_i].request_height.clone() {
-                        if height >= bft_state.height() { continue; }
-                        peers[peer_i].request_height = None;
+                    if let Some(status) = peers[peer_i].latest_status.clone() {
+                        if status.height >= bft_state.height() { continue; }
+                        // TODO(azmr): I don't think we want this?
+                        // peers[peer_i].request_height = None;
 
-                        let round_i = bft_state.decisions[height as usize].round_i;
+                        let round_i = bft_state.decisions[status.height as usize].round_i;
                         let round_data = &bft_state.rounds_data[round_i];
 
                         broadcast_round_data(&bft_state, false, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
@@ -1358,18 +1378,6 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     }
                 } else {
                     todo!();
-                }
-
-                if let Some(peer) = peers.iter_mut().choose(&mut base_rng) {
-                    let other_str = TMState::name_str_other(&roster, &peer);
-                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                        let req_height = bft_state.height();
-                        if PRINT_SENDS { println!("{}: Requesting height {} from {}", ctx_str, req_height, other_str); }
-                        send_buf1[0] = PACKET_TAG_SYNC_REQUEST;
-                        send_buf1[1..9].copy_from_slice(&req_height.to_le_bytes());
-                        bytes_sent += 9;
-                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..9]);
-                    }
                 }
 
                 // println!("Total bytes sent: {}", bytes_sent);
@@ -1564,8 +1572,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         if msg.is_none() { continue; }
         let msg: &[u8] = msg.unwrap();
         if msg.len() == 0 { continue; }
-        let tag        = msg[0] & PACKET_TAG_MASK;
-        let has_status = (msg[0] & PACKET_TAG_STATUS_FLAG) != 0;
+        let Ok((tag, status, read_o)) = read_tag_and_maybe_status(&msg[..]) else {
+            continue;
+        };
 
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
@@ -1573,7 +1582,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
 
             match tag {
-                PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
+                PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
                         peers[i].endpoint = Some(evidence.endpoint);
                         if peer.endpoint == evidence.endpoint {
@@ -1604,14 +1613,18 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
 
             // TODO: other TAGs should also cause this transition
-            if has_status && peer.connection_is_unknown {
-                println!("{:05}: Got a status, this means that the other side does not consider me unknown anymore!", my_port);
-                peer.connection_is_unknown = false;
+            if let Some(status) = status {
+                if peer.connection_is_unknown {
+                    println!("{:05}: Got a status, this means that the other side does not consider me unknown anymore!", my_port);
+                    peer.connection_is_unknown = false;
+                }
+
+                peer.latest_status = Some(status);
             }
 
             const_assert!(PACKET_TAG_PREVOTE_SIGNATURES + 1 == PACKET_TAG_PRECOMMIT_SIGNATURES);
             match tag {
-                PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[1..]) {
+                PACKET_TAG_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
                         peers[i].endpoint = Some(evidence.endpoint);
                         roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
@@ -1621,7 +1634,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
 
                 PACKET_TAG_PROPOSAL_CHUNK => if msg.len() == PROPOSAL_CHUNK_SIZE {
-                    let hdr = match PacketProposalChunkHeader::read_from(&msg[1..]) { Ok(v)=>v, Err(err)=>{
+                    let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v)=>v, Err(err)=>{
                         eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
                         continue;
                     }};
@@ -1630,13 +1643,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if let (Some(roster_i), proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round) {
                         let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
                         bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                            &roster, roster_i, tag, &msg[1..sig_o], &msg[sig_o..sig_o+64]);
+                            &roster, roster_i, tag, &msg[read_o..sig_o], &msg[sig_o..sig_o+64]);
                     };
                 } else {
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
 
-                PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[1..]) {
+                PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[read_o..]) {
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
                         let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
@@ -1650,12 +1663,6 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     }
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(tag), err),
                 }
-
-                PACKET_TAG_SYNC_REQUEST => if msg.len() == 9 {
-                    let req_height = u64::from_le_bytes(msg[1..9].try_into().unwrap());
-                    peer.request_height = Some(req_height);
-                }
-                else { eprintln!("{:05}: couldn't read {}: Size is not 9", my_port, packet_name_from_tag(tag)) },
 
                 PACKET_TAG_EMPTY => {}
                 _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
@@ -1672,13 +1679,12 @@ const PACKET_TAG_CLIENT_UNKNOWN_ACK   : u8 =  2;
 const PACKET_TAG_CLIENT_ACK           : u8 =  3;
 const PACKET_TAG_SERVER_UNKNOWN_HELLO : u8 =  4;
 const PACKET_TAG_SERVER_HELLO         : u8 =  5;
-const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  7;
+const PACKET_TAG_ENDPOINT_EVIDENCE    : u8 =  6;
 // consensus
-const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  8;
-const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  9;
-const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 = 10;
-const PACKET_TAG_SYNC_REQUEST         : u8 = 11;
-const PACKET_TAG_COUNT                : u8 = 12;
+const PACKET_TAG_PROPOSAL_CHUNK       : u8 =  7;
+const PACKET_TAG_PREVOTE_SIGNATURES   : u8 =  8;
+const PACKET_TAG_PRECOMMIT_SIGNATURES : u8 =  9;
+const PACKET_TAG_COUNT                : u8 = 10;
 
 const PACKET_TAG_STATUS_SHIFT         : u8 = 7;
 const PACKET_TAG_STATUS_FLAG          : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
@@ -1697,8 +1703,7 @@ const PACKET_TAG_NAMES: [[&str; 2]; PACKET_TAG_COUNT as usize] = {
     names[PACKET_TAG_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",       "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TAG_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TAG_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES", "STATUS+PRECOMMIT_SIGNATURES"];
-    names[PACKET_TAG_SYNC_REQUEST         as usize] = ["SYNC_REQUEST",         "STATUS+SYNC_REQUEST"];
-    const_assert!(PACKET_TAG_COUNT == 12); // keep names array updated when adding other tags
+    const_assert!(PACKET_TAG_COUNT == 10); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_tag(tag: u8) -> &'static str {
@@ -1713,16 +1718,17 @@ type ProposalRng = [u32; 2]; // [lo, hi)
 type VoteRng     = [u16; 2];
 const STATUS_PROPOSAL_RNGS_N: usize = 1;
 const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
+#[derive(Clone, Debug)]
 struct PacketStatus {
-    my_height: u64,
-    my_round:  u32, // as context for following request ranges
+    height: u64,
+    round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
     need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
 }
 impl PacketStatus {
     pub fn write_to(&self, buf: &mut[u8]) -> usize {
-        let mut o = self.my_height.write_to(&mut buf[..]);
-        o += self.my_round.write_to(&mut buf[o..]);
+        let mut o = self.height.write_to(&mut buf[..]);
+        o += self.round.write_to(&mut buf[o..]);
         for chunk_rng in &self.need_proposal_chunk_rngs {
             o += chunk_rng[0].write_to(&mut buf[o..]);
             o += chunk_rng[1].write_to(&mut buf[o..]);
@@ -1738,12 +1744,12 @@ impl PacketStatus {
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = Self {
-            my_height: 0, my_round: 0,
+            height: 0, round: 0,
             need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
             need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
         };
-        packet.my_height = r.read_u64::<LittleEndian>()?;
-        packet.my_round = r.read_u32::<LittleEndian>()?;
+        packet.height = r.read_u64::<LittleEndian>()?;
+        packet.round = r.read_u32::<LittleEndian>()?;
         for chunk_rng in &mut packet.need_proposal_chunk_rngs {
             chunk_rng[0] = r.read_u32::<LittleEndian>()?;
             chunk_rng[1] = r.read_u32::<LittleEndian>()?;
