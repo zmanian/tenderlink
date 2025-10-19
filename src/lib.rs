@@ -19,7 +19,7 @@ const PRINT_BFT_TIMEOUTS:   bool = 1 == 1;
 use static_assertions::{const_assert};
 use std::{io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use byteorder::{LittleEndian, ReadBytesExt};
-use ed25519_zebra::{SigningKey, VerificationKeyBytes};
+use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey};
 use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
@@ -124,7 +124,7 @@ struct RoundData {
     // TODO: keep parallel with each other, but be sparse in members
     proposal: BlockValue,
     proposal_valid_round: i64,
-    proposal_sigs:  [TMSig; PROPOSAL_CHUNKS_N], // [ed25519_zebra::Signature; PROPOSAL_CHUNKS_N],
+    proposal_sigs:  [TMSig; PROPOSAL_CHUNKS_N], // [Signature; PROPOSAL_CHUNKS_N],
     proposal_sigs_n: usize,
     proposal_id: ValueId,
     proposal_checked_validity: TMStatus,
@@ -386,12 +386,12 @@ impl TMState {
 
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
-                    self.my_signing_key.sign(&buf[..o]).to_bytes().write_to(&mut buf[o..]);
+                    let sig = self.my_signing_key.sign(&buf[..o]).to_bytes();
 
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
                         height, round, chunk_i, hdr.proposal_id, hdr.valid_round,
-                        roster, roster_i, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &buf[o..o+64]
+                        roster, roster_i, PACKET_TAG_PROPOSAL_CHUNK, &buf[..o], &sig
                     );
                 }
 
@@ -489,7 +489,7 @@ impl TMState {
         (n - 1) / 3
     }
 
-    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, tag: u8, signed_data: &[u8], sig_data: &[u8]) -> TMStatus {
+    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, tag: u8, signed_data: &[u8], sig_data: &[u8;64]) -> TMStatus {
         let me_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(tag), height, round, chunk_i);
 
@@ -510,11 +510,8 @@ impl TMState {
         let ctx_str = format!("{} [{} from {} ({:.4}...)]", me_str, pkt_str, roster_i, from_pub_key);
 
         // check if data was signed by pub key
-        let signature = match ed25519_zebra::Signature::from_slice(sig_data) { Ok(v)=>v, Err(err)=> {
-            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: malformed signature: {}", ctx_str, err);
-            return TMStatus::Fail;
-        }};
-        let vk = match ed25519_zebra::VerificationKey::try_from(from_pub_key.0) { Ok(v)=>v, Err(err)=>{
+        let signature = Signature::from_bytes(sig_data);
+        let vk = match VerificationKey::try_from(from_pub_key.0) { Ok(v)=>v, Err(err)=>{
             eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid public key: {} ({})", ctx_str, from_pub_key, err);
             return TMStatus::Fail;
         }};
@@ -522,7 +519,7 @@ impl TMState {
             eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid signature[..{}]: {} {}", ctx_str, signed_data.len(), value_id, err);
             return TMStatus::Fail;
         }}
-        let sig = TMSig(signature.to_bytes());
+        let sig = TMSig(*sig_data);
 
         if PRINT_VALID_INCOMING { eprintln!("{}: valid signature for value id: {}", ctx_str, value_id); }
 
@@ -1352,11 +1349,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
                                 if true { // self-check signatures as sanity check
-                                    let sig = match ed25519_zebra::Signature::from_slice(&round_data.proposal_sigs[chunk_i].0) { Ok(v)=>v, Err(err)=> {
-                                        eprintln!("{}: BFT FAULT: malformed proposal signature: {}", ctx_str, err);
-                                        continue;
-                                    }};
-                                    let vk = match ed25519_zebra::VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
+                                    let sig = Signature::from_bytes(&round_data.proposal_sigs[chunk_i].0);
+                                    let vk = match VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
                                         eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
                                         continue;
                                     }};
@@ -1768,7 +1762,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
                         let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
                         bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                            &roster, roster_i, tag, &msg[read_o..sig_o], &msg[sig_o..sig_o+64]);
+                            &roster, roster_i, tag, &msg[read_o..sig_o], &msg[sig_o..sig_o+64].try_into().unwrap());
                     };
                 } else {
                     eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
@@ -2143,7 +2137,7 @@ pub fn run_instances(i: usize) {
         // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
         let mut secret_key = [0u8; 32];
         crypto_rng.fill_bytes(&mut secret_key);
-        ed25519_zebra::SigningKey::from(secret_key)
+        SigningKey::from(secret_key)
     }).collect();
     let mut cumulative_stake = 0;
     let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
