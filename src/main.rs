@@ -4,6 +4,6 @@ fn main() {
     if args.len() > 1 {
         i = args[1].parse().unwrap_or(usize::MAX);
     }
-    println!("{:?}", args);
+    println!("Command line: {:?}", args);
     stuff::run_instances(i);
 }

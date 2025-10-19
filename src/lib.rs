@@ -3,11 +3,13 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
+const PRINT_BYTES_SENT:     bool = 0 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
+const PRINT_BFT_VOTE:       bool = 0 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
@@ -383,7 +385,7 @@ impl TMState {
 
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
-                println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id);
+                if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let tag         = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(is_precommit, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
@@ -1382,7 +1384,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     todo!();
                 }
 
-                // println!("Total bytes sent: {}", bytes_sent);
+                if PRINT_BYTES_SENT { println!("Total bytes sent: {}", bytes_sent); }
 
                 break;
             }
@@ -1554,6 +1556,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
+                        // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                         let start_nonce = rand::random::<u64>() >> 1;
                         start_nonce                    .write_to(&mut send_buf1[      ..]);
                         PACKET_TAG_SERVER_UNKNOWN_HELLO.write_to(&mut send_buf1[8     ..]);
@@ -2036,7 +2039,7 @@ pub fn run_instances(i: usize) {
     }).collect();
     assert!(roster.is_sorted_by(|a,b| a.stake >= b.stake)); // descending
 
-    println!("{:?}", roster);
+    println!("Roster: {:?}", roster);
 
     let static_keypair_zero = {
         let kp = snow::Builder::with_resolver("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(crypto_rng.clone()) })).generate_keypair().unwrap();
