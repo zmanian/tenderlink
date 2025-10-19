@@ -14,38 +14,18 @@ const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 1 == 1;
 
 use static_assertions::{const_assert};
-use std::{io::{Cursor, Read, Write}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, time::Duration};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::{io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
+use byteorder::{LittleEndian, ReadBytesExt};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes};
-use rand::{seq::{IndexedRandom, IteratorRandom}, Rng, RngCore, SeedableRng};
+use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
 use snow::{resolvers::CryptoResolver, HandshakeState, StatelessTransportState};
 use tokio::time::Instant;
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(100);
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
 const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
-
-const FAKE_FAIL_RATIO: f64 = 0.9;
-// const FAKE_FAIL_DISTR: rand::distr::Bernoulli = rand::distr::Bernoulli::new(FAKE_FAIL_RATIO).unwrap();
-
-// NOTE(Phil): On Windows, you can adjust packet ping/loss in realtime using the Clumsy app:
-//             https://jagt.github.io/clumsy/download.html
-fn should_fake_fail(rng: &mut SimRng) -> bool {
-    return false;
-
-    if std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() / 10 % 2 == 0 {
-        return false;
-    }
-    // use rand::distr::Distribution;
-    if FAKE_FAIL_RATIO == 0.0 {
-        false
-    } else {
-        rng.random_bool(FAKE_FAIL_RATIO)
-        // FAKE_FAIL_DISTR.sample(rng)
-    }
-}
 
 fn is_timeout(e: std::io::ErrorKind) -> bool{
     e == std::io::ErrorKind::WouldBlock || e == std::io::ErrorKind::TimedOut
@@ -79,8 +59,8 @@ struct TMVote {
     todo_sign_bytes: [u8; 96],
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-struct BlockValue([u8; PROPOSAL_BUF_SIZE]); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
+#[derive(Clone, PartialEq, Debug)]
+pub struct BlockValue(Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
 impl BlockValue {
     fn is_valid(&self) -> TMStatus {
         // TODO
@@ -88,10 +68,26 @@ impl BlockValue {
     }
 }
 
+#[derive(Clone)]
+pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send + 'static>> + Send + Sync>);
+#[derive(Clone)]
+pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = TMStatus> + Send + 'a>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToProposeNewBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClosureToProposeNewBlock(..)")
+    }
+}
+impl std::fmt::Debug for ClosureToValidateProposedBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClosureToValidateProposedBlock(..)")
+    }
+}
+
+
 fn get_bft_value(bft_state: &TMState) -> BlockValue {
     // TODO: sim/get from PoW
     let val = ((bft_state.height() << 4) as u32 ^ bft_state.round) as u8 ^ bft_state.my_pub_key.0[0];
-    let mut proposal = BlockValue([val; PROPOSAL_BUF_SIZE]);
+    let mut proposal = BlockValue([val; PROPOSAL_BUF_SIZE].to_vec());
     bft_state.my_pub_key.0.write_to(&mut proposal.0);
     [0; PROPOSAL_BUF_SIZE - PROPOSAL_SEM_SIZE].write_to(&mut proposal.0[PROPOSAL_SEM_SIZE..]);
     proposal
@@ -100,7 +96,7 @@ fn get_bft_value(bft_state: &TMState) -> BlockValue {
 
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum TMStatus {
+pub enum TMStatus {
     Indeterminate,
     Pass, // 2f+1 yes
     Fail, // f+1 no
@@ -151,7 +147,7 @@ impl RoundData {
     const EMPTY: RoundData = RoundData {
         height: 0,
         round: 0,
-        proposal: BlockValue([0; PROPOSAL_BUF_SIZE]),
+        proposal: BlockValue(Vec::new()),
         proposal_valid_round: -1,
         proposal_sigs: [TMSig::NIL; PROPOSAL_CHUNKS_N],
         proposal_sigs_n: 0,
@@ -318,9 +314,12 @@ struct TMState {
     locked_value_round: (Option<BlockValue>, i64), // TODO
 
     rounds_data: Vec<RoundData>,
+
+    propose_closure: ClosureToProposeNewBlock,
+    validate_closure: ClosureToValidateProposedBlock,
 }
 impl TMState {
-    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16) -> Self {
+    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock) -> Self {
         Self {
             my_port,
             my_signing_key,
@@ -332,6 +331,9 @@ impl TMState {
             locked_value_round: (None, -1),
 
             rounds_data: Vec::new(),
+
+            propose_closure,
+            validate_closure,
         }
     }
 
@@ -385,7 +387,7 @@ impl TMState {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
                 println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id);
                 let tag         = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit;
-                let signed_data = make_vote_sign_datas(is_precommit, height, round, value_id)[1];
+                let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
 
                 self.check_and_incorporate_msg(
@@ -435,10 +437,11 @@ impl TMState {
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
             ..RoundData::EMPTY
         });
+        self.rounds_data[insert_i].proposal = BlockValue(vec![0_u8; PROPOSAL_BUF_SIZE]); // TODO: variable size support.
         insert_i
     }
 
-    fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
+    async fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
         self.round = round;
         // self.active_proposal_value_round = (None, -1);
 
@@ -448,10 +451,10 @@ impl TMState {
         };
 
         if Self::proposer_from_height_round(roster, self.height(), round).1 == self.my_pub_key {
-            let proposal = if let Some(valid_value) = self.valid_value_round.0 {
+            let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 valid_value
             } else {
-                get_bft_value(self)
+                self.propose_closure.0().await.unwrap()
             };
             if PRINT_BFT_PROPOSAL { println!("{} about to propose: {:?}", self.ctx_str(roster), proposal); }
 
@@ -665,7 +668,7 @@ impl TMState {
         format!("{:05}-{:?}-{:?}", peer.endpoint.unwrap_or_default().port, PubKeyID(peer.root_public_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_key)))
     }
 
-    fn bft_update(&mut self, roster: &[SortedRosterMember]) {
+    async fn bft_update(&mut self, roster: &[SortedRosterMember]) {
         let now = Instant::now();
         let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
         let ctx_str = self.ctx_str(roster);
@@ -701,7 +704,7 @@ impl TMState {
                 // ALT: send NIL then later override with time-tagged message
                 if self.rounds_data[i].proposal_is_valid() == TMStatus::Pass && (
                     self.locked_value_round.1 == -1 ||
-                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal)) // TODO(perf): use (previously-checked) ids for easier comparison?
+                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
                     if PRINT_BFT_CONDITIONS { println!("{}: in condition 22-0: receive first proposal this height", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
@@ -722,7 +725,7 @@ impl TMState {
             {
                 if self.rounds_data[i].proposal_is_valid() == TMStatus::Pass && (
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
-                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal))
+                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
                 {
                     if PRINT_BFT_CONDITIONS { println!("{}: in condition 28-0: received 2f+1 prevotes", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
@@ -757,10 +760,10 @@ impl TMState {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
                 if self.step == TMStep::Prevote {
                     if PRINT_BFT_CONDITIONS { println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
-                    self.locked_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
+                    self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
-                self.valid_value_round = (Some(self.rounds_data[i].proposal), self.round as i64);
+                self.valid_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
             }
 
             // line 44: seen 2f+1 nil prevotes: precommit nil
@@ -796,13 +799,13 @@ impl TMState {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
                 self.decisions.push(TMDecision {
                     round_i: i,
-                    value: self.rounds_data[i].proposal,
+                    value: self.rounds_data[i].proposal.clone(),
                     // value_sig: self.rounds_data[i].proposal_sig,
                     // votes: self.rounds_data[i].msg_val_sigs
                 });
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
-                self.start_round(roster, now, 0);
+                self.start_round(roster, now, 0).await;
             }
 
             // line 55: round catchup
@@ -812,7 +815,7 @@ impl TMState {
                 f+1 <= counts.anys)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 55: round catchup", ctx_str); }
-                self.start_round(roster, now, self.rounds_data[i].round)
+                self.start_round(roster, now, self.rounds_data[i].round).await
             }
 
             // timeouts
@@ -833,7 +836,7 @@ impl TMState {
                     },
                     TMStep::Precommit => {
                         if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout precommit", ctx_str); }
-                        self.start_round(roster, now, self.round + 1)
+                        self.start_round(roster, now, self.round + 1).await
                     },
                 }
             }
@@ -1040,13 +1043,26 @@ fn nonce_update(nonce: u64, nonce_ack_latest: &mut u64, nonce_ack_field: &mut u6
     }
 }
 
-fn make_vote_sign_datas(is_precommit: u8, height: u64, round: u32, value_id: ValueId) -> [[u8; 45]; 2] {
-    let mut sign_data_no = [0; 45];
-    sign_data_no[0] = is_precommit;
-    height.write_to(&mut sign_data_no[1..]);
-    round.write_to(&mut sign_data_no[9..]);
+/*
+FROM ZEBRA
+DATA LAYOUT FOR VOTE
+32 byte ed25519 public key of the finalizer who's vote this is
+32 byte blake3 hash of value, or all zeroes to indicate Nil vote
+8 byte height
+4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
+
+TOTAL: 76 B
+
+A signed vote will be this same layout followed by the 64 byte ed25519 signature of the previous 76 bytes.
+*/
+
+fn make_vote_sign_datas(pub_key: [u8; 32], is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
+    let mut sign_data_no = [0; 76];
+    sign_data_no[0..32].copy_from_slice(&pub_key[..]);
+    height.write_to(&mut sign_data_no[64..]);
+    (round + 0x8000_0000 * (is_precommit as u32)).write_to(&mut sign_data_no[72..]);
     let mut sign_data_yes = sign_data_no;
-    value_id.0.write_to(&mut sign_data_yes[13..45]);
+    value_id.0.write_to(&mut sign_data_yes[32..64]);
     [sign_data_no, sign_data_yes]
 }
 
@@ -1081,9 +1097,27 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     }
     println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
 
+    let block_rng = Arc::new(Mutex::new(base_rng.clone()));
+
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port); // TODO: double-check this is the right key
-    bft_state.start_round(&roster, Instant::now(), 0);
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port,
+        ClosureToProposeNewBlock(Arc::new(move || {
+            let block_rng2 = block_rng.clone();
+            Box::pin(async move {
+                let mut buf = vec![0_u8; PROPOSAL_BUF_SIZE];
+                block_rng2.lock().unwrap().fill_bytes(&mut buf);
+                Some(BlockValue(buf))
+            })
+        })),
+        ClosureToValidateProposedBlock(Arc::new(|block| {
+            Box::pin(async move {
+                if block.0[0] % 3 == 0 { TMStatus::Pass }
+                else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
+                else { TMStatus::Fail }
+            })
+        })),
+    ); // TODO: double-check this is the right key
+    bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {
         Some(roster_endpoint_evidence[i])
@@ -1206,7 +1240,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
-                bft_state.bft_update(&roster);
+                bft_state.bft_update(&roster).await;
 
                 fn broadcast_round_data(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
                     let height = round_data.height;
@@ -1396,7 +1430,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         let (length, addr) = match tokio::time::timeout(remaining, sock.recv_from(&mut recv_buf1)).await {
             Err(_elapsed) => continue, // timeout
             Ok(Err(error)) => { println!("Socket error: {:?}", error); continue; },
-            Ok(Ok(ret)) => if should_fake_fail(&mut base_rng) { continue; } else { ret },
+            Ok(Ok(ret)) => ret,
         };
         if length < 8 { continue; } // early out to simplify nonce code
         let raw_msg = &recv_buf1[0..length];
@@ -1652,10 +1686,11 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 PACKET_TAG_PREVOTE_SIGNATURES | PACKET_TAG_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[read_o..]) {
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
-                        let sign_datas   = make_vote_sign_datas(is_precommit, packet.height, packet.round, packet.value_id);
                         let value_ids    = [ ValueId::NIL, packet.value_id ];
-
+                        
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+                            // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
+                            let sign_datas   = make_vote_sign_datas(roster[packet.votes[vote_i].roster_i as usize].pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
                             let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
                             bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
                                 &roster, packet.votes[vote_i].roster_i as usize, tag, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
