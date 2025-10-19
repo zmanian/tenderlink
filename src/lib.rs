@@ -1130,7 +1130,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         SimRng::new(seed, 0)
     };
 
-    let should_propose_bad_value_sometimes = my_endpoint.is_some(); // peer 0 only
+    let should_propose_bad_value_sometimes = false; // my_endpoint.is_some(); // peer 0 only
 
     let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
     let my_root_public_key = VerificationKeyBytes::from(&my_root_private_key);
@@ -1274,6 +1274,18 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             let length = transport.write_message(*on_send_next_nonce, msg, &mut send_buf2[8..]).unwrap();
             *on_send_next_nonce += 1;
             send_sock_msg(ctx_str, sock, peer_endpoint, &send_buf2[0..8+length]);
+        }
+
+        const fn _assert_valid_tag<const TAG: u8>() {
+            assert!((TAG & ! PACKET_TAG_MASK) == 0);
+        }
+
+        fn make_packet_header<const TAG: u8>(ack_latest: u64, ack_field: u64) -> PacketHeader {
+            _assert_valid_tag::<TAG>();
+            PacketHeader {
+                tag_and_ack: TAG as u64 | ((ack_latest) & (u64::MAX >> PACKET_TAG_BITS) << PACKET_TAG_BITS),
+                ack_field,
+            }
         }
 
         let was_now = tokio::time::Instant::now();
@@ -1561,7 +1573,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             let tag = if connection_is_unknown { PACKET_TAG_CLIENT_UNKNOWN_ACK } else { PACKET_TAG_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            peer.on_send_next_nonce = rand::random::<u64>() >> 9;
+                            peer.on_send_next_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
 
                             send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &[tag]);
 
@@ -1632,7 +1644,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            let start_nonce = rand::random::<u64>() >> 9;
+                            let start_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
 
                             start_nonce            .write_to(&mut send_buf1[0..]);
                             PACKET_TAG_SERVER_HELLO.write_to(&mut send_buf1[8..]);
@@ -1685,7 +1697,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
                         // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                        let start_nonce = rand::random::<u64>() >> 9;
+                        let start_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
 
                         start_nonce                    .write_to(&mut send_buf1[      ..]);
                         PACKET_TAG_SERVER_UNKNOWN_HELLO.write_to(&mut send_buf1[8     ..]);
@@ -1825,6 +1837,8 @@ const PACKET_TAG_STATUS_SHIFT         : u8 = 7;
 const PACKET_TAG_STATUS_FLAG          : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
 
 const PACKET_TAG_MASK                 : u8 = ! PACKET_TAG_STATUS_FLAG;
+
+const PACKET_TAG_BITS                 : u8 = 8;
 
 const PACKET_TAG_NAMES: [[&str; 2]; PACKET_TAG_COUNT as usize] = {
     let mut names = [["<MISSING>"; 2]; PACKET_TAG_COUNT as usize];
