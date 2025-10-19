@@ -3,11 +3,14 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
+const PRINT_BYTES_SENT:     bool = 0 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
+const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
+const PRINT_BFT_VOTE:       bool = 0 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
@@ -385,7 +388,7 @@ impl TMState {
 
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
-                println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id);
+                if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let tag         = PACKET_TAG_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
@@ -673,8 +676,10 @@ impl TMState {
         let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
         let ctx_str = self.ctx_str(roster);
 
-        // TODO: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
-        for i in 0..self.rounds_data.len() {
+        // NOTE: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
+        let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height(), 0), |el| (el.height, el.round)).unwrap_or(0);
+
+        for i in current_height_start_i..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
@@ -1066,6 +1071,35 @@ fn make_vote_sign_datas(pub_key: [u8; 32], is_precommit: bool, height: u64, roun
     [sign_data_no, sign_data_yes]
 }
 
+pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize; 2]> {
+    let mut rngs: Vec<[usize;2]> = Vec::with_capacity(PROPOSAL_CHUNKS_N);
+    let mut filled_c = 0; // consecutive fills
+    let mut rng = [0, 0];
+    // TODO(perf): these can be split arbitrarily & merged if we wanted to go wide
+    for i in 0..n {
+        if f(i) {
+            rng[1] = i+1;
+            filled_c = 0; // consecutive only, could also consider occupancy
+        } else if rng[0] == rng[1] { // skip over leading fills
+            rng[0] = i+1;
+            rng[1] = i+1;
+        } else {
+            filled_c += 1;
+            if filled_c > 1 { // 2 in a row
+                rngs.push(rng);
+                filled_c = 0;
+                rng[0] = i+1;
+                rng[1] = i+1;
+            }
+        }
+    }
+    if rng[0] != rng[1] {
+        rngs.push(rng);
+    }
+
+    rngs
+}
+
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
@@ -1149,18 +1183,56 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             }
             Ok((tag, status, o))
         }
-        fn write_tag_and_maybe_status(tag: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8]) -> usize {
+        fn write_tag_and_maybe_status(tag: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
             send_buf1[0] = tag;
             let mut o = 1;
             if include_status {
                 send_buf1[0] |= PACKET_TAG_STATUS_FLAG;
-                // TODO: scope down required ranges
-                let status = PacketStatus {
+
+                let mut status = PacketStatus {
                     height: bft_state.height(),
                     round: bft_state.round,
-                    need_proposal_chunk_rngs: [[0, PROPOSAL_CHUNKS_N as u32]],
+                    need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
                 };
+
+
+                // TODO: scope down required ranges
+                // TODO: probably generate these ranges once per tick/incrementally update & pull from it
+                // TODO: weight by stake? (easily determined by cumulative stake)
+                if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(status.height, status.round), |el| (el.height, el.round))
+                {
+
+                    let round_data = &bft_state.rounds_data[current_round_i];
+
+                    let proposal_chunk_rngs = gen_mostly_empty_rngs(round_data.proposal_sigs.len(), |i| round_data.proposal_sigs[i] == TMSig::NIL);
+                    if proposal_chunk_rngs.len() > 0 {
+                        let mut random_i = peer_random;
+                        for dst_rng in &mut status.need_proposal_chunk_rngs {
+                            let rng = proposal_chunk_rngs[random_i as usize % proposal_chunk_rngs.len()];
+                            *dst_rng = [rng[0].try_into().unwrap(), rng[1].try_into().unwrap()];
+                            random_i = random_i.wrapping_add(1610612741); // large prime
+                            // TODO: "with removal"
+                        }
+                    }
+                    if PRINT_RNGS { println!("{} request proposal  chunks {:?} from {:?}", bft_state.ctx_str(roster), status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
+
+                    for is_precommit in 0..2 {
+                        let vote_rngs = gen_mostly_empty_rngs(active_roster_len(roster), |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL);
+                        if vote_rngs.len() > 0 {
+                            let mut random_i = peer_random;
+                            for dst_rng in &mut status.need_vote_rngs[is_precommit] {
+                                let rng = vote_rngs[random_i as usize % vote_rngs.len()];
+                                *dst_rng = [rng[0].try_into().unwrap(), rng[1].try_into().unwrap()];
+                                random_i = random_i.wrapping_add(1610612741); // large prime
+                                // TODO: "with removal"
+                            }
+                        }
+                        if PRINT_RNGS { println!("{} request {:9} chunks {:?} from {:?}", bft_state.ctx_str(roster), ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit], vote_rngs); }
+                    }
+
+                }
+
                 o += status.write_to(&mut send_buf1[1..]);
             }
             o
@@ -1211,7 +1283,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                             }
                         } else {
-                            let len1 = write_tag_and_maybe_status(PACKET_TAG_EMPTY, true, &bft_state, &roster, &mut send_buf1[..]);
+                            let len1 = write_tag_and_maybe_status(PACKET_TAG_EMPTY, true, &bft_state, &roster, &mut send_buf1[..], peer.on_send_next_nonce);
                             send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..len1]);
                         }
                     }
@@ -1384,7 +1456,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 ).collect::<Vec<_>>()); }
 
                 // TODO: loop rounds at current height
-                // if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                // if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
                 // for round_i in 0..bft_state.rounds_data.len()
                 //for height in 0..bft_state.decisions.len()
                 //{
@@ -1402,9 +1474,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
 
 
-                if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
                 {
-                    for round_i in current_round_i..bft_state.rounds_data.len()
+                    for round_i in current_height_start_i..bft_state.rounds_data.len()
                     {
                         let round_data = &bft_state.rounds_data[round_i];
 
@@ -1414,7 +1486,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     todo!();
                 }
 
-                // println!("Total bytes sent: {}", bytes_sent);
+                if PRINT_BYTES_SENT { println!("Total bytes sent: {}", bytes_sent); }
 
                 break;
             }
@@ -1586,6 +1658,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
+                        // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                         let start_nonce = rand::random::<u64>() >> 1;
                         start_nonce                    .write_to(&mut send_buf1[      ..]);
                         PACKET_TAG_SERVER_UNKNOWN_HELLO.write_to(&mut send_buf1[8     ..]);
@@ -1826,14 +1899,8 @@ impl PacketHeartbeat {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct PubKeySig {
-    roster_i: u16,
-    sig: TMSig,
-}
-
-impl PubKeySig {
-    const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL };
-}
+struct PubKeySig { roster_i: u16, sig: TMSig, }
+impl PubKeySig { const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL }; }
 
 // ALT: common packet header: tag, height, round, value_id
 
@@ -2069,7 +2136,7 @@ pub fn run_instances(i: usize) {
     }).collect();
     assert!(roster.is_sorted_by(|a,b| a.stake >= b.stake)); // descending
 
-    println!("{:?}", roster);
+    println!("Roster: {:?}", roster);
 
     let static_keypair_zero = {
         let kp = snow::Builder::with_resolver("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(crypto_rng.clone()) })).generate_keypair().unwrap();
@@ -2183,6 +2250,28 @@ mod tests {
         assert!(nonce_is_ok(124, 12, !0));
         assert!(!nonce_is_ok(12, 124, !0));
         assert!(nonce_is_ok(120, 124, 0xffff_ffff_ffff_ffef));
+    }
+
+    #[test]
+    fn check_gen_rngs() {
+        struct Test {
+            arr: &'static[u8],
+            rngs: &'static[[usize; 2]],
+        }
+        let tests = [
+            Test { arr: b"00000000",  rngs: &[[0,8]] },
+            Test { arr: b"00010000",  rngs: &[[0,8]] },
+            Test { arr: b"10010000",  rngs: &[[1,8]] },
+            Test { arr: b"10010001",  rngs: &[[1,7]] },
+            Test { arr: b"10011001",  rngs: &[[1,3], [5,7]] },
+            Test { arr: b"101101100", rngs: &[[1,2], [4,5], [7,9]] },
+            Test { arr: b"101111100", rngs: &[[1,2],        [7,9]] },
+        ];
+
+        for (test_i, test) in tests.iter().enumerate() {
+            let rngs = gen_mostly_empty_rngs(test.arr.len(), |i| test.arr[i] == b'0');
+            assert_eq!(test.rngs, &rngs, "index {}", test_i);
+        }
     }
 }
 

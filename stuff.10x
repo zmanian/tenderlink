@@ -11,6 +11,7 @@
 		<UseVisualStudioEnvBat>false</UseVisualStudioEnvBat>
 		<CaptureExeOutput>false</CaptureExeOutput>
 		<Configurations>
+			<Configuration>Debug</Configuration>
 			<Configuration>Release</Configuration>
 		</Configurations>
 		<Platforms>
@@ -28,7 +29,7 @@
 		<Defines></Defines>
 		<ConfigProperties>
 			<ConfigAndPlatform>
-				<Name>Release:x64</Name>
+				<Name>Debug:x64</Name>
 				<BuildCommand>cargo build</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
@@ -44,6 +45,27 @@
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 			</ConfigAndPlatform>
+			<ConfigAndPlatform>
+				<Name>Release:x64</Name>
+				<BuildCommand>cargo build --release</BuildCommand>
+				<RebuildCommand></RebuildCommand>
+				<BuildFileCommand></BuildFileCommand>
+				<CleanCommand></CleanCommand>
+				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<CancelBuild></CancelBuild>
+				<Exe></Exe>
+				<Args></Args>
+				<WorkingDirectory></WorkingDirectory>
+				<DebugCommand></DebugCommand>
+				<DebuggerExe></DebuggerExe>
+				<DebugSln>stuff.sln</DebugSln>
+				<Defines></Defines>
+				<ForceIncludes></ForceIncludes>
+			</ConfigAndPlatform>
+			<Config>
+				<Name>Debug</Name>
+				<Defines></Defines>
+			</Config>
 			<Config>
 				<Name>Release</Name>
 				<Defines></Defines>
