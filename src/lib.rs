@@ -16,6 +16,21 @@ const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 1 == 1;
 
+
+// MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
+const ETHERNET_FRAME_SIZE       : usize = 1500;
+const IPV6_HEADER_SIZE          : usize =   40;
+const UDP_HEADER_SIZE           : usize =    8;
+const PPPOE_HEADER_SIZE         : usize =    8;
+const WIREGUARD_HEADER_SIZE     : usize =   40;
+const VPN_HEADER_SIZE           : usize =   64; // relatively conservative(?) OpenVPN header overhead size
+const NOISE_NONCE_SIZE          : usize =    8;
+const NOISE_HEADER_SIZE         : usize =   16;
+
+const MAX_PATH_HEADERS_SIZE: usize = (IPV6_HEADER_SIZE + UDP_HEADER_SIZE + WIREGUARD_HEADER_SIZE + VPN_HEADER_SIZE + NOISE_NONCE_SIZE + NOISE_HEADER_SIZE);
+
+const PATH_MTU: usize = ETHERNET_FRAME_SIZE - MAX_PATH_HEADERS_SIZE;
+
 use static_assertions::{const_assert};
 use std::{io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -1972,8 +1987,8 @@ impl PacketVotes {
 }
 
 const PROPOSAL_SEM_SIZE:        usize = 6000;
-const PROPOSAL_CHUNK_SIZE:      usize = 1200;
 const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_CHUNK_SIZE - (1 + 56 + 64);
+const PROPOSAL_CHUNK_SIZE:      usize = PATH_MTU;
 const PROPOSAL_CHUNKS_N:        usize = PROPOSAL_SEM_SIZE.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
 const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
 const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
@@ -2140,7 +2155,7 @@ pub fn run_instances(i: usize) {
         SigningKey::from(secret_key)
     }).collect();
     let mut cumulative_stake = 0;
-    let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
+    let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(_, sk)| {
         //let stake = 2000 * (static_private_keys.len() - 1 - i) as u64;
         let stake = 1;
         cumulative_stake += stake;
