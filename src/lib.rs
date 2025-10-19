@@ -671,7 +671,7 @@ impl TMState {
         let ctx_str = self.ctx_str(roster);
 
         // NOTE: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
-        let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height(), 0), |el| (el.height, el.round)).unwrap_or_default();
+        let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height(), 0), |el| (el.height, el.round)).unwrap_or(0);
 
         for i in current_height_start_i..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
