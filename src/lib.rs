@@ -9,8 +9,8 @@ const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
-const PRINT_BFT_VOTE:       bool = 0 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
+const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
@@ -64,12 +64,6 @@ struct TMVote {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct BlockValue(Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
-impl BlockValue {
-    fn is_valid(&self) -> TMStatus {
-        // TODO
-        TMStatus::Pass
-    }
-}
 
 #[derive(Clone)]
 pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send + 'static>> + Send + Sync>);
@@ -166,11 +160,11 @@ impl RoundData {
     };
 
     // auto-caching
-    fn proposal_is_valid(&mut self) -> TMStatus {
+    async fn proposal_is_valid(&mut self, validate_closure: ClosureToValidateProposedBlock) -> TMStatus {
         // TODO: may want to start doing some of these on < PROPOSAL_CHUNKS_N, i.e. shortcut known-invalid
         if (self.proposal_checked_validity == TMStatus::Indeterminate &&
             self.proposal_sigs_n == PROPOSAL_CHUNKS_N) {
-            self.proposal_checked_validity = self.proposal.is_valid();
+            self.proposal_checked_validity = validate_closure.0(&self.proposal).await;
         }
         self.proposal_checked_validity
     }
@@ -459,7 +453,7 @@ impl TMState {
             } else {
                 self.propose_closure.0().await.unwrap()
             };
-            if PRINT_BFT_PROPOSAL { println!("{} about to propose: {:?}", self.ctx_str(roster), proposal); }
+            if PRINT_BFT_PROPOSAL { println!("{} about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); }
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
@@ -707,7 +701,7 @@ impl TMState {
             {
                 // TODO: do we want to prevote NIL on currently-indeterminate?
                 // ALT: send NIL then later override with time-tagged message
-                if self.rounds_data[i].proposal_is_valid() == TMStatus::Pass && (
+                if self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass && (
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
@@ -728,7 +722,7 @@ impl TMState {
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
             {
-                if self.rounds_data[i].proposal_is_valid() == TMStatus::Pass && (
+                if self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass && (
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
                 {
@@ -759,7 +753,7 @@ impl TMState {
             if (is_current_height_and_round &&
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
                 2*f+1 <= counts.yes_prevotes &&
-                self.rounds_data[i].proposal_is_valid() == TMStatus::Pass &&
+                self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
@@ -799,7 +793,7 @@ impl TMState {
             if (self.height() == self.rounds_data[i].height && // any round
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
                 2*f+1 <= counts.yes_precommits &&
-                self.rounds_data[i].proposal_is_valid() == TMStatus::Pass)
+                self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
                 self.decisions.push(TMDecision {
@@ -1110,6 +1104,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         SimRng::new(seed, 0)
     };
 
+    let should_propose_bad_value_sometimes = my_endpoint.is_some(); // peer 0 only
+
     let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
     let my_root_public_key = VerificationKeyBytes::from(&my_root_private_key);
     let my_static_keypair = my_static_keypair.unwrap_or_else(|| {
@@ -1140,13 +1136,14 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             Box::pin(async move {
                 let mut buf = vec![0_u8; PROPOSAL_BUF_SIZE];
                 block_rng2.lock().unwrap().fill_bytes(&mut buf);
+                if should_propose_bad_value_sometimes == false { buf[0] = 0; }
                 Some(BlockValue(buf))
             })
         })),
         ClosureToValidateProposedBlock(Arc::new(|block| {
             Box::pin(async move {
-                if block.0[0] % 3 == 0 { TMStatus::Pass }
-                else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
+                if block.0[0] % 2 == 0 { TMStatus::Pass }
+                //else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
                 else { TMStatus::Fail }
             })
         })),
