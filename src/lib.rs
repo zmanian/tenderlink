@@ -1899,28 +1899,23 @@ impl PacketStatus {
     }
 }
 
-// Note(Sam): Heart beat should be different by connection type or contain information regarding the connection type.
-struct PacketHeartbeat {
-    nonce_ack_latest: u64,
-    nonce_ack_field: u64,
-    status: PacketStatus,
-    // followed by sig of sender
+struct PacketHeader {
+    tag_and_ack: u64,
+    ack_field: u64,
 }
-impl PacketHeartbeat {
+impl PacketHeader {
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
-        self.nonce_ack_latest.write_to(&mut buf[..]);
-        self.nonce_ack_field.write_to(&mut buf[8..]);
-        16 + self.status.write_to(&mut buf[16..])
+        let mut o = self.tag_and_ack.write_to(&mut buf[..]);
+        o += self.ack_field.write_to(&mut buf[8..]);
+        o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let nonce_ack_latest = r.read_u64::<LittleEndian>()?;
-        let nonce_ack_field  = r.read_u64::<LittleEndian>()?;
-        let status           = PacketStatus::read_from(r)?;
+        let tag_and_ack = r.read_u64::<LittleEndian>()?;
+        let ack_field   = r.read_u64::<LittleEndian>()?;
         Ok(Self {
-            nonce_ack_latest,
-            nonce_ack_field,
-            status,
+            tag_and_ack,
+            ack_field,
         })
     }
 }
@@ -1929,7 +1924,7 @@ impl PacketHeartbeat {
 struct PubKeySig { roster_i: u16, sig: TMSig, }
 impl PubKeySig { const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL }; }
 
-// ALT: common packet header: tag, height, round, value_id
+// ALT: common consensus packet header: { packet header, height, round, value_id }
 
 // agnostic to prevote/precommit - communicated elsewhere
 // NOTE: all votes for the same value_id (or nil)
