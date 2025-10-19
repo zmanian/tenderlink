@@ -1536,7 +1536,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
                         fn finish_outgoing_handshake(ctx_str: &str, send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool) {
                             let tag = if connection_is_unknown { PACKET_TAG_CLIENT_UNKNOWN_ACK } else { PACKET_TAG_CLIENT_ACK };
-                            peer.on_send_next_nonce = rand::random::<u64>() >> 1;
+
+                            // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
+                            peer.on_send_next_nonce = rand::random::<u64>() >> 9;
+
                             send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &[tag]);
 
                             peer.transport_state                    = Some(transport);
@@ -1604,7 +1607,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
                         if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&my_root_public_key.into(), &peer.root_public_key) {
-                            let start_nonce = rand::random::<u64>() >> 1;
+
+                            // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
+                            let start_nonce = rand::random::<u64>() >> 9;
+
                             start_nonce            .write_to(&mut send_buf1[0..]);
                             PACKET_TAG_SERVER_HELLO.write_to(&mut send_buf1[8..]);
                             let length = incoming_state.write_message(&send_buf1[0..8+1], &mut send_buf2).unwrap();
@@ -1656,7 +1662,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
                         // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                        let start_nonce = rand::random::<u64>() >> 1;
+                        let start_nonce = rand::random::<u64>() >> 9;
+
                         start_nonce                    .write_to(&mut send_buf1[      ..]);
                         PACKET_TAG_SERVER_UNKNOWN_HELLO.write_to(&mut send_buf1[8     ..]);
                         from_ip                        .write_to(&mut send_buf1[8+1   ..]);
