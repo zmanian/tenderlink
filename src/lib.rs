@@ -670,8 +670,10 @@ impl TMState {
         let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
         let ctx_str = self.ctx_str(roster);
 
-        // TODO: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
-        for i in 0..self.rounds_data.len() {
+        // NOTE: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
+        let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height(), 0), |el| (el.height, el.round)).unwrap_or_default();
+
+        for i in current_height_start_i..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
@@ -1350,7 +1352,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 ).collect::<Vec<_>>()); }
 
                 // TODO: loop rounds at current height
-                // if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                // if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
                 // for round_i in 0..bft_state.rounds_data.len()
                 //for height in 0..bft_state.decisions.len()
                 //{
@@ -1368,9 +1370,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 }
 
 
-                if let Ok(current_round_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
                 {
-                    for round_i in current_round_i..bft_state.rounds_data.len()
+                    for round_i in current_height_start_i..bft_state.rounds_data.len()
                     {
                         let round_data = &bft_state.rounds_data[round_i];
 
