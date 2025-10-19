@@ -295,7 +295,24 @@ fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 #[derive(Debug)]
+struct HashKeys {
+    proposer: [u8; 32],
+    value_id: [u8; 32],
+    connect_contention: [u8; 32],
+}
+impl Default for HashKeys {
+    fn default() -> Self {
+        Self {
+            proposer:           blake3::Hasher::new_derive_key("BFT Proposer")          .finalize().into(),
+            value_id:           blake3::Hasher::new_derive_key("BFT Value ID")          .finalize().into(),
+            connect_contention: blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into(), // NOTE(azmr): skipping update
+        }
+    }
+}
+
+#[derive(Debug)]
 struct TMState {
+    hash_keys: HashKeys,
     my_port: u16,
     my_signing_key: SigningKey,
     my_pub_key: PubKeyID,
@@ -318,6 +335,7 @@ struct TMState {
 impl TMState {
     fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock) -> Self {
         Self {
+            hash_keys: HashKeys::default(),
             my_port,
             my_signing_key,
             my_pub_key,
@@ -355,7 +373,7 @@ impl TMState {
             TMMsgData::Proposal(proposal, valid_round) => {
                 let mut hdr = PacketProposalChunkHeader {
                     height, round, chunk_i: 0,
-                    proposal_id: Self::id_from_value(&proposal),
+                    proposal_id: Self::id_from_value(&self.hash_keys, &proposal),
                     valid_round,
                 };
 
@@ -398,15 +416,14 @@ impl TMState {
     }
 
     /// Deterministic weighted round robin (hash & mod total zec on cumulative list)
-    fn proposer_from_height_round(roster: &[SortedRosterMember], height: u64, round: u32) -> (Option<usize>, PubKeyID) {
+    fn proposer_from_height_round(hash_keys: &HashKeys, roster: &[SortedRosterMember], height: u64, round: u32) -> (Option<usize>, PubKeyID) {
         if roster.len() == 0 {
             eprintln!("\x1b[91mBFT ERROR\x1b[0m: trying to get proposer from empty roster");
             return (None, PubKeyID::NIL); // TODO: is a fixed value here exploitable? Presumably nobody can sign for it?
         }
 
         // NOTE(azmr): this 32-byte crypto-hashing is almost certainly overkill!
-        let key: [u8; 32] = blake3::Hasher::new_derive_key("BFT Proposer").finalize().into();
-        let hash = blake3::Hasher::new_keyed(&key).update(&u64::to_le_bytes(height)).update(&u32::to_le_bytes(round)).finalize();
+        let hash = blake3::Hasher::new_keyed(&hash_keys.proposer).update(&u64::to_le_bytes(height)).update(&u32::to_le_bytes(round)).finalize();
 
         let mut hash_stake_bytes = [0; 8];
         hash.as_bytes()[..8].write_to(&mut hash_stake_bytes);
@@ -447,7 +464,7 @@ impl TMState {
             Err(round_i) => self.insert_round(round_i, round, active_roster_len(roster))
         };
 
-        if Self::proposer_from_height_round(roster, self.height(), round).1 == self.my_pub_key {
+        if Self::proposer_from_height_round(&self.hash_keys, roster, self.height(), round).1 == self.my_pub_key {
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 valid_value
             } else {
@@ -464,9 +481,8 @@ impl TMState {
         }
     }
 
-    fn id_from_value(proposal: &BlockValue) -> ValueId {
-        let key: [u8; 32] = blake3::Hasher::new_derive_key("BFT Value ID").finalize().into();
-        ValueId(*blake3::keyed_hash(&key, &proposal.0[..PROPOSAL_SEM_SIZE]).as_bytes())
+    fn id_from_value(hash_keys: &HashKeys, proposal: &BlockValue) -> ValueId {
+        ValueId(*blake3::keyed_hash(&hash_keys.value_id, &proposal.0[..PROPOSAL_SEM_SIZE]).as_bytes())
     }
 
     fn f_from_n(n: u64) -> u64 {
@@ -999,12 +1015,10 @@ impl std::fmt::Debug for SecureUdpEndpoint {
 }
 
 // returns true if a is initiator
-fn contended_noise_is_initiator(a: &[u8; 32], b: &[u8; 32]) -> bool {
+fn contended_noise_is_initiator(hash_keys: &HashKeys, a: &[u8; 32], b: &[u8; 32]) -> bool {
     // TODO: do we want a fast insecure hash for this kind of thing?
-    // TODO: talk to Zooko about not paying the upfront key derive cost every time
-    let key: [u8; 32] = blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into(); // NOTE(azmr): skipping update
-    let a_to_b_hash = blake3::Hasher::new_keyed(&key).update(a).update(b).finalize();
-    let b_to_a_hash = blake3::Hasher::new_keyed(&key).update(b).update(a).finalize();
+    let a_to_b_hash = blake3::Hasher::new_keyed(&hash_keys.connect_contention).update(a).update(b).finalize();
+    let b_to_a_hash = blake3::Hasher::new_keyed(&hash_keys.connect_contention).update(b).update(a).finalize();
     a_to_b_hash.as_bytes() <= b_to_a_hash.as_bytes()
 }
 
@@ -1320,7 +1334,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         proposal_id: round_data.proposal_id,
                         valid_round: round_data.proposal_valid_round,
                     };
-                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(roster, height, round);
+                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, roster, height, round);
 
                     if round_data.proposal_sigs_n > 0 {
                         let mut sent_chunk_cs = 0;
@@ -1555,7 +1569,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                             if length == 8 { break; } // presumably we don't care about standalone nonces
                             let local_msg = &recv_buf2[8..length];
                             if local_msg == [PACKET_TAG_SERVER_HELLO] {
-                                if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&my_root_public_key.into(), &peer.root_public_key) {
+                                if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
                                     if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                         println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
                                         finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false);
@@ -1606,7 +1620,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     if local_msg == &[PACKET_TAG_CLIENT_HELLO] {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
-                        if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&my_root_public_key.into(), &peer.root_public_key) {
+                        if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                             let start_nonce = rand::random::<u64>() >> 9;
@@ -1751,7 +1765,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     }};
                     // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
                     // ALT:  cache proposer for *current* round
-                    if let (Some(roster_i), proposer_pub_key) = TMState::proposer_from_height_round(&roster, hdr.height, hdr.round) {
+                    if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
                         let sig_o = 1 + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
                         bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
                             &roster, roster_i, tag, &msg[read_o..sig_o], &msg[sig_o..sig_o+64]);
@@ -1764,7 +1778,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     Ok(packet) => {
                         let is_precommit = tag - PACKET_TAG_PREVOTE_SIGNATURES;
                         let value_ids    = [ ValueId::NIL, packet.value_id ];
-                        
+
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
                             let sign_datas   = make_vote_sign_datas(roster[packet.votes[vote_i].roster_i as usize].pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
