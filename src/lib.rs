@@ -250,7 +250,7 @@ impl ValueId { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PubKeyID(pub [u8; 32]);
 impl PubKeyID { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
@@ -335,12 +335,12 @@ struct TMMsg {
 
 #[derive(Clone, Copy, PartialEq)]
 struct ConsensusCounts {
-    anys: usize,
-    prevotes: usize,
-    nil_prevotes: usize,
-    yes_prevotes: usize,
-    precommits: usize,
-    yes_precommits: usize,
+    anys: u64,
+    prevotes: u64,
+    nil_prevotes: u64,
+    yes_prevotes: u64,
+    precommits: u64,
+    yes_precommits: u64,
 }
 impl ConsensusCounts {
     const ZERO: Self = Self {
@@ -351,14 +351,6 @@ impl ConsensusCounts {
         yes_precommits: 0,
         nil_prevotes: 0,
     };
-
-    fn from_slice(slice: &[[(ValueId, TMSig); 2]]) -> Self {
-        let mut counts = Self::ZERO;
-        for el in slice {
-            counts = counts + ConsensusCounts::from(el);
-        }
-        counts
-    }
 }
 impl std::ops::Add for ConsensusCounts {
     type Output = Self;
@@ -386,8 +378,9 @@ impl std::ops::Sub for ConsensusCounts {
         }
     }
 }
-impl From<&[(ValueId, TMSig); 2]> for ConsensusCounts {
-    fn from(val: &[(ValueId, TMSig); 2]) -> ConsensusCounts {
+impl From<&([(ValueId, TMSig); 2], u64)> for ConsensusCounts {
+    fn from(val: &([(ValueId, TMSig); 2], u64)) -> ConsensusCounts {
+        let (val, stake) = val;
         let has_sigs     = [(val[0].1 != TMSig::NIL) as usize, (val[1].1 != TMSig::NIL) as usize];
         let has_any_sigs = has_sigs[0] | has_sigs[1]; // TODO: confirm prevote + precommit from the same person counts as 1
 
@@ -396,12 +389,12 @@ impl From<&[(ValueId, TMSig); 2]> for ConsensusCounts {
         status[1][(val[1].0 != ValueId::NIL) as usize] = has_sigs[1];
 
         ConsensusCounts {
-            anys: has_any_sigs,
-            prevotes: has_sigs[0],
-            nil_prevotes: status[0][0],
-            yes_prevotes: status[0][1],
-            precommits: has_sigs[1],
-            yes_precommits: status[1][1],
+            anys: has_any_sigs as u64 * stake,
+            prevotes: has_sigs[0] as u64 * stake,
+            nil_prevotes: status[0][0] as u64 * stake,
+            yes_prevotes: status[0][1] as u64 * stake,
+            precommits: has_sigs[1] as u64 * stake,
+            yes_precommits: status[1][1] as u64 * stake,
         }
     }
 }
@@ -808,7 +801,11 @@ impl TMState {
 
                         if prev_sig_had_fault { // recompute from scratch
                             // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
-                            round_data.counts = ConsensusCounts::from_slice(&round_data.msg_val_sigs);
+                            let mut check_counts = ConsensusCounts::ZERO;
+                            for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                                check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
+                            }
+                            round_data.counts = check_counts;
                         }
                     }
 
@@ -875,9 +872,9 @@ impl TMState {
                 // Checks now finished //////////////////////////
 
                 // Add the signature to the list & update counts
-                let old_cs = ConsensusCounts::from(&round_data.msg_val_sigs[roster_i]);
+                let old_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], roster[roster_i].stake));
                 round_data.msg_val_sigs[roster_i][is_precommit] = new_val_sig;
-                let new_cs = ConsensusCounts::from(&round_data.msg_val_sigs[roster_i]);
+                let new_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], roster[roster_i].stake));
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
 
@@ -892,7 +889,10 @@ impl TMState {
                 }
 
                 if true {
-                    let check_counts = ConsensusCounts::from_slice(&round_data.msg_val_sigs);
+                    let mut check_counts = ConsensusCounts::ZERO;
+                    for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                        check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
+                    }
                     if check_counts != round_data.counts {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: counts don't match: incremental: {:?}, absolute: {:?}", ctx_str, round_data.counts, check_counts);
                     }
@@ -923,7 +923,16 @@ impl TMState {
 
     async fn bft_update(&mut self, roster: &[SortedRosterMember]) {
         let now = Instant::now();
-        let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
+        let f = Self::f_from_n(active_roster_len(roster) as u64) as u64;
+        let big_threshold: u64;
+        let small_threshold: u64;
+        if f == 0 {
+            big_threshold = 2*f+1;
+            small_threshold = f+1;
+        } else {
+            big_threshold = 2*f+1;
+            small_threshold = f+1;
+        }
         let ctx_str = self.ctx_str(roster);
 
         // NOTE: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
@@ -975,7 +984,7 @@ impl TMState {
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
                 self.rounds_data[i].has_full_proposal() &&
-                2*f+1 <= counts.yes_prevotes &&
+                big_threshold <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
             {
@@ -995,7 +1004,7 @@ impl TMState {
             // > upon 2f+1 <PREVOTE, h_p, round_p, ∗> while step_p = prevote for the first time do
             if (is_current_height_and_round &&
                 // don't need the proposal itself
-                2*f+1 <= counts.prevotes &&
+                big_threshold <= counts.prevotes &&
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
@@ -1009,7 +1018,7 @@ impl TMState {
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
                 self.rounds_data[i].has_full_proposal() &&
-                2*f+1 <= counts.yes_prevotes &&
+                big_threshold <= counts.yes_prevotes &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
@@ -1026,7 +1035,7 @@ impl TMState {
             // > upon 2f+1 <PREVOTE, h_p, round_p, nil>
             // > while step_p = prevote do
             if (is_current_height_and_round &&
-                2*f+1 <= counts.nil_prevotes &&
+                big_threshold <= counts.nil_prevotes &&
                 self.step == TMStep::Prevote)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str); }
@@ -1036,7 +1045,7 @@ impl TMState {
             // line 47: last orders on precommit period
             // > upon 2f+1 <PRECOMMIT, h_p, round_p, ∗> for the first time do
             if (is_current_height_and_round &&
-                2*f+1 <= counts.precommits &&
+                big_threshold <= counts.precommits &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 47: last orders on precommit period", ctx_str); }
@@ -1049,7 +1058,7 @@ impl TMState {
             // > while decision_p[h_p] = nil do
             if (self.height == self.rounds_data[i].height && // any round
                 self.rounds_data[i].has_full_proposal() &&
-                2*f+1 <= counts.yes_precommits &&
+                big_threshold <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
@@ -1067,7 +1076,7 @@ impl TMState {
             // > upon f+1 <∗, h_p, round, ∗, ∗> with round > round_p do
             if (self.height == self.rounds_data[i].height &&
                 self.round    <  self.rounds_data[i].round  &&
-                f+1 <= counts.anys)
+                small_threshold <= counts.anys)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 55: round catchup", ctx_str); }
                 self.start_round(roster, now, self.rounds_data[i].round).await
@@ -1163,15 +1172,15 @@ struct UnknownPeer {
 
 #[derive(Clone, Copy)]
 pub struct StaticDHKeyPair {
-    private: [u8; 32],
-    public: [u8; 32],
+    pub private: [u8; 32],
+    pub public: [u8; 32],
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct SecureUdpEndpoint {
-    public_key: [u8; 32],
-    ip_address: [u8; 16],
-    port: u16,
+    pub public_key: [u8; 32],
+    pub ip_address: [u8; 16],
+    pub port: u16,
 }
 impl Default for SecureUdpEndpoint {
     fn default() -> SecureUdpEndpoint {
@@ -1198,8 +1207,8 @@ impl SecureUdpEndpoint {
 
 #[derive(Clone, Copy)]
 pub struct EndpointEvidence {
-    endpoint: SecureUdpEndpoint,
-    root_public_key: [u8; 32],
+    pub endpoint: SecureUdpEndpoint,
+    pub root_public_key: [u8; 32],
 }
 impl Default for EndpointEvidence {
     fn default() -> EndpointEvidence {
@@ -2398,15 +2407,21 @@ fn hook_fail_on_panic() {
 }
 
 #[derive(Clone)]
-struct RustIsBadRngWrapper(ChaCha20Rng);
+pub struct RustIsBadRngWrapper(pub ChaCha20Rng);
 impl snow::types::Random for RustIsBadRngWrapper {
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
         self.0.fill(dest);
         Ok(())
     }
 }
-struct SnowRngResolver {
+pub struct SnowRngResolver {
     pub rng: RustIsBadRngWrapper,
+}
+
+impl SnowRngResolver {
+    pub fn seed_from_u64(seed: u64) -> SnowRngResolver {
+        SnowRngResolver { rng: RustIsBadRngWrapper(ChaCha20Rng::seed_from_u64(seed)) }
+    }
 }
 
 impl CryptoResolver for SnowRngResolver {
