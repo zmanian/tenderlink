@@ -1554,19 +1554,23 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             }
             o
         }
-        fn send_sock_msg(ctx_str: &str, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8]) {
+        fn send_sock_msg(ctx_str: &str, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
             match sock.try_send_to(msg, addr) {
-                Ok(_) => (),
+                Ok(_) => {
+                    stats.packets_sent += 1;
+                    stats.bytes_sent += msg.len();
+                    ()
+                },
                 Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
                 Err(error) => panic!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
             }
         }
-        fn send_noise_msg(ctx_str: &str, transport: &mut StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, on_send_next_nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8]) {
+        fn send_noise_msg(ctx_str: &str, transport: &mut StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, on_send_next_nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
             let mut o = on_send_next_nonce.write_to(                               &mut send_buf2[ ..]);
             o        += transport         .write_message(*on_send_next_nonce, msg, &mut send_buf2[o..]).unwrap();
-            send_sock_msg(ctx_str, sock, peer_endpoint, &send_buf2[..o]);
+            send_sock_msg(ctx_str, sock, peer_endpoint, &send_buf2[..o], stats);
 
             *on_send_next_nonce += 1;
         }
@@ -1598,11 +1602,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if let Some(evidence) = my_endpoint_evidence {
                                 let mut o = PACKET_TYPE_ENDPOINT_EVIDENCE.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
                                 o        += evidence                     .write_to(&mut send_buf1[o..]);
-                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
+                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
                         } else {
                             let o = write_tag_and_maybe_status(PACKET_TYPE_EMPTY, true, &bft_state, &roster, &mut send_buf1[..], peer.on_send_next_nonce);
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
+                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
@@ -1616,7 +1620,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             // @TodoPacketHeader
                             let length = outgoing_state.write_message(&[PACKET_TYPE_CLIENT_HELLO], &mut send_buf2).unwrap();
                             // TODO: no nonce?
-                            send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[0..length]);
+                            send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[0..length], &mut net_stats);
                             peer.outgoing_handshake_state = Some(outgoing_state);
                         }
 
@@ -1624,7 +1628,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             (&mut peer.transport_state, roster_endpoint_evidence.choose(&mut base_rng)) {
                             let mut o = PACKET_TYPE_ENDPOINT_EVIDENCE.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
                             o        += evidence                     .write_to(&mut send_buf1[o..]);
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o]);
+                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
@@ -1679,10 +1683,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
 
                                     sent_chunk_cs += 1;
-                                    stats.packets_sent += 1;
-                                    stats.bytes_sent += o;
-
-                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
+                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
                                 }
                             }
                         }
@@ -1727,8 +1728,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     let mut o = packet_type.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
                                     o        += packet     .write_to(&mut send_buf1[o..]);
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        stats.bytes_sent += o;
-                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
+                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
                                     }
 
                                     packet.no_votes_n  = 0;
@@ -1752,8 +1752,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             // TODO: maybe status
                             let len1 = 1 /* @TodoPacketHeader */ + packet.write_to(&mut send_buf1[1..]);
                             if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                stats.bytes_sent += len1;
-                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
+                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1], stats);
                             }
                         }
                     }
@@ -1850,14 +1849,14 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 }
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool) {
+                        fn finish_outgoing_handshake(ctx_str: &str, send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
                             // @TodoPacketHeader
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                             peer.on_send_next_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
-                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &[packet_type]);
+                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &[packet_type], stats);
 
                             peer.transport_state                    = Some(transport);
                             peer.outgoing_handshake_state           = None;
@@ -1876,7 +1875,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
                                     if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                         println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
-                                        finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false);
+                                        finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
                                     }
                                     break;
                                 }
@@ -1894,7 +1893,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                         my_endpoint_evidence = Some(evidence);
                                     }
 
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true);
+                                    finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true, &mut net_stats);
                                 }
                                 break;
                             }
@@ -1933,7 +1932,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             let mut o = start_nonce             .write_to(&mut send_buf1[ ..]);
                             o        += PACKET_TYPE_SERVER_HELLO.write_to(&mut send_buf1[o..]);
                             let n     = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-                            send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[0..n]);
+                            send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[0..n], &mut net_stats);
 
                             if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
                                 peer.pending_client_ack_transport_state = Some(transport);
@@ -1988,7 +1987,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         o        += from_ip                         .write_to(&mut send_buf1[o..]);
                         o        += from_port                       .write_to(&mut send_buf1[o..]);
                         let n     = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-                        send_sock_msg(&ctx_str, &sock, client_endpoint, &send_buf2[..n]);
+                        send_sock_msg(&ctx_str, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
 
                         if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
                             unknown_peers.push(UnknownPeer { endpoint: client_endpoint, transport_state: transport, pending_client_ack: true, watch_dog: Instant::now(), nonce_ack_latest: 0, nonce_ack_field: 0, on_send_next_nonce: start_nonce+1, });
