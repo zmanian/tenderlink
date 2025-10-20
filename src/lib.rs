@@ -3,7 +3,7 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
-const PRINT_BYTES_SENT:     bool = 0 == 1;
+const PRINT_NETWORK_STATS:  bool = 0 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
@@ -1440,7 +1440,16 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
     let mut unknown_peers: Vec<UnknownPeer> = Vec::new();
 
-    let mut bytes_sent: usize = 0;
+    struct NetworkStats {
+        bytes_sent: usize,
+        packets_sent: usize,
+    }
+
+    let time_we_started_at = tokio::time::Instant::now();
+    let mut net_stats = NetworkStats{
+        bytes_sent: 0,
+        packets_sent: 0,
+    };
 
     let mut recv_buf1 = [0; 2048];
     let mut recv_buf2 = [0; 2048];
@@ -1595,7 +1604,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster).await;
 
-                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer: &mut Peer, sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
+                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer: &mut Peer, sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1623,7 +1632,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 let sig_o = o;
                                 o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
-                                if true { // self-check signatures as sanity check
+                                #[cfg(debug_assertions)]
+                                { // self-check signatures as sanity check
                                     let sig = Signature::from_bytes(&round_data.proposal_sigs[chunk_i].0);
                                     let vk = match VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
                                         eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
@@ -1638,8 +1648,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                                 if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
                                     if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
+
                                     sent_chunk_cs += 1;
-                                    *bytes_sent += o;
+                                    stats.packets_sent += 1;
+                                    stats.bytes_sent += o;
+
                                     send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
                                 }
                             }
@@ -1685,7 +1698,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     let mut o = packet_type.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
                                     o        += packet     .write_to(&mut send_buf1[o..]);
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        *bytes_sent += o;
+                                        stats.bytes_sent += o;
                                         send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
                                     }
 
@@ -1710,7 +1723,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             // TODO: maybe status
                             let len1 = 1 /* @TodoPacketHeader */ + packet.write_to(&mut send_buf1[1..]);
                             if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                *bytes_sent += len1;
+                                stats.bytes_sent += len1;
                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
                             }
                         }
@@ -1736,21 +1749,27 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let peer = &mut peers[peer_i];
                     if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
                         peer.unacted_upon_status_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut bytes_sent);
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut net_stats);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
                         for round_i in current_height_start_i..bft_state.rounds_data.len()
                         {
                             let round_data = &bft_state.rounds_data[round_i];
-                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut bytes_sent);
+                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut net_stats);
                         }
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
                     }
                 }
 
-                if PRINT_BYTES_SENT { println!("Total bytes sent: {}", bytes_sent); }
+                if PRINT_NETWORK_STATS {
+                    println!("Total bytes sent: {}", net_stats.bytes_sent);
+
+                    let elapsed = time_we_started_at.elapsed();
+                    let pps = (net_stats.packets_sent as f32) / (if elapsed.is_zero() { 1f32 } else { elapsed.as_secs_f32() });
+                    println!("Total packets sent: {} ({} packets/s)", net_stats.packets_sent, pps);
+                }
 
                 break;
             }
