@@ -51,9 +51,9 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 
 #[derive(Clone, Debug)]
 pub struct SortedRosterMember {
-    pub_key: PubKeyID,
-    stake: u64,
-    cumulative_stake: u64, // everyone in array prior to this point (used for determining proposer)
+    pub pub_key: PubKeyID,
+    pub stake: u64,
+    pub cumulative_stake: u64, // everyone in array prior to this point (used for determining proposer)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -78,7 +78,7 @@ struct TMVote {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct BlockValue(Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
+pub struct BlockValue(pub Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
 
 #[derive(Clone)]
 pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send>> + Send + Sync + 'static>);
@@ -158,8 +158,9 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
 
     FatPointerToBftBlock3 {
         vote_for_block_without_finalizer_public_key,
-        signatures: round_data.msg_val_sigs[1]
+        signatures: round_data.msg_val_sigs
             .iter()
+            .map(|x| &x[1])
             .enumerate()
             .filter_map(|(roster_i, (value_id, commit_signature))| {
                 if *value_id == round_data.proposal_id && *commit_signature != TMSig::NIL {
@@ -243,7 +244,7 @@ impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PubKeyID([u8; 32]);
+pub struct PubKeyID(pub [u8; 32]);
 impl PubKeyID { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
@@ -1289,8 +1290,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             Box::pin(async move {
                 decisions.lock().unwrap()[height as usize].clone()
             })
-        }))).await
-    }
+        }))
+    ).await
+}
 
 pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> std::io::Result<()> {
     hook_fail_on_panic();
@@ -2155,11 +2157,11 @@ impl PacketVotes {
     }
 }
 
-const PROPOSAL_SEM_SIZE:        usize = 6000;
-const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_CHUNK_SIZE - (1 /* @TodoPacketHeader */ + 56 + 64);
-const PROPOSAL_CHUNK_SIZE:      usize = PATH_MTU;
-const PROPOSAL_CHUNKS_N:        usize = PROPOSAL_SEM_SIZE.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
-const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
+pub const PROPOSAL_SEM_SIZE:        usize = 6000;
+pub const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_CHUNK_SIZE - (1 /* @TodoPacketHeader */ + 56 + 64);
+pub const PROPOSAL_CHUNK_SIZE:      usize = PATH_MTU;
+pub const PROPOSAL_CHUNKS_N:        usize = PROPOSAL_SEM_SIZE.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
+pub const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
 const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
 
 // NOTE(azmr): this is:
