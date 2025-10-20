@@ -2118,7 +2118,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     // ALT:  cache proposer for *current* round
                     if msg.len() == packet_size {
                         if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
-                            let sig_o = 1 /* @TodoPacketHeader */ + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+                            let sig_o = PACKET_HEADER_SIZE /* @TodoPacketHeader */ + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
                             bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
                                 &roster, roster_i, packet_type, &msg[read_o..sig_o], &msg[sig_o..sig_o+64].try_into().unwrap());
                         }
