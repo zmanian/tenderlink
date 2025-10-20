@@ -80,6 +80,7 @@ struct TMVote {
 #[derive(Clone, PartialEq, Debug)]
 pub struct BlockValue(pub Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
 impl BlockValue {
+    fn id_from_value(&self, hash_keys: &HashKeys) -> ValueId { ValueId(hash_keys.value_id.hash(&self.0)) }
     fn chunks_n(&self) -> usize { self.0.len().div_ceil(PROPOSAL_CHUNK_DATA_SIZE) }
     fn chunk_o_size(&self, chunk_i: usize) -> (usize, usize) {
         let o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
@@ -537,7 +538,7 @@ impl TMState {
                 let mut hdr = PacketProposalChunkHeader {
                     height, round, chunk_i: 0,
                     proposal_size: proposal.0.len().try_into().unwrap(),
-                    proposal_id: Self::id_from_value(&self.hash_keys, &proposal),
+                    proposal_id: proposal.id_from_value(&self.hash_keys),
                     valid_round,
                 };
 
@@ -650,10 +651,6 @@ impl TMState {
         self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
     }
 
-    fn id_from_value(hash_keys: &HashKeys, proposal: &BlockValue) -> ValueId {
-        ValueId(hash_keys.value_id.hash(&proposal.0))
-    }
-
     fn f_from_n(n: u64) -> u64 {
         (n - 1) / 3
     }
@@ -676,7 +673,7 @@ impl TMState {
         let from_pub_key = roster[roster_i].pub_key;
 
         // pkt_str += &format!(" from {} ({})", roster_i, from_pub_key);
-        let ctx_str = format!("{} [{} from {} ({:.4}...)]", me_str, pkt_str, roster_i, from_pub_key);
+        let ctx_str = format!("{} [{} from {} {:?}]", me_str, pkt_str, roster_i, from_pub_key);
 
         // check if data was signed by pub key
         let signature = Signature::from_bytes(sig_data);
@@ -812,7 +809,17 @@ impl TMState {
                         }
                     }
 
-                    if PRINT_BFT_UPDATE { println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, round_data.proposal_sigs.len()); }
+                    if round_data.proposal_sigs_n == round_data.proposal_sigs.len() {
+                        let check_value_id = round_data.proposal.id_from_value(&self.hash_keys);
+                        if round_data.proposal_id != check_value_id {
+                            round_data.proposal_is_faulty = true;
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer's value_id does not match our calculation: {} != {}",
+                                ctx_str, round_data.proposal_id, check_value_id);
+                            return TMStatus::Fail;
+                        }
+                    }
+
+                    if PRINT_BFT_UPDATE { println!("{}: update to {}/{} proposal chunks on {}", ctx_str, round_data.proposal_sigs_n, round_data.proposal_sigs.len(), round_data.proposal_id); }
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
