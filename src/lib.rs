@@ -550,7 +550,8 @@ impl TMState {
 
                 for chunk_i in 0..proposal.chunks_n() { // NOTE: excluding packet_type // TODO: check this
                     hdr.chunk_i = chunk_i as u32;
-                    let mut o = hdr.write_to(&mut buf[0..]);
+                    let mut o = 0;
+                    o += hdr.write_to(&mut buf[0..]);
 
                     let (chunk_o, chunk_size) = proposal.chunk_o_size(chunk_i);
                     o += proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut buf[o..]);
@@ -1375,7 +1376,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         SimRng::new(seed, 0)
     }));
 
-    let should_propose_bad_value_sometimes = my_endpoint.is_some(); // peer 0 only
+    let should_propose_bad_value_sometimes = false; // my_endpoint.is_some(); // peer 0 only
 
     let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
@@ -1475,7 +1476,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
     }
 
     let time_we_started_at = tokio::time::Instant::now();
-    let mut net_stats = NetworkStats{
+    let mut net_stats = NetworkStats {
         bytes_sent: 0,
         packets_sent: 0,
     };
@@ -1489,23 +1490,26 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         let ctx_str = bft_state.ctx_str(&roster);
 
         fn read_tag_and_maybe_status(msg: &[u8]) -> std::io::Result<(u8, Option<PacketStatus>, usize)> {
-            let packet_type = msg[0] & PACKET_TYPE_MASK;
-            let mut status = None;
-            let mut o = 1;
-            if (msg[0] & PACKET_TAG_STATUS_FLAG) != 0 {
+            let mut o       = 0;
+            let mut cur     = Cursor::new(&msg[o..]);
+            let header      = PacketHeader::read_from(&mut cur)?;
+            let packet_type = header.tag & PACKET_TYPE_MASK;
+            let mut status  = None;
+            if (header.tag & PACKET_TAG_STATUS_FLAG) != 0 {
                 // TODO: scope down required ranges
-                let mut cur = Cursor::new(&msg[1..]);
                 status = Some(PacketStatus::read_from(&mut cur)?);
-                o += cur.position() as usize;
             }
+            o += cur.position() as usize;
             Ok((packet_type, status, o))
         }
-        fn write_tag_and_maybe_status(packet_type: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
-            send_buf1[0] = packet_type;
-            let mut o = 1;
-            if include_status {
-                send_buf1[0] |= PACKET_TAG_STATUS_FLAG;
+        fn write_tag_and_maybe_status(packet_type: u8, _include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
+            let include_status = (peer_random & 1) != 0; // nocheckin
+            let packet_tag = packet_type | if include_status { PACKET_TAG_STATUS_FLAG } else { 0 }; // @TodoPacketHeader
 
+            let mut o = 0;
+            o += packet_tag.write_to(&mut send_buf1[o..]);
+
+            if include_status {
                 let mut status = PacketStatus {
                     height: bft_state.height,
                     round: bft_state.round,
@@ -1550,7 +1554,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 }
 
-                o += status.write_to(&mut send_buf1[1..]);
+                o += status.write_to(&mut send_buf1[o..]);
             }
             o
         }
@@ -2210,9 +2214,11 @@ impl PacketStatus {
     }
 }
 
+const PACKET_HEADER_SIZE: u8 = 1; // 8 + 8; // 16
 struct PacketHeader {
-    tag_and_ack: u64,
-    ack_field: u64,
+    tag: u8,
+    // tag_and_ack: u64,
+    // ack_field: u64,
 }
 impl PacketHeader {
     const fn assert_valid_tag<const TAG: u8>() {
@@ -2225,23 +2231,28 @@ impl PacketHeader {
     }
     pub fn new_(tag: u8, ack_latest: u64, ack_field: u64) -> PacketHeader {
         PacketHeader {
-            tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TYPE_BITS) << PACKET_TYPE_BITS),
-            ack_field,
+            tag
+            // tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TYPE_BITS) << PACKET_TYPE_BITS),
+            // ack_field,
         }
     }
 
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = self.tag_and_ack.write_to(&mut buf[..]);
-        o += self.ack_field.write_to(&mut buf[8..]);
+        let mut o = 0;
+        o += self.tag.write_to(&mut buf[o..]);
+        // o += self.tag_and_ack.write_to(&mut buf[o..]);
+        // o += self.ack_field  .write_to(&mut buf[o..]);
         o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let tag_and_ack = r.read_u64::<LittleEndian>()?;
-        let ack_field   = r.read_u64::<LittleEndian>()?;
+        let tag = r.read_u8()?;
+        // let tag_and_ack = r.read_u64::<LittleEndian>()?;
+        // let ack_field   = r.read_u64::<LittleEndian>()?;
         Ok(Self {
-            tag_and_ack,
-            ack_field,
+            tag
+            // tag_and_ack,
+            // ack_field,
         })
     }
 }
