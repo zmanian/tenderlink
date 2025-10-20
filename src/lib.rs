@@ -102,7 +102,7 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     }
 }
 #[derive(Clone)]
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClosureToPushDecidedBlock(..)")
@@ -1053,7 +1053,8 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
-                assert!(self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await);
+                let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await;
+                // Note(Sam): @judah and @azmr, use new_roster
                 self.height += 1;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
                 self.rounds_data.retain(|r| r.height < self.height);
@@ -1363,6 +1364,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
 
+    let roster2 = roster.clone();
+
     entry_point(my_root_private_key, my_static_keypair, my_endpoint, roster, roster_endpoint_evidence, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
@@ -1383,9 +1386,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         })),
         ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer| {
             let decisions = Arc::clone(&decisions);
+            let roster2 = roster2.clone();
             Box::pin(async move {
                 decisions.lock().unwrap().push((block, fat_pointer));
-                true
+                let mut ret = roster2.clone();
+                // Note(Sam): @judah, make sure this works
+                //ret.truncate(3 + decisions.lock().unwrap().len() % 2);
+                ret
             })
         })),
         ClosureToGetHistoricalBlock(Arc::new(move |height| {
@@ -1414,8 +1421,15 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
     });
 
-    // TODO(Phillip) enable dual-stack on Windows using setsockopt(IPV6_V6ONLY, false). This is very important!!!
-    let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
+    let sock = {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket.set_only_v6(false).unwrap(); // Sets IPV6_V6ONLY to 0 for dual-stack (required for win32)
+        socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0).into()).unwrap();
+        tokio::net::UdpSocket::from_std(socket.into()).unwrap()
+    };
+
     let my_port = sock.local_addr().unwrap().port();
 
     let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_key.as_ref())
@@ -2466,7 +2480,8 @@ pub fn run_instances(i: usize) {
 
     let endpoint_zero : SecureUdpEndpoint = {
         let port : u16 = 3030;
-        let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
+        // let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
+        let ip = "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped();
         SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public }
     };
 
