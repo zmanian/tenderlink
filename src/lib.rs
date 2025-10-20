@@ -806,7 +806,7 @@ impl TMState {
                         if prev_sig_had_fault { // recompute from scratch
                             // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
                             let mut check_counts = ConsensusCounts::ZERO;
-                            for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                            for (_, sig) in round_data.msg_val_sigs.iter().enumerate() {
                                 check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
                             }
                             round_data.counts = check_counts;
@@ -904,7 +904,7 @@ impl TMState {
 
                 if true {
                     let mut check_counts = ConsensusCounts::ZERO;
-                    for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                    for (_, sig) in round_data.msg_val_sigs.iter().enumerate() {
                         check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
                     }
                     if check_counts != round_data.counts {
@@ -1505,7 +1505,6 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
-        // @TodoHeaderAndStatus
         fn read_header_and_maybe_status(msg: &[u8]) -> std::io::Result<(PacketHeader, Option<PacketStatus>, usize)> {
             let mut o   = 0;
             let mut cur = Cursor::new(&msg[o..]);
@@ -1520,12 +1519,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             Ok((header, status, o))
         }
 
-        // @TodoHeaderAndStatus
-        fn write_tag_and_maybe_status(packet_type: u8, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
-            let packet_tag = packet_type | if include_status { PACKET_TAG_STATUS_FLAG } else { 0 }; // @TodoPacketHeader
+        fn write_header_and_maybe_status(header_: PacketHeader, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
+            let mut header = header_;
+            header.tag |= if include_status { PACKET_TAG_STATUS_FLAG } else { 0 }; // @TodoPacketHeader
 
             let mut o = 0;
-            o += packet_tag.write_to(&mut send_buf1[o..]);
+            o += header.write_to(&mut send_buf1[o..]);
 
             if include_status {
                 let mut status = PacketStatus {
@@ -1630,8 +1629,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
                         } else {
-                            let mut o = 0; // @TodoPacketHeader
-                            o += write_tag_and_maybe_status(PACKET_TYPE_EMPTY, true, &bft_state, &roster, &mut send_buf1[..], peer.on_send_next_nonce);
+                            let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.nonce_ack_latest, peer.nonce_ack_field);
+                            let mut o  = 0;
+                            o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.on_send_next_nonce);
                             send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
@@ -2123,7 +2123,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     // ALT:  cache proposer for *current* round
                     if msg.len() == packet_size {
                         if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
-                            let sig_o = 1 /* @TodoPacketHeader */ + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+                            let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
                             bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
                                 &roster, roster_i, packet_type, &msg[read_o..sig_o], &msg[sig_o..sig_o+64].try_into().unwrap());
                         }
@@ -2272,7 +2272,7 @@ impl PacketHeader {
         Self::assert_valid_tag::<TAG>();
         Self::new_(TAG, ack_latest, ack_field)
     }
-    pub fn new_(tag: u8, ack_latest: u64, ack_field: u64) -> PacketHeader {
+    pub fn new_(tag: u8, _ack_latest: u64, _ack_field: u64) -> PacketHeader {
         PacketHeader {
             tag
             // tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TYPE_BITS) << PACKET_TYPE_BITS),
