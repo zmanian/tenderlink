@@ -287,6 +287,25 @@ struct RoundData {
     timeout_triggered: [bool; 2],
 }
 impl RoundData {
+    const EMPTY: RoundData = RoundData {
+        height: 0,
+        round: 0,
+        proposal: BlockValue(Vec::new()), // NOTE(azmr): don't alloc until we know the size (signed by proposer)
+        proposal_valid_round: -1,
+        proposal_sigs: Vec::new(),
+        proposal_sigs_n: 0,
+        proposal_id: ValueId::NIL,
+        proposal_checked_validity: TMStatus::Indeterminate,
+        proposal_is_faulty: false,
+        // TODO: probably put both step messages next to each other
+        msg_val_sigs: Vec::new(),
+        roster: Vec::new(),
+        counts: ConsensusCounts::ZERO,
+
+        active_timeout: None,
+        timeout_triggered: [false;2],
+    };
+
     // ALT: "has_enough_info_to_determine_proposal_validity"
     fn has_full_proposal(&self) -> bool {
         self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
@@ -595,20 +614,8 @@ impl TMState {
             height: self.height,
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
-            proposal_valid_round: -1,
-            // NOTE(azmr): don't alloc until we know the size (signed by proposer)
-            proposal: BlockValue(Vec::with_capacity(0)),
-            proposal_sigs: Vec::with_capacity(0),
-            proposal_sigs_n: 0,
-            proposal_id: ValueId::NIL,
-            proposal_checked_validity: TMStatus::Indeterminate,
-            proposal_is_faulty: false,
-            // TODO: probably put both step messages next to each other
-            counts: ConsensusCounts::ZERO,
             roster: roster.to_vec(),
-
-            active_timeout: None,
-            timeout_triggered: [false;2],
+            ..RoundData::EMPTY
         });
         insert_i
     }
@@ -694,6 +701,31 @@ impl TMState {
         };
         let round_data = &mut self.rounds_data[round_i];
 
+        // TODO: Keep a dynamic array to solve the "Amnesiac Proposer's Dilemma".
+        //       If I propose my block for this height and round, but then my
+        //       computer gets unplugged, I've forgotten block history and need to
+        //       catch back up to the network's consensus height. However, on the
+        //       way there, I'll sometimes propose new values. (This is expected,
+        //       arguably, since we never truly know whether we're at the top of
+        //       the consensus height.) However, in the process of catching up I
+        //       may get my own *different* signed proposal that was already decided!
+        //       Normally we would mark that proposer as faulty/adversarial, but we
+        //       assume that we are never faulty, and must therefore be "amnesic".
+        //       In Byzantine scenarios I may have been unplugged arbitrarily
+        //       many times and be receiving arbitrarily many validly signed
+        //       proposals of my own making, with even some signed precommits.
+        //       We'll observe multiple competing proposals, all signed by us, all
+        //       equally valid candidates for the decisive proposal, any of which
+        //       may establish consensus. We won't know until we see 2f+1 precommits.
+        //       We need to let these precommits *race*, until we observe 2f+1
+        //       stake being precommitted to *any* of our proposals, at which
+        //       point we accept *that* proposal as decisive. (There will never
+        //       be multiple proposals with 2f+1 precommits unless the BFT
+        //       network is faulty; we just need to wait and see which one
+        //       is the decisive one.)  -Phil 2025-10-20
+        // NOTE: @Incomplete: for now, only track the latest proposal.
+        let is_my_proposal = (from_pub_key == self.my_pub_key);
+
         match packet_type {
             PACKET_TYPE_PROPOSAL_CHUNK => {
                 let Ok(hdr) = PacketProposalChunkHeader::read_from(signed_data) else {
@@ -702,22 +734,44 @@ impl TMState {
 
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
-                    if round_data.proposal.0.len() != hdr.proposal_size as usize {
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
-                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
-                        return TMStatus::Fail;
-                    }
-                    if round_data.proposal_id != value_id {
-                        // TODO: immediately class both as invalid?
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
-                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
-                        return TMStatus::Fail;
-                    }
-                    if round_data.proposal_valid_round != valid_round {
-                        // TODO: immediately class both as invalid
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
-                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
-                        return TMStatus::Fail;
+                    if is_my_proposal &&
+                      (round_data.proposal.0.len() != hdr.proposal_size as usize ||
+                       round_data.proposal_id != value_id ||
+                       round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
+                        // Flush proposal id/votes. @Robustness @Duplicate: how to tersely flush the round?
+                        let roster_n = active_roster_len(roster);
+                        *round_data = RoundData {
+                            height:               round_data.height,
+                            round:                round_data.round,
+                            proposal_id:          value_id,
+                            proposal_valid_round: valid_round,
+                            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
+                            roster:               Vec::from(&roster[0..roster_n]),
+                            active_timeout:       round_data.active_timeout.clone(),
+                            timeout_triggered:    round_data.timeout_triggered,
+                            ..RoundData::EMPTY
+                        };
+                        round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
+                        round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                        eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
+                    } else {
+                        if round_data.proposal.0.len() != hdr.proposal_size as usize {
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
+                            return TMStatus::Fail;
+                        }
+                        if round_data.proposal_id != value_id {
+                            // TODO: immediately class both as invalid?
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
+                            return TMStatus::Fail;
+                        }
+                        if round_data.proposal_valid_round != valid_round {
+                            // TODO: immediately class both as invalid
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
+                            return TMStatus::Fail;
+                        }
                     }
                 } else {
                     round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
@@ -762,10 +816,29 @@ impl TMState {
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
-                    // TODO: treat this as a failed is_valid & early out before awaiting full proposal
-                    round_data.proposal_is_faulty = true;
-                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
-                    return TMStatus::Fail;
+                    if is_my_proposal { // Amnesiac Proposer's Dilemma
+                        // Flush proposal id/votes. @Robustness @Duplicate: how to tersely flush the round?
+                        let roster_n = active_roster_len(roster);
+                        *round_data = RoundData {
+                            height:               round_data.height,
+                            round:                round_data.round,
+                            proposal_id:          value_id,
+                            proposal_valid_round: valid_round,
+                            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
+                            roster:               Vec::from(&roster[0..roster_n]),
+                            active_timeout:       round_data.active_timeout.clone(),
+                            timeout_triggered:    round_data.timeout_triggered,
+                            ..RoundData::EMPTY
+                        };
+                        round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
+                        round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                        eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
+                    } else {
+                        // TODO: treat this as a failed is_valid & early out before awaiting full proposal
+                        round_data.proposal_is_faulty = true;
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
+                        return TMStatus::Fail;
+                    }
                 } else {
                     return TMStatus::Pass; // already good
                 }
@@ -1534,7 +1607,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster).await;
 
-                fn broadcast_round_data(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
+                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer: &mut Peer, sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1549,110 +1622,108 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let mut sent_chunk_cs = 0;
                     let mut sent_c: [usize; 2] = [0; 2];
 
-                    for peer in &mut peers[..] {
-                        if round_data.proposal_sigs_n > 0 {
-                            for chunk_i in 0..round_data.proposal_sigs.len() {
-                                // send all of the proposal chunks we've seen
-                                if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
-                                    hdr.chunk_i = chunk_i as u32;
-                                    let mut o = PACKET_TYPE_PROPOSAL_CHUNK.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
-                                    o        += hdr                       .write_to(&mut send_buf1[o..]);
+                    if round_data.proposal_sigs_n > 0 {
+                        for chunk_i in 0..round_data.proposal_sigs.len() {
+                            // send all of the proposal chunks we've seen
+                            if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
+                                hdr.chunk_i = chunk_i as u32;
+                                let mut o = PACKET_TYPE_PROPOSAL_CHUNK.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
+                                o += hdr.write_to(&mut send_buf1[o..]);
 
-                                    let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
-                                    o += round_data.proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut send_buf1[o..]);
-                                    let sig_o = o;
-                                    o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
+                                let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
+                                o += round_data.proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut send_buf1[o..]);
+                                let sig_o = o;
+                                o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
-                                    if true { // self-check signatures as sanity check
-                                        let sig = Signature::from_bytes(&round_data.proposal_sigs[chunk_i].0);
-                                        let vk = match VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
-                                            eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
-                                            continue;
-                                        }};
-                                        match vk.verify(&sig, &send_buf1[1..sig_o]) { Ok(_)=>{}, Err(err)=>{
-                                            eprintln!("{}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
-                                                ctx_str, proposer_pub_key, height, round, chunk_i, sig_o-1, hdr.proposal_id, err);
-                                            continue;
-                                        }}
-                                    }
+                                if true { // self-check signatures as sanity check
+                                    let sig = Signature::from_bytes(&round_data.proposal_sigs[chunk_i].0);
+                                    let vk = match VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
+                                        eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
+                                        continue;
+                                    }};
+                                    match vk.verify(&sig, &send_buf1[1..sig_o]) { Ok(_)=>{}, Err(err)=>{
+                                        eprintln!("{}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
+                                            ctx_str, proposer_pub_key, height, round, chunk_i, sig_o-1, hdr.proposal_id, err);
+                                        continue;
+                                    }}
+                                }
 
+                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                    if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
+                                    sent_chunk_cs += 1;
+                                    *bytes_sent += o;
+                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
+                                }
+                            }
+                        }
+                    }
+
+                    let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
+                    for is_precommit in vote_start..2 {
+                        if  (is_precommit == 0 && round_data.counts.prevotes   == 0) ||
+                            (is_precommit == 1 && round_data.counts.precommits == 0)
+                        {
+                            continue;
+                        }
+
+                        let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit; // TODO: maybe include status
+                        let mut packet = PacketVotes {
+                            height, round,
+                            value_id: hdr.proposal_id,
+                            no_votes_n: 0, yes_votes_n: 0,
+                            votes: [ PubKeySig::NIL; 18 ],
+                        };
+
+                        for roster_i in 0..round_data.msg_val_sigs.len() {
+                            let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
+                            if sig != TMSig::NIL {
+                                let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
+                                // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
+
+                                // add nos and yeses from opposite ends to avoid excess moves
+                                if value_id == ValueId::NIL {
+                                    packet.votes[packet.no_votes_n as usize] = pub_key_sig;
+                                    packet.no_votes_n += 1;
+                                } else {
+                                    packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
+                                    packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
+                                };
+
+                                if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
+                                    sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
+                                    // full evidence block; send it
+                                    if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
+                                    // TODO: maybe status
+                                    let mut o = packet_type.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
+                                    o        += packet     .write_to(&mut send_buf1[o..]);
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
-                                        sent_chunk_cs += 1;
                                         *bytes_sent += o;
                                         send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
                                     }
+
+                                    packet.no_votes_n  = 0;
+                                    packet.yes_votes_n = 0;
+                                    packet.votes       = [ PubKeySig::NIL; 18 ];
                                 }
                             }
                         }
 
-                        let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
-                        for is_precommit in vote_start..2 {
-                            if  (is_precommit == 0 && round_data.counts.prevotes   == 0) ||
-                                (is_precommit == 1 && round_data.counts.precommits == 0)
-                            {
-                                continue;
+                        // send any half-filled vote blocks
+                        if (packet.no_votes_n + packet.yes_votes_n) > 0 {
+                            sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
+                            // println!("{}: half-filled block pre-gap-close: {:#?}", ctx_str, packet);
+                            // move items from end to fill gap
+                            for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
+                                packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                             }
 
-                            let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit; // TODO: maybe include status
-                            let mut packet = PacketVotes {
-                                height, round,
-                                value_id: hdr.proposal_id,
-                                no_votes_n: 0, yes_votes_n: 0,
-                                votes: [ PubKeySig::NIL; 18 ],
-                            };
-
-                            for roster_i in 0..round_data.msg_val_sigs.len() {
-                                let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
-                                if sig != TMSig::NIL {
-                                    let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
-                                    // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
-
-                                    // add nos and yeses from opposite ends to avoid excess moves
-                                    if value_id == ValueId::NIL {
-                                        packet.votes[packet.no_votes_n as usize] = pub_key_sig;
-                                        packet.no_votes_n += 1;
-                                    } else {
-                                        packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
-                                        packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
-                                    };
-
-                                    if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
-                                        sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
-                                        // full evidence block; send it
-                                        if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
-                                        // TODO: maybe status
-                                        let mut o = packet_type.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
-                                        o        += packet     .write_to(&mut send_buf1[o..]);
-                                        if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                            *bytes_sent += o;
-                                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o]);
-                                        }
-
-                                        packet.no_votes_n  = 0;
-                                        packet.yes_votes_n = 0;
-                                        packet.votes       = [ PubKeySig::NIL; 18 ];
-                                    }
-                                }
-                            }
-
-                            // send any half-filled vote blocks
-                            if (packet.no_votes_n + packet.yes_votes_n) > 0 {
-                                sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
-                                // println!("{}: half-filled block pre-gap-close: {:#?}", ctx_str, packet);
-                                // move items from end to fill gap
-                                for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
-                                    packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
-                                }
-
-                                if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
-                                send_buf1[0] = packet_type;
-                                // TODO: maybe status
-                                let len1 = 1 /* @TodoPacketHeader */ + packet.write_to(&mut send_buf1[1..]);
-                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                    *bytes_sent += len1;
-                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
-                                }
+                            if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
+                            send_buf1[0] = packet_type;
+                            // TODO: maybe status
+                            let len1 = 1 /* @TodoPacketHeader */ + packet.write_to(&mut send_buf1[1..]);
+                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                *bytes_sent += len1;
+                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..len1]);
                             }
                         }
                     }
@@ -1670,35 +1741,32 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 }
 
                 if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|p|
-                        (PubKeyID(p.root_public_key), p.latest_status.clone(), p.connection_is_unknown)
+                    (PubKeyID(p.root_public_key), p.latest_status.clone(), p.connection_is_unknown)
                 ).collect::<Vec<_>>()); }
 
                 for peer_i in 0..peers.len() {
-                    if let Some(height) = peers[peer_i].unacted_upon_status_height {
-                        if height >= bft_state.height { continue; }
-                        peers[peer_i].unacted_upon_status_height = None;
-
-                        broadcast_round_data(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                    let peer = &mut peers[peer_i];
+                    if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
+                        peer.unacted_upon_status_height = None;
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut bytes_sent);
                     }
-                }
-
-
-                if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
-                {
-                    for round_i in current_height_start_i..bft_state.rounds_data.len()
+                    else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
-                        let round_data = &bft_state.rounds_data[round_i];
-
-                        broadcast_round_data(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        for round_i in current_height_start_i..bft_state.rounds_data.len()
+                        {
+                            let round_data = &bft_state.rounds_data[round_i];
+                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut bytes_sent);
+                        }
+                    } else {
+                        eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
                     }
-                } else {
-                    todo!();
                 }
 
                 if PRINT_BYTES_SENT { println!("Total bytes sent: {}", bytes_sent); }
 
                 break;
             }
+
             let now_now = tokio::time::Instant::now();
             if now_now - next_tick_time > TICK_DURATION {
                 next_tick_time = now_now + TICK_DURATION;
