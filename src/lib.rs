@@ -1414,8 +1414,15 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
     });
 
-    // TODO(Phillip) enable dual-stack on Windows using setsockopt(IPV6_V6ONLY, false). This is very important!!!
-    let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
+    let sock = {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket.set_only_v6(false).unwrap(); // Sets IPV6_V6ONLY to 0 for dual-stack (required for win32)
+        socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0).into()).unwrap();
+        tokio::net::UdpSocket::from_std(socket.into()).unwrap()
+    };
+
     let my_port = sock.local_addr().unwrap().port();
 
     let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_key.as_ref())
@@ -2447,7 +2454,8 @@ pub fn run_instances(i: usize) {
 
     let endpoint_zero : SecureUdpEndpoint = {
         let port : u16 = 3030;
-        let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
+        // let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
+        let ip = "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped();
         SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public }
     };
 
