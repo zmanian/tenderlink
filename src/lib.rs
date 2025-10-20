@@ -79,6 +79,13 @@ struct TMVote {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct BlockValue(pub Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
+impl BlockValue {
+    fn chunks_n(&self) -> usize { self.0.len().div_ceil(PROPOSAL_CHUNK_DATA_SIZE) }
+    fn chunk_o_size(&self, chunk_i: usize) -> (usize, usize) {
+        let o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
+        (o, usize::min(PROPOSAL_CHUNK_DATA_SIZE, self.0.len() - o))
+    }
+}
 
 #[derive(Clone)]
 pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send>> + Send + Sync + 'static>);
@@ -262,8 +269,8 @@ struct RoundData {
     // TODO: keep parallel with each other, but be sparse in members
     proposal: BlockValue,
     proposal_valid_round: i64,
-    proposal_sigs:  [TMSig; PROPOSAL_CHUNKS_N], // [Signature; PROPOSAL_CHUNKS_N],
-    proposal_sigs_n: usize,
+    proposal_sigs: Vec<TMSig>,
+    proposal_sigs_n: usize, // filling sigs with random-access
     proposal_id: ValueId,
     proposal_checked_validity: TMStatus,
     // TODO: handle early outs because of this
@@ -280,30 +287,15 @@ struct RoundData {
     timeout_triggered: [bool; 2],
 }
 impl RoundData {
-    const EMPTY: RoundData = RoundData {
-        height: 0,
-        round: 0,
-        proposal: BlockValue(Vec::new()),
-        proposal_valid_round: -1,
-        proposal_sigs: [TMSig::NIL; PROPOSAL_CHUNKS_N],
-        proposal_sigs_n: 0,
-        proposal_id: ValueId::NIL,
-        proposal_checked_validity: TMStatus::Indeterminate,
-        proposal_is_faulty: false,
-        // TODO: probably put both step messages next to each other
-        msg_val_sigs: Vec::new(),
-        roster: Vec::new(),
-        counts: ConsensusCounts::ZERO,
-
-        active_timeout: None,
-        timeout_triggered: [false;2],
-    };
-
+    // ALT: "has_enough_info_to_determine_proposal_validity"
+    fn has_full_proposal(&self) -> bool {
+        self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
+    }
     // auto-caching
     async fn proposal_is_valid(&mut self, validate_closure: ClosureToValidateProposedBlock) -> TMStatus {
-        // TODO: may want to start doing some of these on < PROPOSAL_CHUNKS_N, i.e. shortcut known-invalid
+        // TODO: may want to start doing some of these on < proposal_chunks_n, i.e. shortcut known-invalid
         if (self.proposal_checked_validity == TMStatus::Indeterminate &&
-            self.proposal_sigs_n == PROPOSAL_CHUNKS_N) {
+            self.has_full_proposal()) {
             self.proposal_checked_validity = validate_closure.0(&self.proposal).await;
         }
         self.proposal_checked_validity
@@ -434,18 +426,28 @@ const ROSTER_MAX_N: usize = 100;
 fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
+#[derive(PartialEq, Debug, Clone, Copy)]
+struct HashKey([u8; 32]);
+impl HashKey { const NIL: Self = Self([0;32]); }
+impl HashKey {
+    fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
+    fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
+}
+
 #[derive(Debug)]
 struct HashKeys {
-    proposer: [u8; 32],
-    value_id: [u8; 32],
-    connect_contention: [u8; 32],
+    proposer: HashKey,
+    value_id: HashKey,
+    connect_contention: HashKey,
+    proposal_sig: HashKey,
 }
 impl Default for HashKeys {
     fn default() -> Self {
         Self {
-            proposer:           blake3::Hasher::new_derive_key("BFT Proposer")          .finalize().into(),
-            value_id:           blake3::Hasher::new_derive_key("BFT Value ID")          .finalize().into(),
-            connect_contention: blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into(), // NOTE(azmr): skipping update
+            proposer:           HashKey(blake3::Hasher::new_derive_key("BFT Proposer")          .finalize().into()),
+            value_id:           HashKey(blake3::Hasher::new_derive_key("BFT Value ID")          .finalize().into()),
+            connect_contention: HashKey(blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into()), // NOTE(azmr): skipping update
+            proposal_sig:       HashKey(blake3::Hasher::new_derive_key("BFT Proposal Signature").finalize().into()),
         }
     }
 }
@@ -515,16 +517,17 @@ impl TMState {
             TMMsgData::Proposal(proposal, valid_round) => {
                 let mut hdr = PacketProposalChunkHeader {
                     height, round, chunk_i: 0,
+                    proposal_size: proposal.0.len().try_into().unwrap(),
                     proposal_id: Self::id_from_value(&self.hash_keys, &proposal),
                     valid_round,
                 };
 
-                for chunk_i in 0..PROPOSAL_CHUNKS_N { // NOTE: excluding packet_type // TODO: check this
+                for chunk_i in 0..proposal.chunks_n() { // NOTE: excluding packet_type // TODO: check this
                     hdr.chunk_i = chunk_i as u32;
                     let mut o = hdr.write_to(&mut buf[0..]);
 
-                    let chunk_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
-                    o += proposal.0[chunk_o..chunk_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut buf[o..]);
+                    let (chunk_o, chunk_size) = proposal.chunk_o_size(chunk_i);
+                    o += proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut buf[o..]);
 
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
@@ -543,7 +546,7 @@ impl TMState {
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
                 if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
-                let packet_type         = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
+                let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
 
@@ -565,7 +568,7 @@ impl TMState {
         }
 
         // NOTE(azmr): this 32-byte crypto-hashing is almost certainly overkill!
-        let hash = blake3::Hasher::new_keyed(&hash_keys.proposer).update(&u64::to_le_bytes(height)).update(&u32::to_le_bytes(round)).finalize();
+        let hash = hash_keys.proposer.hasher().update(&u64::to_le_bytes(height)).update(&u32::to_le_bytes(round)).finalize();
 
         let mut hash_stake_bytes = [0; 8];
         hash.as_bytes()[..8].write_to(&mut hash_stake_bytes);
@@ -588,14 +591,25 @@ impl TMState {
 
     fn insert_round(&mut self, insert_i: usize, round: u32, roster: &[SortedRosterMember]) -> usize {
         let roster_n = active_roster_len(roster);
-        self.rounds_data.insert(insert_i, RoundData{
+        self.rounds_data.insert(insert_i, RoundData {
             height: self.height,
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
-            roster: Vec::from(&roster[0..roster_n]),
-            ..RoundData::EMPTY
+            proposal_valid_round: -1,
+            // NOTE(azmr): don't alloc until we know the size (signed by proposer)
+            proposal: BlockValue(Vec::with_capacity(0)),
+            proposal_sigs: Vec::with_capacity(0),
+            proposal_sigs_n: 0,
+            proposal_id: ValueId::NIL,
+            proposal_checked_validity: TMStatus::Indeterminate,
+            proposal_is_faulty: false,
+            // TODO: probably put both step messages next to each other
+            counts: ConsensusCounts::ZERO,
+            roster: roster.to_vec(),
+
+            active_timeout: None,
+            timeout_triggered: [false;2],
         });
-        self.rounds_data[insert_i].proposal = BlockValue(vec![0_u8; PROPOSAL_BUF_SIZE]); // TODO: variable size support.
         insert_i
     }
 
@@ -626,7 +640,7 @@ impl TMState {
     }
 
     fn id_from_value(hash_keys: &HashKeys, proposal: &BlockValue) -> ValueId {
-        ValueId(*blake3::keyed_hash(&hash_keys.value_id, &proposal.0[..PROPOSAL_SEM_SIZE]).as_bytes())
+        ValueId(hash_keys.value_id.hash(&proposal.0))
     }
 
     fn f_from_n(n: u64) -> u64 {
@@ -672,40 +686,49 @@ impl TMState {
 
         let (is_prev_seen_round, round_i) = match self.rounds_data.binary_search_by_key(&(height, round), |el| (el.height, el.round)) {
             Ok(round_i)  => (true,  round_i),
-            Err(round_i) => (false, round_i),
+            Err(round_i) => (false, self.insert_round(round_i, round, roster)),
         };
-
-        if ! is_prev_seen_round {
-            self.insert_round(round_i, round, roster);
-        }
         let round_data = &mut self.rounds_data[round_i];
 
         match packet_type {
             PACKET_TYPE_PROPOSAL_CHUNK => {
+                let Ok(hdr) = PacketProposalChunkHeader::read_from(signed_data) else {
+                    return TMStatus::Fail
+                };
+
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
+                    if round_data.proposal.0.len() != hdr.proposal_size as usize {
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
+                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
+                        return TMStatus::Fail;
+                    }
                     if round_data.proposal_id != value_id {
-                        // TODO: immediately class both as invalid
+                        // TODO: immediately class both as invalid?
                         eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
-                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
+                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
                         return TMStatus::Fail;
                     }
                     if round_data.proposal_valid_round != valid_round {
                         // TODO: immediately class both as invalid
                         eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
-                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
+                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
                         return TMStatus::Fail;
                     }
+                } else {
+                    round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
+                    round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
                 }
 
                 // Preliminary checks now finished (although not infallible from here) //////////////////////////
 
                 // TODO: check expected proposer here if not above
-                let chunk_data = &signed_data[PacketProposalChunkHeader::SERIALIZED_SIZE..PacketProposalChunkHeader::SERIALIZED_SIZE+PROPOSAL_CHUNK_DATA_SIZE];
+                let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
+                let packet_chunk_o        = PacketProposalChunkHeader::SERIALIZED_SIZE;
+                let chunk_data            = &signed_data[packet_chunk_o..packet_chunk_o + chunk_size];
 
                 if round_data.proposal_sigs[chunk_i] == TMSig::NIL { // value chunk not seen before
-                    let o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
-                    chunk_data.write_to(&mut round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
+                    chunk_data.write_to(&mut round_data.proposal.0[chunk_o..chunk_o+chunk_size]);
                     round_data.proposal_sigs[chunk_i] = sig;
                     round_data.proposal_sigs_n       += 1;
                     round_data.proposal_valid_round   = valid_round;
@@ -731,8 +754,7 @@ impl TMState {
                         }
                     }
 
-                    if PRINT_BFT_UPDATE { println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, PROPOSAL_CHUNKS_N); }
-                    // println!("{}: chunk data:\n{:?}", ctx_str, &round_data.proposal.0[o..o+PROPOSAL_CHUNK_DATA_SIZE]);
+                    if PRINT_BFT_UPDATE { println!("{}: update to {}/{} proposal chunks", ctx_str, round_data.proposal_sigs_n, round_data.proposal_sigs.len()); }
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
@@ -832,14 +854,15 @@ impl TMState {
 
         for i in current_height_start_i..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
+
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
             if PRINT_BFT_STATE {
-                println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
+                println!("{} {}={}.{}, {}/{}, {}", ctx_str,
                     ["!","="][is_current_height_and_round as usize],
                     self.rounds_data[i].height, self.rounds_data[i].round,
-                    self.rounds_data[i].proposal_sigs_n,
+                    self.rounds_data[i].proposal_sigs_n, self.rounds_data[i].proposal_sigs.len(),
                     self.rounds_data[i].proposal_valid_round
                 );
              }
@@ -852,7 +875,7 @@ impl TMState {
             // > while step_p = propose do
             // TODO: merge conditionals with below, they massively overlap
             if (is_current_height_and_round &&
-                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N && // we have received the proposal value
+                self.rounds_data[i].has_full_proposal() && // we have received the proposal value
                 self.rounds_data[i].proposal_valid_round == -1 &&
                 self.step == TMStep::Propose)
             {
@@ -874,7 +897,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, vr> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, vr, id(v)>
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
-                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
+                self.rounds_data[i].has_full_proposal() &&
                 2*f+1 <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
@@ -908,7 +931,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, ∗> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, round_p, id(v)>
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
-                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
+                self.rounds_data[i].has_full_proposal() &&
                 2*f+1 <= counts.yes_prevotes &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
@@ -948,7 +971,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, r, v, ∗> from proposer(h_p, r) AND 2f+1 <PRECOMMIT, h_p, r, id(v)>
             // > while decision_p[h_p] = nil do
             if (self.height == self.rounds_data[i].height && // any round
-                self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
+                self.rounds_data[i].has_full_proposal() &&
                 2*f+1 <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
@@ -1158,8 +1181,8 @@ impl std::fmt::Debug for SecureUdpEndpoint {
 // returns true if a is initiator
 fn contended_noise_is_initiator(hash_keys: &HashKeys, a: &[u8; 32], b: &[u8; 32]) -> bool {
     // TODO: do we want a fast insecure hash for this kind of thing?
-    let a_to_b_hash = blake3::Hasher::new_keyed(&hash_keys.connect_contention).update(a).update(b).finalize();
-    let b_to_a_hash = blake3::Hasher::new_keyed(&hash_keys.connect_contention).update(b).update(a).finalize();
+    let a_to_b_hash = hash_keys.connect_contention.hasher().update(a).update(b).finalize();
+    let b_to_a_hash = hash_keys.connect_contention.hasher().update(b).update(a).finalize();
     a_to_b_hash.as_bytes() <= b_to_a_hash.as_bytes()
 }
 
@@ -1221,7 +1244,7 @@ fn make_vote_sign_datas(pub_key: [u8; 32], is_precommit: bool, height: u64, roun
 }
 
 pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize; 2]> {
-    let mut rngs: Vec<[usize;2]> = Vec::with_capacity(PROPOSAL_CHUNKS_N);
+    let mut rngs: Vec<[usize;2]> = Vec::with_capacity(n);
     let mut filled_c = 0; // consecutive fills
     let mut rng = [0, 0];
     // TODO(perf): these can be split arbitrarily & merged if we wanted to go wide
@@ -1249,7 +1272,7 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     rngs
 }
 
-async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
+async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
     let block_rng = Arc::new(Mutex::new({
         let seed : u128 = maybe_seed.clone().unwrap_or_else(||{
             let mut seed_rng = rand::rng();
@@ -1257,9 +1280,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         });
         SimRng::new(seed, 0)
     }));
-    
+
     let should_propose_bad_value_sometimes = my_endpoint.is_some(); // peer 0 only
-    
+
     let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
 
@@ -1267,7 +1290,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
-                let mut buf = vec![0_u8; PROPOSAL_BUF_SIZE];
+                let mut buf = vec![0; 6000]; // TODO: replace with real data
                 block_rng.lock().unwrap().fill_bytes(&mut buf);
                 if should_propose_bad_value_sometimes == false { buf[0] = 0; }
                 Some(BlockValue(buf))
@@ -1275,7 +1298,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         })),
         ClosureToValidateProposedBlock(Arc::new(move |block| {
             Box::pin(async move {
-                if block.0[0] % 2 == 0 { TMStatus::Pass }
+                if block.0.len() == 0 { TMStatus::Fail }
+                else if block.0[0] % 2 == 0 { TMStatus::Pass }
                 //else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
                 else { TMStatus::Fail }
             })
@@ -1512,6 +1536,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                     let mut hdr = PacketProposalChunkHeader {
                         height, round, chunk_i: 0,
+                        proposal_size: round_data.proposal.0.len().try_into().unwrap(),
                         proposal_id: round_data.proposal_id,
                         valid_round: round_data.proposal_valid_round,
                     };
@@ -1522,15 +1547,15 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                     for peer in &mut peers[..] {
                         if round_data.proposal_sigs_n > 0 {
-                            for chunk_i in 0..PROPOSAL_CHUNKS_N {
+                            for chunk_i in 0..round_data.proposal_sigs.len() {
                                 // send all of the proposal chunks we've seen
                                 if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                     hdr.chunk_i = chunk_i as u32;
                                     let mut o = PACKET_TYPE_PROPOSAL_CHUNK.write_to(&mut send_buf1[ ..]); // @TodoPacketHeader
                                     o        += hdr                       .write_to(&mut send_buf1[o..]);
 
-                                    let chunk_o = chunk_i * PROPOSAL_CHUNK_DATA_SIZE;
-                                    o += round_data.proposal.0[chunk_o..chunk_o + PROPOSAL_CHUNK_DATA_SIZE].write_to(&mut send_buf1[o..]);
+                                    let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
+                                    o += round_data.proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut send_buf1[o..]);
                                     let sig_o = o;
                                     o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
@@ -1931,20 +1956,27 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 }
 
-                PACKET_TYPE_PROPOSAL_CHUNK => if msg.len() == PROPOSAL_CHUNK_SIZE {
+                PACKET_TYPE_PROPOSAL_CHUNK => {
                     let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v)=>v, Err(err)=>{
                         eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
                         continue;
                     }};
+                    let proposal_size = hdr.proposal_size as usize;
+                    let chunk_i       = hdr.chunk_i       as usize;
+                    let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
+                    let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
+
                     // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
                     // ALT:  cache proposer for *current* round
-                    if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
-                        let sig_o = 1 /* @TodoPacketHeader */ + PacketProposalChunkHeader::SERIALIZED_SIZE + PROPOSAL_CHUNK_DATA_SIZE;
-                        bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                            &roster, roster_i, packet_type, &msg[read_o..sig_o], &msg[sig_o..sig_o+64].try_into().unwrap());
-                    };
-                } else {
-                    eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
+                    if msg.len() == packet_size {
+                        if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
+                            let sig_o = 1 /* @TodoPacketHeader */ + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+                            bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
+                                &roster, roster_i, packet_type, &msg[read_o..sig_o], &msg[sig_o..sig_o+64].try_into().unwrap());
+                        }
+                    } else {
+                        eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
+                    }
                 }
 
                 PACKET_TYPE_PREVOTE_SIGNATURES | PACKET_TYPE_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[read_o..]) {
@@ -2151,12 +2183,8 @@ impl PacketVotes {
     }
 }
 
-pub const PROPOSAL_SEM_SIZE:        usize = 6000;
-pub const PROPOSAL_CHUNK_DATA_SIZE: usize = PROPOSAL_CHUNK_SIZE - (1 /* @TodoPacketHeader */ + 56 + 64);
-pub const PROPOSAL_CHUNK_SIZE:      usize = PATH_MTU;
-pub const PROPOSAL_CHUNKS_N:        usize = PROPOSAL_SEM_SIZE.div_ceil(PROPOSAL_CHUNK_DATA_SIZE);
-pub const PROPOSAL_BUF_SIZE:        usize = PROPOSAL_CHUNKS_N * PROPOSAL_CHUNK_DATA_SIZE;
-const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
+const PROPOSAL_PACKET_EXTRA:    usize = (1 /* @TodoPacketHeader */ + 56 + 64);
+const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
 
 // NOTE(azmr): this is:
 // - conservative in terms of max chunks, value_id, & arrival order
@@ -2164,37 +2192,44 @@ const_assert!(PROPOSAL_BUF_SIZE % PROPOSAL_CHUNK_DATA_SIZE == 0);
 #[derive(Debug)]
 struct PacketProposalChunkHeader {
     // header
-    chunk_i:     u32,
-    round:       u32,
-    height:      u64,
-    valid_round: i64,
-    proposal_id: ValueId, // for the total proposal, not just this chunk
+    chunk_i:       u32,
+    proposal_size: u32,
+    round:         u32,
+    valid_round:   i64, // serialized as u32 with 0xff.ff for -1
+    height:        u64,
+    proposal_id:   ValueId, // for the total proposal, not just this chunk
     // data:        [u8; 1087], // 1200-113
     // proposer_signature: TMSig,
 }
 impl PacketProposalChunkHeader {
-    const SERIALIZED_SIZE: usize = 56;
+    const SERIALIZED_SIZE: usize = 4 * 4 + 8 + 32; // 56
 
     fn write_to(&self, buf: &mut [u8]) -> usize {
-        self.chunk_i      .write_to(&mut buf[   0..]);
-        self.round        .write_to(&mut buf[   4..]);
-        self.height       .write_to(&mut buf[   8..]);
-        self.valid_round  .write_to(&mut buf[  16..]);
-        self.proposal_id.0.write_to(&mut buf[  24..]);
+        let valid_round: u32 = if self.valid_round >= 0 { self.valid_round.try_into().unwrap() } else { u32::MAX };
+
+        let mut o = self.chunk_i      .write_to(&mut buf[..]);
+        o        += self.proposal_size.write_to(&mut buf[o..]);
+        o        += self.round        .write_to(&mut buf[o..]);
+        o        += valid_round       .write_to(&mut buf[o..]);
+        o        += self.height       .write_to(&mut buf[o..]);
+        o        += self.proposal_id.0.write_to(&mut buf[o..]);
         // self.data                .write_to(&mut buf[48..]);
         // self.proposer_signature.0.write_to(&mut buf[1135..]);
-        Self::SERIALIZED_SIZE
+        o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
         let mut packet = PacketProposalChunkHeader {
-            chunk_i: 0, round: 0, height: 0, valid_round: 0, proposal_id: ValueId::NIL
+            chunk_i: 0, proposal_size: 0, round: 0, height: 0, valid_round: 0, proposal_id: ValueId::NIL
         };
-        packet.chunk_i     = r.read_u32::<LittleEndian>()?;
-        packet.round       = r.read_u32::<LittleEndian>()?;
-        packet.height      = r.read_u64::<LittleEndian>()?;
-        packet.valid_round = r.read_i64::<LittleEndian>()?;
+        packet.chunk_i       = r.read_u32::<LittleEndian>()?;
+        packet.proposal_size = r.read_u32::<LittleEndian>()?;
+        packet.round         = r.read_u32::<LittleEndian>()?;
+        let valid_round      = r.read_u32::<LittleEndian>()?;
+        packet.height        = r.read_u64::<LittleEndian>()?;
         r.read_exact(&mut packet.proposal_id.0)?;
+
+        packet.valid_round = if valid_round != u32::MAX { valid_round.into() } else { -1 };
         Ok(packet)
     }
 }
