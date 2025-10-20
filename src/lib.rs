@@ -434,18 +434,28 @@ const ROSTER_MAX_N: usize = 100;
 fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
+#[derive(PartialEq, Debug, Clone, Copy)]
+struct HashKey([u8; 32]);
+impl HashKey { const NIL: Self = Self([0;32]); }
+impl HashKey {
+    fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
+    fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
+}
+
 #[derive(Debug)]
 struct HashKeys {
-    proposer: [u8; 32],
-    value_id: [u8; 32],
-    connect_contention: [u8; 32],
+    proposer: HashKey,
+    value_id: HashKey,
+    connect_contention: HashKey,
+    proposal_sig: HashKey,
 }
 impl Default for HashKeys {
     fn default() -> Self {
         Self {
-            proposer:           blake3::Hasher::new_derive_key("BFT Proposer")          .finalize().into(),
-            value_id:           blake3::Hasher::new_derive_key("BFT Value ID")          .finalize().into(),
-            connect_contention: blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into(), // NOTE(azmr): skipping update
+            proposer:           HashKey(blake3::Hasher::new_derive_key("BFT Proposer")          .finalize().into()),
+            value_id:           HashKey(blake3::Hasher::new_derive_key("BFT Value ID")          .finalize().into()),
+            connect_contention: HashKey(blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into()), // NOTE(azmr): skipping update
+            proposal_sig:       HashKey(blake3::Hasher::new_derive_key("BFT Proposal Signature").finalize().into()),
         }
     }
 }
@@ -543,7 +553,7 @@ impl TMState {
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
                 if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
-                let packet_type         = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
+                let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
 
@@ -565,7 +575,7 @@ impl TMState {
         }
 
         // NOTE(azmr): this 32-byte crypto-hashing is almost certainly overkill!
-        let hash = blake3::Hasher::new_keyed(&hash_keys.proposer).update(&u64::to_le_bytes(height)).update(&u32::to_le_bytes(round)).finalize();
+        let hash = hash_keys.proposer.hasher().update(&u64::to_le_bytes(height)).update(&u32::to_le_bytes(round)).finalize();
 
         let mut hash_stake_bytes = [0; 8];
         hash.as_bytes()[..8].write_to(&mut hash_stake_bytes);
@@ -626,7 +636,7 @@ impl TMState {
     }
 
     fn id_from_value(hash_keys: &HashKeys, proposal: &BlockValue) -> ValueId {
-        ValueId(*blake3::keyed_hash(&hash_keys.value_id, &proposal.0[..PROPOSAL_SEM_SIZE]).as_bytes())
+        ValueId(hash_keys.value_id.hash(&proposal.0[..PROPOSAL_SEM_SIZE]))
     }
 
     fn f_from_n(n: u64) -> u64 {
@@ -1156,8 +1166,8 @@ impl std::fmt::Debug for SecureUdpEndpoint {
 // returns true if a is initiator
 fn contended_noise_is_initiator(hash_keys: &HashKeys, a: &[u8; 32], b: &[u8; 32]) -> bool {
     // TODO: do we want a fast insecure hash for this kind of thing?
-    let a_to_b_hash = blake3::Hasher::new_keyed(&hash_keys.connect_contention).update(a).update(b).finalize();
-    let b_to_a_hash = blake3::Hasher::new_keyed(&hash_keys.connect_contention).update(b).update(a).finalize();
+    let a_to_b_hash = hash_keys.connect_contention.hasher().update(a).update(b).finalize();
+    let b_to_a_hash = hash_keys.connect_contention.hasher().update(b).update(a).finalize();
     a_to_b_hash.as_bytes() <= b_to_a_hash.as_bytes()
 }
 
