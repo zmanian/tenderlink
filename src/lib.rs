@@ -307,16 +307,21 @@ impl RoundData {
         timeout_triggered: [false;2],
     };
 
-    // ALT: "has_enough_info_to_determine_proposal_validity"
     fn has_full_proposal(&self) -> bool {
         self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
+    }
+    fn has_enough_info_to_determine_validity(&self) -> bool {
+        self.proposal_is_faulty || self.has_full_proposal()
     }
     // auto-caching
     async fn proposal_is_valid(&mut self, validate_closure: ClosureToValidateProposedBlock) -> TMStatus {
         // TODO: may want to start doing some of these on < proposal_chunks_n, i.e. shortcut known-invalid
-        if (self.proposal_checked_validity == TMStatus::Indeterminate &&
-            self.has_full_proposal()) {
-            self.proposal_checked_validity = validate_closure.0(&self.proposal).await;
+        if self.proposal_checked_validity == TMStatus::Indeterminate {
+            if self.proposal_is_faulty {
+                self.proposal_checked_validity = TMStatus::Fail;
+            } else if self.has_full_proposal() {
+                self.proposal_checked_validity = validate_closure.0(&self.proposal).await;
+            }
         }
         self.proposal_checked_validity
     }
@@ -538,7 +543,7 @@ impl TMState {
                 let mut hdr = PacketProposalChunkHeader {
                     height, round, chunk_i: 0,
                     proposal_size: proposal.0.len().try_into().unwrap(),
-                    proposal_id: proposal.id_from_value(&self.hash_keys),
+                    proposal_id: /*if proposal.0[1] % 5 == 0 { ValueId([6;32]) } else*/ { proposal.id_from_value(&self.hash_keys) },
                     valid_round,
                 };
 
@@ -938,6 +943,7 @@ impl TMState {
 
         for i in current_height_start_i..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
+            let has_enough_info_to_determine_validity = self.rounds_data[i].has_enough_info_to_determine_validity();
 
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
@@ -959,7 +965,7 @@ impl TMState {
             // > while step_p = propose do
             // TODO: merge conditionals with below, they massively overlap
             if (is_current_height_and_round &&
-                self.rounds_data[i].has_full_proposal() && // we have received the proposal value
+                has_enough_info_to_determine_validity && // we have received the proposal value
                 self.rounds_data[i].proposal_valid_round == -1 &&
                 self.step == TMStep::Propose)
             {
@@ -981,7 +987,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, vr> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, vr, id(v)>
             // > while step_p = propose && (0 <= vr && vr < round_p)
             if (is_current_height_and_round &&
-                self.rounds_data[i].has_full_proposal() &&
+                has_enough_info_to_determine_validity &&
                 2*f+1 <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
                 0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
@@ -1015,7 +1021,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, ∗> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, round_p, id(v)>
             // > while valid(v) && step_p >= prevote for the first time do
             if (is_current_height_and_round &&
-                self.rounds_data[i].has_full_proposal() &&
+                has_enough_info_to_determine_validity &&
                 2*f+1 <= counts.yes_prevotes &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
@@ -1055,7 +1061,7 @@ impl TMState {
             // > upon <PROPOSAL, h_p, r, v, ∗> from proposer(h_p, r) AND 2f+1 <PRECOMMIT, h_p, r, id(v)>
             // > while decision_p[h_p] = nil do
             if (self.height == self.rounds_data[i].height && // any round
-                self.rounds_data[i].has_full_proposal() &&
+                has_enough_info_to_determine_validity &&
                 2*f+1 <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
