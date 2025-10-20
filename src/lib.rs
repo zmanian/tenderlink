@@ -1809,7 +1809,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let  bpp = (net_stats.bytes_sent   as f32)          / (if net_stats.packets_sent > 0 { net_stats.packets_sent as f32 } else { 1f32 });
                     println!("\x1b[92mNET\x1b[0m: SENT {} b, {} pckts ({} Kb/s {} pckts/s, {} b/pckt)",
                              net_stats.bytes_sent, net_stats.packets_sent,
-                             Kbps, pps, bpp);
+                             kbps, pps, bpp);
                 }
 
                 break;
