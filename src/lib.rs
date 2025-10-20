@@ -1014,6 +1014,7 @@ struct Peer {
 
     connection_is_unknown: bool,
 
+    unacted_upon_status_height: Option<u64>,
     latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
@@ -1031,6 +1032,7 @@ impl Default for Peer {
             on_send_next_nonce: 0,
 
             connection_is_unknown: false,
+            unacted_upon_status_height: None,
             latest_status: None,
         }
     }
@@ -1642,21 +1644,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         (PubKeyID(p.root_public_key), p.latest_status.clone(), p.connection_is_unknown)
                 ).collect::<Vec<_>>()); }
 
-                // TODO: loop rounds at current height
-                // if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
-                // for round_i in 0..bft_state.rounds_data.len()
-                //for height in 0..bft_state.decisions.len()
-                //{
                 for peer_i in 0..peers.len() {
-                    if let Some(status) = peers[peer_i].latest_status.clone() {
-                        if status.height >= bft_state.height { continue; }
-                        // TODO(azmr): I don't think we want this?
-                        // peers[peer_i].request_height = None;
+                    if let Some(height) = peers[peer_i].unacted_upon_status_height {
+                        if height >= bft_state.height { continue; }
+                        peers[peer_i].unacted_upon_status_height = None;
 
-                        //let (block, fat_pointer) = bft_state.get_block_closure.0(status.height).await;
-                        // Temporarily we will just have all proposals be recent.
-
-                        broadcast_round_data(&bft_state, false, &bft_state.recent_commit_round_cache[status.height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        broadcast_round_data(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 }
 
@@ -1923,6 +1916,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     peer.connection_is_unknown = false;
                 }
 
+                peer.unacted_upon_status_height = Some(status.height);
                 peer.latest_status = Some(status);
             }
 
