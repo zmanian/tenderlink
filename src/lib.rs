@@ -102,7 +102,7 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     }
 }
 #[derive(Clone)]
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClosureToPushDecidedBlock(..)")
@@ -1053,7 +1053,8 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
-                assert!(self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await);
+                let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await;
+                // Note(Sam): @judah and @azmr, use new_roster
                 self.height += 1;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
                 self.rounds_data.retain(|r| r.height < self.height);
@@ -1363,6 +1364,8 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
 
+    let roster2 = roster.clone();
+
     entry_point(my_root_private_key, my_static_keypair, my_endpoint, roster, roster_endpoint_evidence, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
@@ -1383,9 +1386,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         })),
         ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer| {
             let decisions = Arc::clone(&decisions);
+            let roster2 = roster2.clone();
             Box::pin(async move {
                 decisions.lock().unwrap().push((block, fat_pointer));
-                true
+                let mut ret = roster2.clone();
+                // Note(Sam): @judah, make sure this works
+                //ret.truncate(3 + decisions.lock().unwrap().len() % 2);
+                ret
             })
         })),
         ClosureToGetHistoricalBlock(Arc::new(move |height| {
