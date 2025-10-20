@@ -427,7 +427,7 @@ fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
-struct HashKey([u8; 32]);
+pub struct HashKey(pub [u8; 32]);
 impl HashKey { const NIL: Self = Self([0;32]); }
 impl HashKey {
     fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
@@ -435,11 +435,11 @@ impl HashKey {
 }
 
 #[derive(Debug)]
-struct HashKeys {
-    proposer: HashKey,
-    value_id: HashKey,
-    connect_contention: HashKey,
-    proposal_sig: HashKey,
+pub struct HashKeys {
+    pub proposer: HashKey,
+    pub value_id: HashKey,
+    pub connect_contention: HashKey,
+    pub proposal_sig: HashKey,
 }
 impl Default for HashKeys {
     fn default() -> Self {
@@ -624,19 +624,23 @@ impl TMState {
 
         if Self::proposer_from_height_round(&self.hash_keys, roster, self.height, round).1 == self.my_pub_key {
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
-                valid_value
+                Some(valid_value)
             } else {
-                self.propose_closure.0().await.unwrap()
+                self.propose_closure.0().await
             };
-            if PRINT_BFT_PROPOSAL { println!("{} about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); }
+            if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{} about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); } }
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
-            self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, self.valid_value_round.1));
+            if let Some(proposal) = proposal {
+                self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, self.valid_value_round.1));
+            } else {
+                self.step = TMStep::Propose;
+            }
         } else {
             self.step = TMStep::Propose;
-            self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
         }
+        self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
     }
 
     fn id_from_value(hash_keys: &HashKeys, proposal: &BlockValue) -> ValueId {
