@@ -4,7 +4,7 @@
 
 #![allow(clippy::eq_op)]
 const PRINT_ROSTER:         bool = 0 == 1;
-const PRINT_NETWORK_STATS:  bool = 0 == 1;
+const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
@@ -1803,11 +1803,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 }
 
                 if PRINT_NETWORK_STATS {
-                    println!("Total bytes sent: {}", net_stats.bytes_sent);
-
                     let elapsed = time_we_started_at.elapsed();
-                    let pps = (net_stats.packets_sent as f32) / (if elapsed.is_zero() { 1f32 } else { elapsed.as_secs_f32() });
-                    println!("Total packets sent: {} ({} packets/s)", net_stats.packets_sent, pps);
+                    let kbps = (net_stats.bytes_sent   as f32) / 1000.0 / (if elapsed.is_zero() { 1f32 } else { elapsed.as_secs_f32() });
+                    let  pps = (net_stats.packets_sent as f32)          / (if elapsed.is_zero() { 1f32 } else { elapsed.as_secs_f32() });
+                    let  bpp = (net_stats.bytes_sent   as f32)          / (if net_stats.packets_sent > 0 { net_stats.packets_sent as f32 } else { 1f32 });
+                    println!("\x1b[92mNET\x1b[0m: SENT {} b, {} pckts ({} Kb/s {} pckts/s, {} b/pckt)",
+                             net_stats.bytes_sent, net_stats.packets_sent,
+                             Kbps, pps, bpp);
                 }
 
                 break;
