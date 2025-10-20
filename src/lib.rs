@@ -1836,9 +1836,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let  pps = (std::cmp::max(1, net_stats.packets_sent) as f32)          / (nonzero_elapsed_sec);
                     let  bpp = (std::cmp::max(1, net_stats.bytes_sent)   as f32)          / (std::cmp::max(1, net_stats.packets_sent) as f32);
 
-                    println!("\x1b[92mNET\x1b[0m: SENT {} b, {} pckts ({} Kb/s {} pckts/s, {} b/pckt)",
-                             net_stats.bytes_sent, net_stats.packets_sent,
-                             kbps, pps, bpp);
+                    println!("\x1b[92mNET\x1b[0m: {} Kb/s | {} packets/s | {} bytes/packet",
+                             kbps as u32, pps as u32, bpp as u32);
                 }
 
                 break;
