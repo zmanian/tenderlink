@@ -1,3 +1,4 @@
 /target
 /.vs
 *.vcxproj.user
+*/x64/Release
