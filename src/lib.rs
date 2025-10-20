@@ -270,6 +270,7 @@ pub struct RoundData {
 
     // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
     msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
+    roster: Vec<SortedRosterMember>,
 
     counts: ConsensusCounts,
     // TODO: can probably do this from whether *our* node has a valid value
@@ -290,6 +291,7 @@ impl RoundData {
         proposal_is_faulty: false,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
+        roster: Vec::new(),
         counts: ConsensusCounts::ZERO,
 
         active_timeout: None,
@@ -580,11 +582,13 @@ impl TMState {
         (Some(roster_i), roster[roster_i].pub_key)
     }
 
-    fn insert_round(&mut self, insert_i: usize, round: u32, roster_n: usize) -> usize {
+    fn insert_round(&mut self, insert_i: usize, round: u32, roster: &[SortedRosterMember]) -> usize {
+        let roster_n = active_roster_len(roster);
         self.rounds_data.insert(insert_i, RoundData{
             height: self.height,
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
+            roster: Vec::from(&roster[0..roster_n]),
             ..RoundData::EMPTY
         });
         self.rounds_data[insert_i].proposal = BlockValue(vec![0_u8; PROPOSAL_BUF_SIZE]); // TODO: variable size support.
@@ -597,7 +601,7 @@ impl TMState {
 
         let round_i = match self.rounds_data.binary_search_by_key(&(self.height, round), |el| (el.height, el.round)) {
             Ok(round_i)  => round_i,
-            Err(round_i) => self.insert_round(round_i, round, active_roster_len(roster))
+            Err(round_i) => self.insert_round(round_i, round, roster)
         };
 
         if Self::proposer_from_height_round(&self.hash_keys, roster, self.height, round).1 == self.my_pub_key {
@@ -668,7 +672,7 @@ impl TMState {
         };
 
         if ! is_prev_seen_round {
-            self.insert_round(round_i, round, active_roster_len(roster));
+            self.insert_round(round_i, round, roster);
         }
         let round_data = &mut self.rounds_data[round_i];
 
@@ -947,6 +951,7 @@ impl TMState {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
                 assert!(self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].clone()).await);
                 self.height += 1;
+                self.rounds_data.retain(|r| r.height < self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
@@ -1484,7 +1489,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&roster).await;
 
-                fn broadcast_round_data(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, roster: &[SortedRosterMember], ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
+                fn broadcast_round_data(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peers: &mut [Peer], sock: &tokio::net::UdpSocket, bytes_sent: &mut usize) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1493,7 +1498,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         proposal_id: round_data.proposal_id,
                         valid_round: round_data.proposal_valid_round,
                     };
-                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, roster, height, round);
+                    let (_, proposer_pub_key) = TMState::proposer_from_height_round(&bft_state.hash_keys, &round_data.roster, height, round);
 
                     let mut sent_chunk_cs = 0;
                     let mut sent_c: [usize; 2] = [0; 2];
@@ -1635,7 +1640,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
                         let (block, fat_pointer, temp_round_data) = bft_state.get_block_closure.0(status.height).await;
 
-                        broadcast_round_data(&bft_state, false, &temp_round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        broadcast_round_data(&bft_state, false, &temp_round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 }
 
@@ -1646,7 +1651,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                     {
                         let round_data = &bft_state.rounds_data[round_i];
 
-                        broadcast_round_data(&bft_state, true, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        broadcast_round_data(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 } else {
                     todo!();
@@ -2406,14 +2411,14 @@ mod tests {
             SortedRosterMember{ pub_key: PubKeyID([2;32]), stake: 0, cumulative_stake: 0 },
             SortedRosterMember{ pub_key: PubKeyID([3;32]), stake: 0, cumulative_stake: 0 },
         ];
-        assert!((None, PubKeyID::NIL) == TMState::proposer_from_height_round(&[], 2, 1));
+        assert!((None, PubKeyID::NIL) == TMState::proposer_from_height_round(&HashKeys::default(), &[], 2, 1));
         for height in 0..8 {
             for round in 0..6 {
-                let (Some(i), _) = TMState::proposer_from_height_round(&roster_[..], height, round) else { panic!(); };
+                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster_[..], height, round) else { panic!(); };
                 println!("BFT Proposer at {}.{}: {}", height, round, i);
-                let (Some(i), _) = TMState::proposer_from_height_round(&roster[..], height, round) else { panic!(); };
+                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster[..], height, round) else { panic!(); };
                 println!("BFT Proposer at {}.{}: {}", height, round, i);
-                let (Some(i), _) = TMState::proposer_from_height_round(&roster[..1], height, round) else { panic!(); };
+                let (Some(i), _) = TMState::proposer_from_height_round(&HashKeys::default(), &roster[..1], height, round) else { panic!(); };
                 println!("BFT Proposer at {}.{}: {}", height, round, i);
                 // assert!(TMState::proposer_from_height_round(&roster0, 100, height, round).0.is_none());
             }
