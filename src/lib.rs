@@ -1804,9 +1804,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 if PRINT_NETWORK_STATS {
                     let elapsed = time_we_started_at.elapsed();
-                    let kbps = (net_stats.bytes_sent   as f32) / 1000.0 / (if elapsed.is_zero() { 1f32 } else { elapsed.as_secs_f32() });
-                    let  pps = (net_stats.packets_sent as f32)          / (if elapsed.is_zero() { 1f32 } else { elapsed.as_secs_f32() });
-                    let  bpp = (net_stats.bytes_sent   as f32)          / (if net_stats.packets_sent > 0 { net_stats.packets_sent as f32 } else { 1f32 });
+                    let nonzero_elapsed_sec = if (elapsed.is_zero()) { 1f32 } else { elapsed.as_secs_f32() };
+
+                    let kbps = (std::cmp::max(1, net_stats.bytes_sent)   as f32) / 1000.0 / (nonzero_elapsed_sec);
+                    let  pps = (std::cmp::max(1, net_stats.packets_sent) as f32)          / (nonzero_elapsed_sec);
+                    let  bpp = (std::cmp::max(1, net_stats.bytes_sent)   as f32)          / (std::cmp::max(1, net_stats.packets_sent) as f32);
+
                     println!("\x1b[92mNET\x1b[0m: SENT {} b, {} pckts ({} Kb/s {} pckts/s, {} b/pckt)",
                              net_stats.bytes_sent, net_stats.packets_sent,
                              kbps, pps, bpp);
