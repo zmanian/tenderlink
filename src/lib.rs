@@ -66,31 +66,153 @@ struct TMVote {
 pub struct BlockValue(Vec<u8>); // NOTE (azmr): currently exactly-divided by chunk size for simplicity
 
 #[derive(Clone)]
-pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send + 'static>> + Send + Sync>);
-#[derive(Clone)]
-pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = TMStatus> + Send + 'a>> + Send + Sync + 'static>);
+pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToProposeNewBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClosureToProposeNewBlock(..)")
     }
 }
+#[derive(Clone)]
+pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = TMStatus> + Send + 'a>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClosureToValidateProposedBlock(..)")
     }
 }
-
-
-fn get_bft_value(bft_state: &TMState) -> BlockValue {
-    // TODO: sim/get from PoW
-    let val = ((bft_state.height() << 4) as u32 ^ bft_state.round) as u8 ^ bft_state.my_pub_key.0[0];
-    let mut proposal = BlockValue([val; PROPOSAL_BUF_SIZE].to_vec());
-    bft_state.my_pub_key.0.write_to(&mut proposal.0);
-    [0; PROPOSAL_BUF_SIZE - PROPOSAL_SEM_SIZE].write_to(&mut proposal.0[PROPOSAL_SEM_SIZE..]);
-    proposal
+#[derive(Clone)]
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3, RoundData)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToPushDecidedBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClosureToPushDecidedBlock(..)")
+    }
+}
+#[derive(Clone)]
+pub struct ClosureToGetHistoricalBlock(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = (BlockValue, FatPointerToBftBlock3, RoundData)> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToGetHistoricalBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClosureToGetHistoricalBlock(..)")
+    }
 }
 
+/// A bundle of signed votes for a block
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
+pub struct FatPointerToBftBlock3 {
+    pub vote_for_block_without_finalizer_public_key: [u8; 76 - 32],
+    pub signatures: Vec<FatPointerSignature3>,
+}
 
+impl std::fmt::Display for FatPointerToBftBlock3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{{hash:")?;
+        for b in &self.vote_for_block_without_finalizer_public_key[0..32] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, " ovd:")?;
+        for b in &self.vote_for_block_without_finalizer_public_key[32..] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, " signatures:[")?;
+        for (i, s) in self.signatures.iter().enumerate() {
+            write!(f, "{{pk:")?;
+            for b in s.public_key {
+                write!(f, "{:02x}", b)?;
+            }
+            write!(f, " sig:")?;
+            for b in s.vote_signature {
+                write!(f, "{:02x}", b)?;
+            }
+            write!(f, "}}")?;
+            if i + 1 < self.signatures.len() {
+                write!(f, " ")?;
+            }
+        }
+        write!(f, "]}}")?;
+        Ok(())
+    }
+}
+
+fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock3 {
+    let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
+    {
+        let mut sign_data = [0; 76 - 32];
+        round_data.proposal_id.0.write_to(&mut sign_data[0..32]);
+        round_data.height.write_to(&mut sign_data[32..]);
+        (round_data.round + 0x8000_0000).write_to(&mut sign_data[40..]);
+        vote_for_block_without_finalizer_public_key = sign_data;
+    }
+
+    FatPointerToBftBlock3 {
+        vote_for_block_without_finalizer_public_key,
+        signatures: round_data.msg_val_sigs[1]
+            .iter()
+            .enumerate()
+            .filter_map(|(roster_i, (value_id, commit_signature))| {
+                if *value_id == round_data.proposal_id && *commit_signature != TMSig::NIL {
+                    Some(FatPointerSignature3 {
+                        public_key: roster[roster_i].pub_key.0,
+                        vote_signature: commit_signature.0,
+                    })
+                } else { None }
+            })
+            .collect(),
+    }
+}
+
+impl FatPointerToBftBlock3 {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.vote_for_block_without_finalizer_public_key);
+        buf.extend_from_slice(&(self.signatures.len() as u16).to_le_bytes());
+        for s in &self.signatures {
+            buf.extend_from_slice(&s.to_bytes());
+        }
+        buf
+    }
+    #[allow(clippy::reversed_empty_ranges)]
+    pub fn try_from_bytes(bytes: &Vec<u8>) -> Option<FatPointerToBftBlock3> {
+        if bytes.len() < 76 - 32 + 2 {
+            return None;
+        }
+        let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
+        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
+
+        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
+            return None;
+        }
+        let rem = &bytes[76 - 32 + 2..];
+        let signatures = rem
+            .chunks_exact(32 + 64)
+            .map(|chunk| FatPointerSignature3::from_bytes(chunk.try_into().unwrap()))
+            .collect();
+
+        Some(Self {
+            vote_for_block_without_finalizer_public_key,
+            signatures,
+        })
+    }
+}
+
+/// A vote signature for a block
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
+pub struct FatPointerSignature3 {
+    pub public_key: [u8; 32],
+    pub vote_signature: [u8; 64],
+}
+
+impl FatPointerSignature3 {
+    pub fn to_bytes(&self) -> [u8; 32 + 64] {
+        let mut buf = [0_u8; 32 + 64];
+        buf[0..32].copy_from_slice(&self.public_key);
+        buf[32..32 + 64].copy_from_slice(&self.vote_signature);
+        buf
+    }
+    pub fn from_bytes(bytes: &[u8; 32 + 64]) -> FatPointerSignature3 {
+        Self {
+            public_key: bytes[0..32].try_into().unwrap(),
+            vote_signature: bytes[32..32 + 64].try_into().unwrap(),
+        }
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum TMStatus {
@@ -116,8 +238,8 @@ struct TMSig ([u8; 64]);
 impl TMSig { const NIL: Self = Self([0; 64]); }
 impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
-#[derive(Debug)]
-struct RoundData {
+#[derive(Debug, Clone)]
+pub struct RoundData {
     height: u64,
     round: u32,
     // parallel with sorted roster arrays
@@ -272,7 +394,7 @@ fn roster_i_from_pub_key(roster: &[SortedRosterMember], pub_key: PubKeyID) -> Op
     roster.iter().position(|m| m.pub_key == pub_key)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Timeout { time: Instant, height: u64, round: u32, step: TMStep }
 impl Timeout {
     fn new(now: Instant, height: u64, round: u32, step: TMStep) -> Timeout {
@@ -302,7 +424,7 @@ struct TMState {
     round: u32,
     step: TMStep,
     /// basically the chain of agreed blocks
-    decisions: Vec<TMDecision>, // TODO: rearchitect
+    height: u64,
     /// most recent "possible decision value" - successful proposal + prevote
     /// when valid_value was updated
     valid_value_round: (Option<BlockValue>, i64), // TODO
@@ -314,16 +436,18 @@ struct TMState {
 
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
+    push_block_closure: ClosureToPushDecidedBlock,
+    get_block_closure: ClosureToGetHistoricalBlock,
 }
 impl TMState {
-    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock) -> Self {
+    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> Self {
         Self {
             my_port,
             my_signing_key,
             my_pub_key,
             round: 0,
             step: TMStep::Propose,
-            decisions: Vec::new(), // simple approach: 1 per height
+            height: 0,
             valid_value_round: (None, -1), // TODO: is this actually protocol-relevant or just a cache?
             locked_value_round: (None, -1),
 
@@ -331,13 +455,10 @@ impl TMState {
 
             propose_closure,
             validate_closure,
+            push_block_closure,
+            get_block_closure,
         }
     }
-
-    fn height(&self) -> u64 {
-        self.decisions.len() as u64
-    }
-
 
     // NOTE: we just add our info to our round data & have it become equivalent to everyone else's...
     fn broadcast(&mut self, roster: &[SortedRosterMember], round_i: usize, msg: TMMsgData) -> TMStep {
@@ -429,7 +550,7 @@ impl TMState {
 
     fn insert_round(&mut self, insert_i: usize, round: u32, roster_n: usize) -> usize {
         self.rounds_data.insert(insert_i, RoundData{
-            height: self.height(),
+            height: self.height,
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
             ..RoundData::EMPTY
@@ -442,12 +563,12 @@ impl TMState {
         self.round = round;
         // self.active_proposal_value_round = (None, -1);
 
-        let round_i = match self.rounds_data.binary_search_by_key(&(self.height(), round), |el| (el.height, el.round)) {
+        let round_i = match self.rounds_data.binary_search_by_key(&(self.height, round), |el| (el.height, el.round)) {
             Ok(round_i)  => round_i,
             Err(round_i) => self.insert_round(round_i, round, active_roster_len(roster))
         };
 
-        if Self::proposer_from_height_round(roster, self.height(), round).1 == self.my_pub_key {
+        if Self::proposer_from_height_round(roster, self.height, round).1 == self.my_pub_key {
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 valid_value
             } else {
@@ -460,7 +581,7 @@ impl TMState {
             self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(proposal, self.valid_value_round.1));
         } else {
             self.step = TMStep::Propose;
-            self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Propose));
+            self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
         }
     }
 
@@ -477,8 +598,8 @@ impl TMState {
         let me_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(tag), height, round, chunk_i);
 
-        if height != self.height() {
-            // eprintln!("{}: BFT: received [{}] when we're at height {}", me_str, pkt_str, self.height());
+        if height != self.height {
+            // eprintln!("{}: BFT: received [{}] when we're at height {}", me_str, pkt_str, self.height);
             return TMStatus::Fail;
         }
 
@@ -659,7 +780,7 @@ impl TMState {
     }
 
     fn ctx_str(&self, roster: &[SortedRosterMember]) -> String {
-        format!("{:05}-{:?}-{:?}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height(), self.round, format!("{:?}", self.step))
+        format!("{:05}-{:?}-{:?}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
     }
     fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
         format!("{:05}-{:?}-{:?}", peer.endpoint.unwrap_or_default().port, PubKeyID(peer.root_public_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_key)))
@@ -671,12 +792,12 @@ impl TMState {
         let ctx_str = self.ctx_str(roster);
 
         // NOTE: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
-        let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height(), 0), |el| (el.height, el.round)).unwrap_or(0);
+        let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height, 0), |el| (el.height, el.round)).unwrap_or(0);
 
         for i in current_height_start_i..self.rounds_data.len() {
             let counts = self.rounds_data[i].counts.clone();
             // TODO: don't spam "while" messages repeatedly
-            let is_current_height_and_round = (self.height(), self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
+            let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
             if PRINT_BFT_STATE {
                 println!("{} {}={}.{}, {}/{PROPOSAL_CHUNKS_N}, {}", ctx_str,
@@ -744,7 +865,7 @@ impl TMState {
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 34: last orders on prevote period", ctx_str); }
                 self.rounds_data[i].timeout_triggered[0] = true;
-                self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Prevote));
+                self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Prevote));
             }
 
             // line 36: seen 2f+1 valid prevotes: lock, valid, precommit
@@ -784,24 +905,20 @@ impl TMState {
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 47: last orders on precommit period", ctx_str); }
                 self.rounds_data[i].timeout_triggered[1] = true;
-                self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height(), self.round, TMStep::Precommit));
+                self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Precommit));
             }
 
             // line 49: value decided
             // > upon <PROPOSAL, h_p, r, v, ∗> from proposer(h_p, r) AND 2f+1 <PRECOMMIT, h_p, r, id(v)>
             // > while decision_p[h_p] = nil do
-            if (self.height() == self.rounds_data[i].height && // any round
+            if (self.height == self.rounds_data[i].height && // any round
                 self.rounds_data[i].proposal_sigs_n == PROPOSAL_CHUNKS_N &&
                 2*f+1 <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
-                self.decisions.push(TMDecision {
-                    round_i: i,
-                    value: self.rounds_data[i].proposal.clone(),
-                    // value_sig: self.rounds_data[i].proposal_sig,
-                    // votes: self.rounds_data[i].msg_val_sigs
-                });
+                assert!(self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].clone()).await);
+                self.height += 1;
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
@@ -809,7 +926,7 @@ impl TMState {
 
             // line 55: round catchup
             // > upon f+1 <∗, h_p, round, ∗, ∗> with round > round_p do
-            if (self.height() == self.rounds_data[i].height &&
+            if (self.height == self.rounds_data[i].height &&
                 self.round    <  self.rounds_data[i].round  &&
                 f+1 <= counts.anys)
             {
@@ -820,7 +937,7 @@ impl TMState {
             // timeouts
             if let Some(timeout) = &self.rounds_data[i].active_timeout &&
                 timeout.time <= now &&
-                self.height() == timeout.height &&
+                self.height == timeout.height &&
                 self.round    == timeout.round
             {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
@@ -1129,22 +1246,38 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
     let block_rng = Arc::new(Mutex::new(base_rng.clone()));
 
+    let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3, RoundData)>::new()));
+    let decisions2 = Arc::clone(&decisions);
+
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port,
         ClosureToProposeNewBlock(Arc::new(move || {
-            let block_rng2 = block_rng.clone();
+            let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
                 let mut buf = vec![0_u8; PROPOSAL_BUF_SIZE];
-                block_rng2.lock().unwrap().fill_bytes(&mut buf);
+                block_rng.lock().unwrap().fill_bytes(&mut buf);
                 if should_propose_bad_value_sometimes == false { buf[0] = 0; }
                 Some(BlockValue(buf))
             })
         })),
-        ClosureToValidateProposedBlock(Arc::new(|block| {
+        ClosureToValidateProposedBlock(Arc::new(move |block| {
             Box::pin(async move {
                 if block.0[0] % 2 == 0 { TMStatus::Pass }
                 //else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
                 else { TMStatus::Fail }
+            })
+        })),
+        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, round_data| {
+            let decisions = Arc::clone(&decisions);
+            Box::pin(async move {
+                decisions.lock().unwrap().push((block, fat_pointer, round_data));
+                true
+            })
+        })),
+        ClosureToGetHistoricalBlock(Arc::new(move |height| {
+            let decisions = Arc::clone(&decisions2);
+            Box::pin(async move {
+                decisions.lock().unwrap()[height as usize].clone()
             })
         })),
     ); // TODO: double-check this is the right key
@@ -1187,7 +1320,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 send_buf1[0] |= PACKET_TAG_STATUS_FLAG;
 
                 let mut status = PacketStatus {
-                    height: bft_state.height(),
+                    height: bft_state.height,
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
@@ -1453,25 +1586,24 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 ).collect::<Vec<_>>()); }
 
                 // TODO: loop rounds at current height
-                // if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                // if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                 // for round_i in 0..bft_state.rounds_data.len()
                 //for height in 0..bft_state.decisions.len()
                 //{
                 for peer_i in 0..peers.len() {
                     if let Some(status) = peers[peer_i].latest_status.clone() {
-                        if status.height >= bft_state.height() { continue; }
+                        if status.height >= bft_state.height { continue; }
                         // TODO(azmr): I don't think we want this?
                         // peers[peer_i].request_height = None;
 
-                        let round_i = bft_state.decisions[status.height as usize].round_i;
-                        let round_data = &bft_state.rounds_data[round_i];
+                        let (block, fat_pointer, temp_round_data) = bft_state.get_block_closure.0(status.height).await;
 
-                        broadcast_round_data(&bft_state, false, &round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        broadcast_round_data(&bft_state, false, &temp_round_data, &roster, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 }
 
 
-                if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height(), 0), |el| (el.height, el.round))
+                if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                 {
                     for round_i in current_height_start_i..bft_state.rounds_data.len()
                     {
