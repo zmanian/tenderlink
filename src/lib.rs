@@ -3,6 +3,7 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
+const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 0 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
@@ -534,8 +535,8 @@ impl TMState {
         // TODO: send to (some) others
         let height   = self.rounds_data[round_i].height;
         let round    = self.rounds_data[round_i].round;
-        let Some(roster_i) = roster_i_from_pub_key(&roster, self.my_pub_key) else {
-            eprintln!("\x1b[91mBFT ERROR\x1b[0m: failed to find my own public key in the roster");
+        let Some(roster_i) = roster_i_from_pub_key(roster, self.my_pub_key) else {
+            eprintln!("{} \x1b[91mBFT ERROR\x1b[0m: failed to find my own public key in the roster", self.ctx_str(roster));
             return self.step;
         };
         match msg {
@@ -927,13 +928,14 @@ impl TMState {
     }
 
     fn ctx_str(&self, roster: &[SortedRosterMember]) -> String {
+        // format!("{:?} {:05}-{:?}-{:?}.{:3}.{:3}.{:9}", roster.into_iter().map(|m| m.pub_key).collect::<Vec<_>>(), self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
         format!("{:05}-{:?}-{:?}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
     }
     fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
         format!("{:05}-{:?}-{:?}", peer.endpoint.unwrap_or_default().port, PubKeyID(peer.root_public_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_key)))
     }
 
-    async fn bft_update(&mut self, roster: &[SortedRosterMember]) {
+    async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
         let now = Instant::now();
         let f = Self::f_from_n(active_roster_len(roster) as u64) as usize;
         let ctx_str = self.ctx_str(roster);
@@ -1067,7 +1069,8 @@ impl TMState {
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
                 let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await;
-                // Note(Sam): @judah and @azmr, use new_roster
+                if PRINT_ROSTER { println!("{} new roster: {:?}", ctx_str, new_roster); }
+                *roster = new_roster;
                 self.height += 1;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
                 self.rounds_data.retain(|r| r.height < self.height);
@@ -1403,8 +1406,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             Box::pin(async move {
                 decisions.lock().unwrap().push((block, fat_pointer));
                 let mut ret = roster2.clone();
-                // Note(Sam): @judah, make sure this works
-                //ret.truncate(3 + decisions.lock().unwrap().len() % 2);
+                ret.truncate(3 + decisions.lock().unwrap().len() % 2);
                 ret
             })
         })),
@@ -1417,7 +1419,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     ).await
 }
 
-pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> std::io::Result<()> {
+pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, mut roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(||{
@@ -1629,7 +1631,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
-                bft_state.bft_update(&roster).await;
+                bft_state.bft_update(&mut roster).await;
 
                 fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer: &mut Peer, sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
@@ -2092,10 +2094,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
-                            let sign_datas   = make_vote_sign_datas(roster[packet.votes[vote_i].roster_i as usize].pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                            let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                            bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
+                            if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
+                                let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                                let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                                bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
+                                    &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
+                            }
                         }
                     }
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_type(packet_type), err),
