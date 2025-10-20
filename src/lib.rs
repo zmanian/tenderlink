@@ -1533,18 +1533,6 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             *on_send_next_nonce += 1;
         }
 
-        const fn _assert_valid_tag<const TAG: u8>() {
-            assert!((TAG & ! PACKET_TYPE_MASK) == 0);
-        }
-
-        fn make_packet_header<const TAG: u8>(ack_latest: u64, ack_field: u64) -> PacketHeader {
-            _assert_valid_tag::<TAG>();
-            PacketHeader {
-                tag_and_ack: TAG as u64 | ((ack_latest) & (u64::MAX >> PACKET_TYPE_BITS) << PACKET_TYPE_BITS),
-                ack_field,
-            }
-        }
-
         let was_now = tokio::time::Instant::now();
         if was_now > next_tick_time {
             loop {
@@ -2178,6 +2166,21 @@ struct PacketHeader {
     ack_field: u64,
 }
 impl PacketHeader {
+    const fn assert_valid_tag<const TAG: u8>() {
+        assert!((TAG & ! PACKET_TYPE_MASK) == 0);
+    }
+
+    pub fn new<const TAG: u8>(ack_latest: u64, ack_field: u64) -> PacketHeader {
+        Self::assert_valid_tag::<TAG>();
+        Self::new_(TAG, ack_latest, ack_field)
+    }
+    pub fn new_(tag: u8, ack_latest: u64, ack_field: u64) -> PacketHeader {
+        PacketHeader {
+            tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TYPE_BITS) << PACKET_TYPE_BITS),
+            ack_field,
+        }
+    }
+
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = self.tag_and_ack.write_to(&mut buf[..]);
         o += self.ack_field.write_to(&mut buf[8..]);
