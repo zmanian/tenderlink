@@ -938,12 +938,17 @@ impl TMState {
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
         let now = Instant::now();
-        let f = Self::f_from_n(active_roster_len(roster) as u64) as u64;
-        let big_threshold: u64;
-        let small_threshold: u64;
+        let mut total_active_stake = 0;
+        for i in 0..active_roster_len(roster) {
+            total_active_stake += roster[i].stake;
+        }
+        let total_active_stake = total_active_stake;
+        let f = Self::f_from_n(total_active_stake);
+        let big_threshold;
+        let small_threshold;
         if f == 0 {
-            big_threshold = 2*f+1;
-            small_threshold = f+1;
+            big_threshold = total_active_stake;
+            small_threshold = total_active_stake;
         } else {
             big_threshold = 2*f+1;
             small_threshold = f+1;
