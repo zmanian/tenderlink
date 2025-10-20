@@ -95,14 +95,14 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     }
 }
 #[derive(Clone)]
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3, RoundData)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClosureToPushDecidedBlock(..)")
     }
 }
 #[derive(Clone)]
-pub struct ClosureToGetHistoricalBlock(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = (BlockValue, FatPointerToBftBlock3, RoundData)> + Send>> + Send + Sync + 'static>);
+pub struct ClosureToGetHistoricalBlock(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = (BlockValue, FatPointerToBftBlock3)> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToGetHistoricalBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClosureToGetHistoricalBlock(..)")
@@ -254,7 +254,7 @@ impl TMSig { const NIL: Self = Self([0; 64]); }
 impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Debug, Clone)]
-pub struct RoundData {
+struct RoundData {
     height: u64,
     round: u32,
     // parallel with sorted roster arrays
@@ -468,6 +468,8 @@ struct TMState {
 
     rounds_data: Vec<RoundData>,
 
+    recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
+
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
@@ -487,6 +489,7 @@ impl TMState {
             locked_value_round: (None, -1),
 
             rounds_data: Vec::new(),
+            recent_commit_round_cache: Vec::new(),
 
             propose_closure,
             validate_closure,
@@ -949,8 +952,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
-                assert!(self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].clone()).await);
+                assert!(self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await);
                 self.height += 1;
+                self.recent_commit_round_cache.push(self.rounds_data[i].clone());
                 self.rounds_data.retain(|r| r.height < self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
@@ -1277,7 +1281,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
 
     let block_rng = Arc::new(Mutex::new(base_rng.clone()));
 
-    let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3, RoundData)>::new()));
+    let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
 
     // TODO: only convert private to public in 1 location
@@ -1298,10 +1302,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 else { TMStatus::Fail }
             })
         })),
-        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, round_data| {
+        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer| {
             let decisions = Arc::clone(&decisions);
             Box::pin(async move {
-                decisions.lock().unwrap().push((block, fat_pointer, round_data));
+                decisions.lock().unwrap().push((block, fat_pointer));
                 true
             })
         })),
@@ -1638,9 +1642,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                         // TODO(azmr): I don't think we want this?
                         // peers[peer_i].request_height = None;
 
-                        let (block, fat_pointer, temp_round_data) = bft_state.get_block_closure.0(status.height).await;
+                        //let (block, fat_pointer) = bft_state.get_block_closure.0(status.height).await;
+                        // Temporarily we will just have all proposals be recent.
 
-                        broadcast_round_data(&bft_state, false, &temp_round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
+                        broadcast_round_data(&bft_state, false, &bft_state.recent_commit_round_cache[status.height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peers, &sock, &mut bytes_sent);
                     }
                 }
 
