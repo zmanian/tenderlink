@@ -649,21 +649,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "stuff"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "byteorder",
- "ed25519-zebra",
- "rand",
- "rand_chacha",
- "rand_pcg",
- "snow",
- "static_assertions",
- "tokio",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -678,6 +663,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tenderloin"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "byteorder",
+ "ed25519-zebra",
+ "rand",
+ "rand_chacha",
+ "rand_pcg",
+ "snow",
+ "static_assertions",
+ "tokio",
 ]
 
 [[package]]

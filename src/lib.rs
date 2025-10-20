@@ -50,7 +50,7 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 }
 
 #[derive(Clone, Debug)]
-struct SortedRosterMember {
+pub struct SortedRosterMember {
     pub_key: PubKeyID,
     stake: u64,
     cumulative_stake: u64, // everyone in array prior to this point (used for determining proposer)
@@ -1058,13 +1058,13 @@ struct UnknownPeer {
 }
 
 #[derive(Clone, Copy)]
-struct StaticDHKeyPair {
+pub struct StaticDHKeyPair {
     private: [u8; 32],
     public: [u8; 32],
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-struct SecureUdpEndpoint {
+pub struct SecureUdpEndpoint {
     public_key: [u8; 32],
     ip_address: [u8; 16],
     port: u16,
@@ -1093,7 +1093,7 @@ impl SecureUdpEndpoint {
 }
 
 #[derive(Clone, Copy)]
-struct EndpointEvidence {
+pub struct EndpointEvidence {
     endpoint: SecureUdpEndpoint,
     root_public_key: [u8; 32],
 }
@@ -1247,45 +1247,20 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
 }
 
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
-    hook_fail_on_panic();
-    let mut base_rng = {
-        let seed : u128 = maybe_seed.unwrap_or_else(||{
+    let block_rng = Arc::new(Mutex::new({
+        let seed : u128 = maybe_seed.clone().unwrap_or_else(||{
             let mut seed_rng = rand::rng();
             ((seed_rng.next_u64() as u128) << 64) | seed_rng.next_u64() as u128
         });
         SimRng::new(seed, 0)
-    };
-
+    }));
+    
     let should_propose_bad_value_sometimes = my_endpoint.is_some(); // peer 0 only
-
-    let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-    let my_root_public_key = VerificationKeyBytes::from(&my_root_private_key);
-    let my_static_keypair = my_static_keypair.unwrap_or_else(|| {
-        let kp = snow::Builder::new(noise_params.clone()).generate_keypair().unwrap();
-        StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
-    });
-
-    // TODO(Phillip) enable dual-stack on Windows using setsockopt(IPV6_V6ONLY, false). This is very important!!!
-    let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
-    let my_port = sock.local_addr().unwrap().port();
-
-    let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_key.as_ref())
-        .map(|m| Peer { root_public_key: m.pub_key.0, ..Peer::default() }).collect();
-
-    for evidence in &roster_endpoint_evidence {
-        if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
-            peers[i].endpoint = Some(evidence.endpoint);
-        }
-    }
-    println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
-
-    let block_rng = Arc::new(Mutex::new(base_rng.clone()));
-
+    
     let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
 
-    // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port,
+    entry_point(my_root_private_key, my_static_keypair, my_endpoint, roster, roster_endpoint_evidence, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
@@ -1314,8 +1289,42 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             Box::pin(async move {
                 decisions.lock().unwrap()[height as usize].clone()
             })
-        })),
-    ); // TODO: double-check this is the right key
+        }))).await
+    }
+
+pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> std::io::Result<()> {
+    hook_fail_on_panic();
+    let mut base_rng = {
+        let seed : u128 = maybe_seed.unwrap_or_else(||{
+            let mut seed_rng = rand::rng();
+            ((seed_rng.next_u64() as u128) << 64) | seed_rng.next_u64() as u128
+        });
+        SimRng::new(seed, 0)
+    };
+
+    let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let my_root_public_key = VerificationKeyBytes::from(&my_root_private_key);
+    let my_static_keypair = my_static_keypair.unwrap_or_else(|| {
+        let kp = snow::Builder::new(noise_params.clone()).generate_keypair().unwrap();
+        StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
+    });
+
+    // TODO(Phillip) enable dual-stack on Windows using setsockopt(IPV6_V6ONLY, false). This is very important!!!
+    let sock = tokio::net::UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0))).await.unwrap();
+    let my_port = sock.local_addr().unwrap().port();
+
+    let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_key.as_ref())
+        .map(|m| Peer { root_public_key: m.pub_key.0, ..Peer::default() }).collect();
+
+    for evidence in &roster_endpoint_evidence {
+        if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
+            peers[i].endpoint = Some(evidence.endpoint);
+        }
+    }
+    println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
+
+    // TODO: only convert private to public in 1 location
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure); // TODO: double-check this is the right key
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {

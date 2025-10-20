@@ -5,5 +5,5 @@ fn main() {
         i = args[1].parse().unwrap_or(usize::MAX);
     }
     println!("Command line: {:?}", args);
-    stuff::run_instances(i);
+    tenderloin::run_instances(i);
 }
