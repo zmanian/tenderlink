@@ -287,6 +287,25 @@ struct RoundData {
     timeout_triggered: [bool; 2],
 }
 impl RoundData {
+    const EMPTY: RoundData = RoundData {
+        height: 0,
+        round: 0,
+        proposal: BlockValue(Vec::new()), // NOTE(azmr): don't alloc until we know the size (signed by proposer)
+        proposal_valid_round: -1,
+        proposal_sigs: Vec::new(),
+        proposal_sigs_n: 0,
+        proposal_id: ValueId::NIL,
+        proposal_checked_validity: TMStatus::Indeterminate,
+        proposal_is_faulty: false,
+        // TODO: probably put both step messages next to each other
+        msg_val_sigs: Vec::new(),
+        roster: Vec::new(),
+        counts: ConsensusCounts::ZERO,
+
+        active_timeout: None,
+        timeout_triggered: [false;2],
+    };
+
     // ALT: "has_enough_info_to_determine_proposal_validity"
     fn has_full_proposal(&self) -> bool {
         self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
@@ -595,20 +614,8 @@ impl TMState {
             height: self.height,
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
-            proposal_valid_round: -1,
-            // NOTE(azmr): don't alloc until we know the size (signed by proposer)
-            proposal: BlockValue(Vec::with_capacity(0)),
-            proposal_sigs: Vec::with_capacity(0),
-            proposal_sigs_n: 0,
-            proposal_id: ValueId::NIL,
-            proposal_checked_validity: TMStatus::Indeterminate,
-            proposal_is_faulty: false,
-            // TODO: probably put both step messages next to each other
-            counts: ConsensusCounts::ZERO,
             roster: roster.to_vec(),
-
-            active_timeout: None,
-            timeout_triggered: [false;2],
+            ..RoundData::EMPTY
         });
         insert_i
     }
@@ -690,6 +697,31 @@ impl TMState {
         };
         let round_data = &mut self.rounds_data[round_i];
 
+        // TODO: Keep a dynamic array to solve the "Amnesiac Proposer's Dilemma".
+        //       If I propose my block for this height and round, but then my
+        //       computer gets unplugged, I've forgotten block history and need to
+        //       catch back up to the network's consensus height. However, on the
+        //       way there, I'll sometimes propose new values. (This is expected,
+        //       arguably, since we never truly know whether we're at the top of
+        //       the consensus height.) However, in the process of catching up I
+        //       may get my own *different* signed proposal that was already decided!
+        //       Normally we would mark that proposer as faulty/adversarial, but we
+        //       assume that we are never faulty, and must therefore be "amnesic".
+        //       In Byzantine scenarios I may have been unplugged arbitrarily
+        //       many times and be receiving arbitrarily many validly signed
+        //       proposals of my own making, with even some signed precommits.
+        //       We'll observe multiple competing proposals, all signed by us, all
+        //       equally valid candidates for the decisive proposal, any of which
+        //       may establish consensus. We won't know until we see 2f+1 precommits.
+        //       We need to let these precommits *race*, until we observe 2f+1
+        //       stake being precommitted to *any* of our proposals, at which
+        //       point we accept *that* proposal as decisive. (There will never
+        //       be multiple proposals with 2f+1 precommits unless the BFT
+        //       network is faulty; we just need to wait and see which one
+        //       is the decisive one.)  -Phil 2025-10-20
+        // NOTE: @Incomplete: for now, only track the latest proposal.
+        let is_my_proposal = (from_pub_key == self.my_pub_key);
+
         match packet_type {
             PACKET_TYPE_PROPOSAL_CHUNK => {
                 let Ok(hdr) = PacketProposalChunkHeader::read_from(signed_data) else {
@@ -698,22 +730,44 @@ impl TMState {
 
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
-                    if round_data.proposal.0.len() != hdr.proposal_size as usize {
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
-                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
-                        return TMStatus::Fail;
-                    }
-                    if round_data.proposal_id != value_id {
-                        // TODO: immediately class both as invalid?
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
-                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
-                        return TMStatus::Fail;
-                    }
-                    if round_data.proposal_valid_round != valid_round {
-                        // TODO: immediately class both as invalid
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
-                        ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
-                        return TMStatus::Fail;
+                    if is_my_proposal &&
+                      (round_data.proposal.0.len() != hdr.proposal_size as usize ||
+                       round_data.proposal_id != value_id ||
+                       round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
+                        // Flush proposal id/votes. @Robustness @Duplicate: how to tersely flush the round?
+                        let roster_n = active_roster_len(roster);
+                        *round_data = RoundData {
+                            height:               round_data.height,
+                            round:                round_data.round,
+                            proposal_id:          value_id,
+                            proposal_valid_round: valid_round,
+                            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
+                            roster:               Vec::from(&roster[0..roster_n]),
+                            active_timeout:       round_data.active_timeout.clone(),
+                            timeout_triggered:    round_data.timeout_triggered,
+                            ..RoundData::EMPTY
+                        };
+                        round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
+                        round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                        eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
+                    } else {
+                        if round_data.proposal.0.len() != hdr.proposal_size as usize {
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
+                            return TMStatus::Fail;
+                        }
+                        if round_data.proposal_id != value_id {
+                            // TODO: immediately class both as invalid?
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
+                            return TMStatus::Fail;
+                        }
+                        if round_data.proposal_valid_round != valid_round {
+                            // TODO: immediately class both as invalid
+                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
+                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
+                            return TMStatus::Fail;
+                        }
                     }
                 } else {
                     round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
@@ -758,10 +812,29 @@ impl TMState {
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
-                    // TODO: treat this as a failed is_valid & early out before awaiting full proposal
-                    round_data.proposal_is_faulty = true;
-                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
-                    return TMStatus::Fail;
+                    if is_my_proposal { // Amnesiac Proposer's Dilemma
+                        // Flush proposal id/votes. @Robustness @Duplicate: how to tersely flush the round?
+                        let roster_n = active_roster_len(roster);
+                        *round_data = RoundData {
+                            height:               round_data.height,
+                            round:                round_data.round,
+                            proposal_id:          value_id,
+                            proposal_valid_round: valid_round,
+                            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
+                            roster:               Vec::from(&roster[0..roster_n]),
+                            active_timeout:       round_data.active_timeout.clone(),
+                            timeout_triggered:    round_data.timeout_triggered,
+                            ..RoundData::EMPTY
+                        };
+                        round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
+                        round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                        eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
+                    } else {
+                        // TODO: treat this as a failed is_valid & early out before awaiting full proposal
+                        round_data.proposal_is_faulty = true;
+                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
+                        return TMStatus::Fail;
+                    }
                 } else {
                     return TMStatus::Pass; // already good
                 }
