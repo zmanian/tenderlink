@@ -1521,7 +1521,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             let header  = PacketHeader::read_from(&mut cur)?;
 
             let mut status = None;
-            if (header.tag & PACKET_TAG_STATUS_FLAG) != 0 {
+            if header.has_status() {
                 // TODO: scope down required ranges
                 status = Some(PacketStatus::read_from(&mut cur)?);
             }
@@ -1531,7 +1531,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
         fn write_header_and_maybe_status(header_: PacketHeader, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
             let mut header = header_;
-            header.tag |= if include_status { PACKET_TAG_STATUS_FLAG } else { 0 };
+            header.tag_and_ack |= if include_status { PACKET_TAG_STATUS_FLAG as u64 } else { 0 };
 
             let mut o = 0;
             o += header.write_to(&mut send_buf1[o..]);
@@ -1928,7 +1928,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         let header_and_local_msg = &recv_buf2[8..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                        let packet_type = header.tag & PACKET_TYPE_MASK;
+                        let packet_type = header.type_();
                         let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
 
                         if packet_type == PACKET_TYPE_SERVER_HELLO {
@@ -1964,7 +1964,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                        let packet_type = header.tag & PACKET_TYPE_MASK;
+                        let packet_type = header.type_();
                         if packet_type == PACKET_TYPE_CLIENT_ACK {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
                             peer.transport_state          = peer.pending_client_ack_transport_state.take();
@@ -1982,7 +1982,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
                     let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                     let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                    let packet_type = header.tag & PACKET_TYPE_MASK;
+                    let packet_type = header.type_();
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
@@ -2018,7 +2018,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     if let Ok(length) = peer.transport_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                        let packet_type = header.tag & PACKET_TYPE_MASK;
+                        let packet_type = header.type_();
                         if peer.pending_client_ack {
                             if packet_type == PACKET_TYPE_CLIENT_UNKNOWN_ACK {
                                 println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
@@ -2044,7 +2044,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
                     let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                     let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                    let packet_type = header.tag & PACKET_TYPE_MASK;
+                    let packet_type = header.type_();
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
@@ -2078,7 +2078,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         let Ok((header, status, read_o)) = read_header_and_maybe_status(&msg[..]) else {
             continue;
         };
-        let packet_type = header.tag & PACKET_TYPE_MASK;
+        let packet_type = header.type_();
 
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
@@ -2286,11 +2286,10 @@ impl PacketStatus {
     }
 }
 
-const PACKET_HEADER_SIZE: usize = 1; // 8 + 8; // 16
+const PACKET_HEADER_SIZE: usize = 8 + 8; // 16
 struct PacketHeader {
-    tag: u8,
-    // tag_and_ack: u64,
-    // ack_field: u64,
+    tag_and_ack: u64,
+    ack_field: u64,
 }
 impl PacketHeader {
     const fn assert_valid_tag<const TAG: u8>() {
@@ -2301,30 +2300,31 @@ impl PacketHeader {
         Self::assert_valid_tag::<TAG>();
         Self::new_(TAG, ack_latest, ack_field)
     }
-    pub fn new_(tag: u8, _ack_latest: u64, _ack_field: u64) -> PacketHeader {
+    pub fn new_(tag: u8, ack_latest: u64, ack_field: u64) -> PacketHeader {
         PacketHeader {
-            tag
-            // tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TYPE_BITS) << PACKET_TYPE_BITS),
-            // ack_field,
+            tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TAG_BITS) << PACKET_TAG_BITS),
+            ack_field,
         }
     }
 
+    pub fn has_status(&self) -> bool { self.tag_and_ack as u8  & PACKET_TAG_STATUS_FLAG != 0 }
+    pub fn type_     (&self) -> u8   { self.tag_and_ack as u8  & PACKET_TYPE_MASK            }
+    pub fn tag       (&self) -> u8   { self.tag_and_ack as u8  & PACKET_TAG_MASK             }
+    pub fn ack       (&self) -> u64  { self.tag_and_ack       >> PACKET_TAG_BITS }
+
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.tag.write_to(&mut buf[o..]);
-        // o += self.tag_and_ack.write_to(&mut buf[o..]);
-        // o += self.ack_field  .write_to(&mut buf[o..]);
+        o += self.tag_and_ack.write_to(&mut buf[o..]);
+        o += self.ack_field  .write_to(&mut buf[o..]);
         o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let tag = r.read_u8()?;
-        // let tag_and_ack = r.read_u64::<LittleEndian>()?;
-        // let ack_field   = r.read_u64::<LittleEndian>()?;
+        let tag_and_ack = r.read_u64::<LittleEndian>()?;
+        let ack_field   = r.read_u64::<LittleEndian>()?;
         Ok(Self {
-            tag
-            // tag_and_ack,
-            // ack_field,
+            tag_and_ack,
+            ack_field,
         })
     }
 }
