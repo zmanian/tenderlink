@@ -193,6 +193,19 @@ impl std::fmt::Debug for ClosureToUpdateRosterCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdateRosterCmd(..)") }
 }
 
+/*
+FROM ZEBRA
+DATA LAYOUT FOR VOTE
+32 byte ed25519 public key of the finalizer who's vote this is
+32 byte blake3 hash of value, or all zeroes to indicate Nil vote
+8 byte height
+4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
+
+TOTAL: 76 B
+
+A signed vote will be this same layout followed by the 64 byte ed25519 signature of the previous 76 bytes.
+*/
+
 /// A bundle of signed votes for a block
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
 pub struct FatPointerToBftBlock3 {
@@ -1446,19 +1459,6 @@ fn nonce_update(nonce: u64, ack_latest: &mut u64, ack_field: &mut u64) {
         *ack_field |= 1_u64 << (*ack_latest - nonce);
     }
 }
-
-/*
-FROM ZEBRA
-DATA LAYOUT FOR VOTE
-32 byte ed25519 public key of the finalizer who's vote this is
-32 byte blake3 hash of value, or all zeroes to indicate Nil vote
-8 byte height
-4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
-
-TOTAL: 76 B
-
-A signed vote will be this same layout followed by the 64 byte ed25519 signature of the previous 76 bytes.
-*/
 
 fn make_vote_sign_datas(pub_key: [u8; 32], is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
     let mut sign_data_no = [0; 76];
