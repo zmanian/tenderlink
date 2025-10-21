@@ -1632,9 +1632,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         if peer.connection_is_unknown {
                             // Gossip evidence in order to trigger upgrade
                             if let Some(evidence) = my_endpoint_evidence {
-                                let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.nonce_ack_latest, peer.nonce_ack_field);
+                                let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
                                 let mut o  = 0;
-                                o += header  .write_to(&mut send_buf1[o..]); // @TodoHeaderAndStatus
+                                o += header  .write_to(&mut send_buf1[o..]);
                                 o += evidence.write_to(&mut send_buf1[o..]);
                                 send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
@@ -1653,9 +1653,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 .local_private_key(&my_static_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
-                            let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.nonce_ack_latest, peer.nonce_ack_field);
+                            let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
                             let mut o = 0;
-                            o += header.write_to(&mut send_buf1[o..]); // @TodoHeaderAndStatus
+                            o += header.write_to(&mut send_buf1[o..]);
                             let n = outgoing_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                             // TODO: no nonce?
                             send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
@@ -1664,9 +1664,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         if let (Some(transport), Some(evidence)) =
                             (&mut peer.transport_state, roster_endpoint_evidence.choose(&mut base_rng)) {
-                            let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.nonce_ack_latest, peer.nonce_ack_field);
+                            let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
                             let mut o = 0;
-                            o += header  .write_to(&mut send_buf1[o..]); // @TodoHeaderAndStatus
+                            o += header  .write_to(&mut send_buf1[o..]);
                             o += evidence.write_to(&mut send_buf1[o..]);
                             send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
@@ -1698,10 +1698,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                 chunk_hdr.chunk_i = chunk_i as u32;
 
-                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer.nonce_ack_latest, peer.nonce_ack_field);
+                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
 
                                 let mut o = 0;
-                                o += header   .write_to(&mut send_buf1[o..]); // @TodoHeaderAndStatus
+                                o += header   .write_to(&mut send_buf1[o..]);
                                 o += chunk_hdr.write_to(&mut send_buf1[o..]);
 
                                 let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
@@ -1741,7 +1741,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             continue;
                         }
 
-                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer.nonce_ack_latest, peer.nonce_ack_field); // TODO: maybe include status
+                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
                         let mut packet = PacketVotes {
                             height, round,
                             value_id: chunk_hdr.proposal_id,
@@ -1768,9 +1768,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
                                     // full evidence block; send it
                                     if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
-                                    // TODO: maybe status
                                     let mut o = 0;
-                                    o += header.write_to(&mut send_buf1[o..]); // @TodoHeaderAndStatus
+                                    o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
                                     if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
                                         send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
@@ -1795,7 +1794,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
 
                             let mut o = 0;
-                            o += header.write_to(&mut send_buf1[o..]); // @TodoHeaderAndStatus
+                            o += header.write_to(&mut send_buf1[o..]);
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
                             if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
@@ -1992,8 +1991,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                             let start_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
-                            // @TodoHeaderAndStatus
-                            let header = PacketHeader::new::<PACKET_TYPE_SERVER_HELLO>(0, 0);
+                            let header = PacketHeader::new::<PACKET_TYPE_SERVER_HELLO>(0, 0); // @TodoHeaderAndStatus
 
                             let mut o = 0;
                             o += start_nonce.write_to(&mut send_buf1[o..]);
