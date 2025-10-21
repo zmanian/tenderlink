@@ -1854,6 +1854,17 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&mut roster).await;
 
+                {
+                    let active_roster = &roster[..active_roster_len(&roster)];
+                    // Drop those who are not in the active roster.
+                    peers.retain(|p| active_roster.iter().position(|rp| rp.pub_key.0 == p.root_public_key).is_some());
+                    for rp in active_roster {
+                        if peers.iter().position(|p| p.root_public_key == rp.pub_key.0).is_none() && rp.pub_key.0 != my_root_private_key.as_ref() {
+                            peers.push(Peer { root_public_key: rp.pub_key.0, ..Peer::default() });
+                        }
+                    }
+                }
+
                 fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
