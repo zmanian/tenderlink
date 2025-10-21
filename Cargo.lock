@@ -577,7 +577,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tenderloin"
+name = "tenderlink"
 version = "0.1.0"
 dependencies = [
  "blake3",
