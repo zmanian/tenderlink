@@ -1716,7 +1716,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                         eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
                                         continue;
                                     }};
-                                    match vk.verify(&sig, &send_buf1[1..sig_o]) { Ok(_)=>{}, Err(err)=>{
+                                    match vk.verify(&sig, &send_buf1[PACKET_HEADER_SIZE..sig_o]) { Ok(_)=>{}, Err(err)=>{
                                         eprintln!("{}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
                                             ctx_str, proposer_pub_key, height, round, chunk_i, sig_o-1, chunk_hdr.proposal_id, err);
                                         continue;
