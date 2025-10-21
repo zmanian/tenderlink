@@ -4,6 +4,7 @@
 
 #![allow(clippy::eq_op)]
 const PRINT_ROSTER:         bool = 0 == 1;
+const PRINT_ROSTER_CMD:     bool = 1 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
@@ -163,30 +164,27 @@ impl BlockValue {
 #[derive(Clone)]
 pub struct ClosureToProposeNewBlock(pub Arc<dyn Fn() -> core::pin::Pin<Box<dyn Future<Output = Option<BlockValue>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToProposeNewBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ClosureToProposeNewBlock(..)")
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToProposeNewBlock(..)") }
 }
 #[derive(Clone)]
 pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = TMStatus> + Send + 'a>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToValidateProposedBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ClosureToValidateProposedBlock(..)")
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
 #[derive(Clone)]
 pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ClosureToPushDecidedBlock(..)")
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
 #[derive(Clone)]
 pub struct ClosureToGetHistoricalBlock(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = (BlockValue, FatPointerToBftBlock3)> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToGetHistoricalBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ClosureToGetHistoricalBlock(..)")
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetHistoricalBlock(..)") }
+}
+#[derive(Clone)]
+pub struct ClosureToUpdateRosterCmd(pub Arc<dyn Fn(Option<String>)-> core::pin::Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToUpdateRosterCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdateRosterCmd(..)") }
 }
 
 /// A bundle of signed votes for a block
@@ -574,9 +572,18 @@ struct TMState {
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
     get_block_closure: ClosureToGetHistoricalBlock,
+
+    roster_cmd: Option<String>,
+    update_roster_cmd_closure: ClosureToUpdateRosterCmd,
 }
 impl TMState {
-    fn init(my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> Self {
+    fn init(
+        my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16,
+        propose_closure: ClosureToProposeNewBlock,
+        validate_closure: ClosureToValidateProposedBlock,
+        push_block_closure: ClosureToPushDecidedBlock,
+        get_block_closure: ClosureToGetHistoricalBlock,
+        update_roster_cmd_closure: ClosureToUpdateRosterCmd) -> Self {
         Self {
             hash_keys: HashKeys::default(),
             my_port,
@@ -595,6 +602,8 @@ impl TMState {
             validate_closure,
             push_block_closure,
             get_block_closure,
+            roster_cmd: None,
+            update_roster_cmd_closure,
         }
     }
 
@@ -1499,6 +1508,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
     let decisions2 = Arc::clone(&decisions);
 
     let roster2 = roster.clone();
+    let pub_key = PubKeyID(VerificationKeyBytes::from(&my_root_private_key.clone()).into());
 
     entry_point(my_root_private_key, my_static_keypair, my_endpoint, roster, roster_endpoint_evidence, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
@@ -1533,11 +1543,15 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
             Box::pin(async move {
                 decisions.lock().unwrap()[height as usize].clone()
             })
-        }))
+        })),
+        ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
+            Some(format!("{:?}", pub_key))
+        })})),
     ).await
 }
 
-pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, mut roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>, propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock) -> std::io::Result<()> {
+pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, mut roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>,
+    propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock, roster_cmd_closure: ClosureToUpdateRosterCmd) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(||{
@@ -1576,7 +1590,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
     println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>());
 
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure); // TODO: double-check this is the right key
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, roster_cmd_closure); // TODO: double-check this is the right key
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_key == my_root_public_key.as_ref()) {
@@ -1994,6 +2008,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     (PubKeyID(p.root_public_key), p.latest_status.clone(), p.connection_is_unknown)
                 ).collect::<Vec<_>>()); }
 
+                if let Some(cmd) = &bft_state.roster_cmd && PRINT_ROSTER_CMD { eprintln!("{ctx_str} recv roster cmd: \"{}\"", cmd); }
+                let roster_cmd = bft_state.update_roster_cmd_closure.0(bft_state.roster_cmd.take()).await;
+                if let Some(cmd) = &roster_cmd && PRINT_ROSTER_CMD { eprintln!("{ctx_str} send roster cmd: \"{}\"", cmd); }
+
                 for peer_i in 0..peers.len() {
                     let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
@@ -2011,6 +2029,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
                     }
+
+                    if let Some(cmd) = &roster_cmd {
+                        let header = PacketHeader::new::<PACKET_TYPE_ROSTER_CMD>(peer.transport.ack_latest, peer.transport.ack_field);
+                        let mut o = write_header_and_maybe_status(header, false, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
+                        o        += cmd.as_bytes().write_to(&mut send_buf1[o..]);
+                        send_noise_msg(&ctx_str, &mut peer.transport, peer.snow_state.as_mut().unwrap(), &sock, peer.endpoint.unwrap(), &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                    }
                 }
 
                 for peer_i in 0..unknown_peers.len() {
@@ -2018,6 +2043,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
                         peer.unacted_upon_status_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
+                    }
+
+                    if let Some(cmd) = &roster_cmd {
+                        let header = PacketHeader::new::<PACKET_TYPE_ROSTER_CMD>(peer.transport.ack_latest, peer.transport.ack_field);
+                        let mut o = write_header_and_maybe_status(header, false, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
+                        o        += cmd.as_bytes().write_to(&mut send_buf1[o..]);
+                        send_noise_msg(&ctx_str, &mut peer.transport, &mut peer.snow_state, &sock, peer.endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                     }
                 }
 
@@ -2351,6 +2383,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     }
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 },
+                PACKET_TYPE_ROSTER_CMD => if msg[read_o..].len() > 0 {
+                    if let Ok(cmd) = String::from_utf8(msg[read_o..].to_vec()) { bft_state.roster_cmd = Some(cmd); }
+                },
                 PACKET_TYPE_EMPTY => (),
                 _ => (), //println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
             }
@@ -2427,6 +2462,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_type(packet_type), err),
                 }
 
+                PACKET_TYPE_ROSTER_CMD => if msg[read_o..].len() > 0 {
+                    if let Ok(cmd) = String::from_utf8(msg[read_o..].to_vec()) { bft_state.roster_cmd = Some(cmd); }
+                },
                 PACKET_TYPE_EMPTY => {}
                 _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.ack_field, msg, addr);
             }
@@ -2447,7 +2485,9 @@ const PACKET_TYPE_ENDPOINT_EVIDENCE    : u8 =  6;
 const PACKET_TYPE_PROPOSAL_CHUNK       : u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES   : u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES : u8 =  9;
-const PACKET_TYPE_COUNT                : u8 = 10;
+// misc
+const PACKET_TYPE_ROSTER_CMD           : u8 = 10;
+const PACKET_TYPE_COUNT                : u8 = 11;
 
 
 const PACKET_TYPE_BITS                 : u8 =  7;
@@ -2472,7 +2512,8 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",       "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES", "STATUS+PRECOMMIT_SIGNATURES"];
-    const_assert!(PACKET_TYPE_COUNT == 10); // keep names array updated when adding other tags
+    names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
+    const_assert!(PACKET_TYPE_COUNT == 11); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_type(packet_type: u8) -> &'static str {
