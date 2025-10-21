@@ -1004,7 +1004,7 @@ impl TMState {
 
     fn ctx_str(&self, roster: &[SortedRosterMember]) -> String {
         // format!("{:?} {:05}-{:?}-{:?}.{:3}.{:3}.{:9}", roster.into_iter().map(|m| m.pub_key).collect::<Vec<_>>(), self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
-        format!("{:05}-{:?}-{:?}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
+        format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
     }
     fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
         format!("{:05}-{:?}-{:?}", peer.endpoint.unwrap_or_default().port, PubKeyID(peer.root_public_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_key)))
