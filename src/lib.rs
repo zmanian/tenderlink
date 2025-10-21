@@ -1531,7 +1531,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
         fn write_header_and_maybe_status(header_: PacketHeader, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
             let mut header = header_;
-            header.tag |= if include_status { PACKET_TAG_STATUS_FLAG } else { 0 }; // @TodoPacketHeader
+            header.tag |= if include_status { PACKET_TAG_STATUS_FLAG } else { 0 };
 
             let mut o = 0;
             o += header.write_to(&mut send_buf1[o..]);
@@ -1898,6 +1898,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         break;
                     }
                 }
+
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
                         fn finish_outgoing_handshake(ctx_str: &str, send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
@@ -1917,37 +1918,49 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             peer.connection_is_unknown              = connection_is_unknown;
                         }
 
-                        if length <= 8 {
+                        if length < 8 + PACKET_HEADER_SIZE {
                             break; // presumably we don't care about standalone nonces
+                        }
+
+                        nonce = u64::from_le_bytes(recv_buf2[..8].try_into().unwrap());
+
+                        let header_and_local_msg = &recv_buf2[8..length];
+
+                        // @TodoHeaderAndStatus
+                        let header = if let Ok(header_ok) = PacketHeader::read_from(&header_and_local_msg[..]) {
+                            header_ok
                         } else {
-                            nonce = u64::from_le_bytes(recv_buf2[..8].try_into().unwrap());
-                            let local_msg = &recv_buf2[8..length];
-                            if local_msg == [PACKET_TYPE_SERVER_HELLO] /* @TodoPacketHeader */ {
-                                if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
-                                    if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                        println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
-                                        finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
-                                    }
-                                    break;
-                                }
-                            } else if local_msg.len() == PACKET_HEADER_SIZE /* @TodoPacketHeader */ + 18 && local_msg[0] == PACKET_TYPE_SERVER_UNKNOWN_HELLO {
-                                let other_side_ip       = &local_msg[PACKET_HEADER_SIZE     ..PACKET_HEADER_SIZE + 16];
-                                let other_side_port     = &local_msg[PACKET_HEADER_SIZE + 16..PACKET_HEADER_SIZE + 18];
-                                let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
-                                // TODO hash
+                            break;
+                        };
+                        let packet_type = header.tag & PACKET_TYPE_MASK;
+
+                        let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
+
+                        if packet_type == PACKET_TYPE_SERVER_HELLO {
+                            if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
                                 if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                    println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
-
-                                    if my_endpoint_evidence.is_none() {
-                                        let evidence = EndpointEvidence { endpoint: other_side_endpoint, root_public_key: my_root_public_key.into() };
-                                        println!("{:05}: I am locking in the endpoint evidence {:?}", my_port, evidence);
-                                        my_endpoint_evidence = Some(evidence);
-                                    }
-
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true, &mut net_stats);
+                                    println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
+                                    finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
                                 }
                                 break;
                             }
+                        } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
+                            let other_side_ip       = &local_msg[   .. 16];
+                            let other_side_port     = &local_msg[16 .. 18];
+                            let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
+                            // TODO hash
+                            if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
+                                println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
+
+                                if my_endpoint_evidence.is_none() {
+                                    let evidence = EndpointEvidence { endpoint: other_side_endpoint, root_public_key: my_root_public_key.into() };
+                                    println!("{:05}: I am locking in the endpoint evidence {:?}", my_port, evidence);
+                                    my_endpoint_evidence = Some(evidence);
+                                }
+
+                                finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true, &mut net_stats);
+                            }
+                            break;
                         }
                     }
                 }
