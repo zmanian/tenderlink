@@ -331,7 +331,14 @@ impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TMSig ([u8; 64]);
-impl TMSig { const NIL: Self = Self([0; 64]); }
+impl TMSig {
+    const NIL: Self = Self([0; 64]);
+    fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
+        let signature = Signature::from_bytes(&self.0);
+        let vk = match VerificationKey::try_from(pub_key.0) { Ok(v)=>v,       Err(err)=>{ return Err((err, "invalid public key")) }};
+        match vk.verify(&signature, signed_data)            { Ok(())=>Ok(()), Err(err)=>{ Err((err, "invalid signature")) }}
+    }
+}
 impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Debug, Clone)]
@@ -622,13 +629,13 @@ impl TMState {
 
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
-                    let sig = self.my_signing_key.sign(&buf[..o]).to_bytes();
-                    if PRINT_SIGN { println!("{}: signed proposal with {:?}", self.ctx_str(roster), TMSig(sig)) };
+                    let sig = TMSig(self.my_signing_key.sign(&buf[..o]).to_bytes());
+                    if PRINT_SIGN { println!("{}: signed proposal with {:?}", self.ctx_str(roster), sig) };
 
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
                         height, round, chunk_i, hdr.proposal_id, hdr.valid_round,
-                        roster, roster_i, PACKET_TYPE_PROPOSAL_CHUNK, &buf[..o], &sig
+                        roster, roster_i, PACKET_TYPE_PROPOSAL_CHUNK, &buf[..o], sig
                     );
                 }
 
@@ -640,12 +647,12 @@ impl TMState {
                 if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
-                let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
-                if PRINT_SIGN { println!("{} signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], TMSig(sig)) };
+                let sig         = TMSig(self.my_signing_key.sign(&signed_data).to_bytes());
+                if PRINT_SIGN { println!("{} signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], sig) };
 
                 self.check_and_incorporate_msg(
                     height, round, 0, value_id, -2,
-                    roster, roster_i, packet_type, &signed_data, &sig
+                    roster, roster_i, packet_type, &signed_data, sig
                 );
 
                 [TMStep::Prevote, TMStep::Precommit][is_precommit as usize]
@@ -728,7 +735,7 @@ impl TMState {
         (n - 1) / 3
     }
 
-    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, packet_type: u8, signed_data: &[u8], sig_data: &[u8;64]) -> TMStatus {
+    fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, packet_type: u8, signed_data: &[u8], sig: TMSig) -> TMStatus {
         let me_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_type(packet_type), height, round, chunk_i);
 
@@ -749,16 +756,10 @@ impl TMState {
         let ctx_str = format!("{} [{} from {} {:?}]", me_str, pkt_str, roster_i, from_pub_key);
 
         // check if data was signed by pub key
-        let signature = Signature::from_bytes(sig_data);
-        let vk = match VerificationKey::try_from(from_pub_key.0) { Ok(v)=>v, Err(err)=>{
-            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid public key: {} ({})", ctx_str, from_pub_key, err);
+        match sig.verify(from_pub_key, signed_data) { Ok(())=>{}, Err((err, str))=> {
+            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: {} [..{}]: for {} {}", ctx_str, str, signed_data.len(), value_id, err);
             return TMStatus::Fail;
         }};
-        match vk.verify(&signature, signed_data) { Ok(_)=>{}, Err(err)=>{
-            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: invalid signature[..{}]: {} {}", ctx_str, signed_data.len(), value_id, err);
-            return TMStatus::Fail;
-        }}
-        let sig = TMSig(*sig_data);
 
         if PRINT_VALID_INCOMING { eprintln!("{}: valid signature for value id: {}", ctx_str, value_id); }
 
@@ -1871,18 +1872,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 let sig_o = o;
                                 o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
-                                #[cfg(debug_assertions)]
-                                { // self-check signatures as sanity check
-                                    let sig = Signature::from_bytes(&round_data.proposal_sigs[chunk_i].0);
-                                    let vk = match VerificationKey::try_from(proposer_pub_key.0) { Ok(v)=>v, Err(err)=>{
-                                        eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
+                                #[cfg(debug_assertions)] // self-check signatures as sanity check
+                                match round_data.proposal_sigs[chunk_i].verify(proposer_pub_key, &send_buf1[PACKET_HEADER_SIZE..sig_o]) {
+                                    Ok(_) => {}
+                                    Err((err, str)) => {
+                                        eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
                                         continue;
-                                    }};
-                                    match vk.verify(&sig, &send_buf1[PACKET_HEADER_SIZE..sig_o]) { Ok(_)=>{}, Err(err)=>{
-                                        eprintln!("{}: BFT FAULT: invalid signature from {} for proposal {}.{}.{}[..{}]: {} {}",
-                                            ctx_str, proposer_pub_key, height, round, chunk_i, sig_o-1, chunk_hdr.proposal_id, err);
-                                        continue;
-                                    }}
+                                    }
                                 }
 
                                 if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_root_public_key); }
@@ -1915,7 +1911,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
                                 if value_id != ValueId::NIL && value_id != packet.value_id {
-                                    eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: local mismastch: {:?} vs {:?}", ctx_str, packet.value_id, value_id);
+                                    eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: local mismatch: {:?} vs {:?}", ctx_str, packet.value_id, value_id);
                                 }
 
                                 // add nos and yeses from opposite ends to avoid excess moves
@@ -1929,17 +1925,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                                 #[cfg(debug_assertions)]
                                 { // self-check signatures as sanity check
-                                    let sign = Signature::from_bytes(&sig.0);
-                                    let pub_key = round_data.roster[roster_i].pub_key;
-                                    let vk = match VerificationKey::try_from(pub_key.0) { Ok(v)=>v, Err(err)=>{
-                                        eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
-                                        continue;
-                                    }};
+                                    let pub_key    = round_data.roster[roster_i].pub_key;
                                     let sign_datas = make_vote_sign_datas(pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                                    match vk.verify(&sign, &sign_datas[(value_id != ValueId::NIL) as usize]) { Ok(_)=>{}, Err(err)=>{
-                                        eprintln!("{}: BFT FAULT: invalid signature from {}-{:?} for {} {}.{}[..{}]: {:?} {} {}",
-                                            ctx_str, roster_i, pub_key, ["prevote", "precommit"][is_precommit as usize],
-                                            height, round, sign_datas[0].len(), sig, packet.value_id, err);
+                                    let sign_data  = &sign_datas[(value_id != ValueId::NIL) as usize];
+                                    match sig.verify(pub_key, sign_data) { Ok(_)=>{} Err((err, str)) => {
+                                        eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for {} from {roster_i}-{pub_key:?} {height}.{round}: {} {err}",
+                                            sign_data.len(), ["prevote", "precommit"][is_precommit as usize], packet.value_id);
                                         continue;
                                     }}
                                 }
@@ -1952,7 +1943,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     let mut o = 0;
                                     o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
+                                    send_noise_msg(ctx_str, peer_transport, peer_snow_state, sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
 
                                     packet.no_votes_n  = 0;
                                     packet.yes_votes_n = 0;
@@ -1976,7 +1967,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             o += header.write_to(&mut send_buf1[o..]);
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
-                            send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
+                            send_noise_msg(ctx_str, peer_transport, peer_snow_state, sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
                         }
                     }
 
@@ -2404,7 +2395,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
                             let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
                             bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                                &roster, roster_i, packet_type, &msg[read_o..sig_o], &msg[sig_o..sig_o+64].try_into().unwrap());
+                                &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
                         }
                     } else {
                         eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
@@ -2422,7 +2413,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
                                 let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
                                 bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                    &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], &packet.votes[vote_i].sig.0);
+                                    &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
                             }
                         }
                     }
