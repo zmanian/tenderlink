@@ -72,6 +72,64 @@ struct TMDecision {
     //signatures: Vec<TMSig>, // ability to prove to others e.g. those catching up
 }
 
+#[derive(Debug, Default, Copy, Clone)]
+struct SentPacket {
+    bytes: u64,
+    time_sent: f64,
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+struct ReceivedPacket {
+    bytes: u64,
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+struct AcknowledgedSentPacket {
+    bytes: u64,
+    rtt: f64,
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+struct Slot<T> {
+    index: usize,
+    value: T
+}
+
+#[derive(Debug)]
+struct RingStream<T: Default, const N: usize> {
+    slots: [Slot<T>; N],
+}
+impl<T: Default + Copy, const N: usize> Default for RingStream<T, N> {
+    fn default() -> Self {
+        Self {
+            slots: [Slot::<T>::default(); N],
+        }
+    }
+}
+impl<T: Default, const N: usize> RingStream<T, N> {
+    pub fn at<'a>(&'a mut self, index: usize) -> Option<&'a mut T> {
+        let slot_index = index % N;
+        if self.slots[slot_index].index == index {
+            Some((&mut self.slots[slot_index].value))
+        } else {
+            None
+        }
+    }
+    pub fn at_immut<'a>(&'a self, index: usize) -> Option<&'a T> {
+        let slot_index = index % N;
+        if self.slots[slot_index].index == index {
+            Some((&self.slots[slot_index].value))
+        } else {
+            None
+        }
+    }
+    pub fn set(&mut self, value: T, index: usize) {
+        let slot_index = index % N;
+        self.slots[slot_index].index = index;
+        self.slots[slot_index].value = value;
+    }
+}
+
 
 struct TMVote {
     approve: bool,
@@ -1153,6 +1211,10 @@ struct Peer {
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
     on_send_next_nonce: u64,
+    sent_packets:              RingStream<SentPacket, 1024>,
+    received_packets:          RingStream<ReceivedPacket, 1024>,
+    acknowledged_sent_packets: RingStream<AcknowledgedSentPacket, 1024>,
+
 
     connection_is_unknown: bool,
 
@@ -1172,6 +1234,9 @@ impl Default for Peer {
             nonce_ack_latest: 0,
             nonce_ack_field: 0,
             on_send_next_nonce: 0,
+            sent_packets:              RingStream::<SentPacket, 1024>::default(),
+            received_packets:          RingStream::<ReceivedPacket, 1024>::default(),
+            acknowledged_sent_packets: RingStream::<AcknowledgedSentPacket, 1024>::default(),
 
             connection_is_unknown: false,
             unacted_upon_status_height: None,
@@ -1881,6 +1946,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         let mut nonce = 0;
         let mut msg: Option<&[u8]> = None;
 
+        fn process_acks(peer: &mut Peer, header: PacketHeader) {
+            // peer
+        }
+
         //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
         //      the unknown connections array since that also shouldn't be able to be blocked.
         if let Some(i) = peers.iter().map(|p| p.endpoint.unwrap_or_default()).position(|endpoint| endpoint.ip_address == from_ip && endpoint.port == from_port) {
@@ -1930,6 +1999,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.type_();
                         let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
+
+                        process_acks(peer, header);
 
                         if packet_type == PACKET_TYPE_SERVER_HELLO {
                             if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
