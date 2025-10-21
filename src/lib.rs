@@ -10,7 +10,7 @@ const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
@@ -528,7 +528,7 @@ impl TMState {
         // TODO: send to (some) others
         let height   = self.rounds_data[round_i].height;
         let round    = self.rounds_data[round_i].round;
-        let Some(roster_i) = roster_i_from_pub_key(roster, self.my_pub_key) else {
+        let Some(roster_i) = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key) else {
             eprintln!("{} \x1b[91mBFT ERROR\x1b[0m: failed to find my own public key in the roster", self.ctx_str(roster));
             return self.step;
         };
@@ -959,6 +959,7 @@ impl TMState {
         let current_height_start_i = self.rounds_data.binary_search_by_key(&(self.height, 0), |el| (el.height, el.round)).unwrap_or(0);
 
         for i in current_height_start_i..self.rounds_data.len() {
+            let on_roster = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key).is_some();
             let counts = self.rounds_data[i].counts.clone();
             let has_enough_info_to_determine_validity = self.rounds_data[i].has_enough_info_to_determine_validity();
 
@@ -981,7 +982,8 @@ impl TMState {
             // > upon <PROPOSAL, h_p, round_p, v, −1> from proposer(h_p, round_p)
             // > while step_p = propose do
             // TODO: merge conditionals with below, they massively overlap
-            if (is_current_height_and_round &&
+            if (on_roster &&
+                is_current_height_and_round &&
                 has_enough_info_to_determine_validity && // we have received the proposal value
                 self.rounds_data[i].proposal_valid_round == -1 &&
                 self.step == TMStep::Propose)
@@ -1003,7 +1005,8 @@ impl TMState {
             // line 28: received 2f+1 prevotes: prevote
             // > upon <PROPOSAL, h_p, round_p, v, vr> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, vr, id(v)>
             // > while step_p = propose && (0 <= vr && vr < round_p)
-            if (is_current_height_and_round &&
+            if (on_roster &&
+                is_current_height_and_round &&
                 has_enough_info_to_determine_validity &&
                 big_threshold <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
@@ -1023,7 +1026,8 @@ impl TMState {
 
             // line 34: last orders on prevote period
             // > upon 2f+1 <PREVOTE, h_p, round_p, ∗> while step_p = prevote for the first time do
-            if (is_current_height_and_round &&
+            if (on_roster &&
+                is_current_height_and_round &&
                 // don't need the proposal itself
                 big_threshold <= counts.prevotes &&
                 self.step == TMStep::Prevote &&
@@ -1037,7 +1041,8 @@ impl TMState {
             // line 36: seen 2f+1 valid prevotes: lock, valid, precommit
             // > upon <PROPOSAL, h_p, round_p, v, ∗> from proposer(h_p, round_p) AND 2f+1 <PREVOTE, h_p, round_p, id(v)>
             // > while valid(v) && step_p >= prevote for the first time do
-            if (is_current_height_and_round &&
+            if (on_roster &&
+                is_current_height_and_round &&
                 has_enough_info_to_determine_validity &&
                 big_threshold <= counts.yes_prevotes &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
@@ -1055,7 +1060,8 @@ impl TMState {
             // line 44: seen 2f+1 nil prevotes: precommit nil
             // > upon 2f+1 <PREVOTE, h_p, round_p, nil>
             // > while step_p = prevote do
-            if (is_current_height_and_round &&
+            if (on_roster &&
+                is_current_height_and_round &&
                 big_threshold <= counts.nil_prevotes &&
                 self.step == TMStep::Prevote)
             {
@@ -1065,7 +1071,8 @@ impl TMState {
 
             // line 47: last orders on precommit period
             // > upon 2f+1 <PRECOMMIT, h_p, round_p, ∗> for the first time do
-            if (is_current_height_and_round &&
+            if (on_roster &&
+                is_current_height_and_round &&
                 big_threshold <= counts.precommits &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
@@ -1077,6 +1084,7 @@ impl TMState {
             // line 49: value decided
             // > upon <PROPOSAL, h_p, r, v, ∗> from proposer(h_p, r) AND 2f+1 <PRECOMMIT, h_p, r, id(v)>
             // > while decision_p[h_p] = nil do
+            // @note(judah): observers only care about this
             if (self.height == self.rounds_data[i].height && // any round
                 has_enough_info_to_determine_validity &&
                 big_threshold <= counts.yes_precommits &&
@@ -1096,7 +1104,8 @@ impl TMState {
 
             // line 55: round catchup
             // > upon f+1 <∗, h_p, round, ∗, ∗> with round > round_p do
-            if (self.height == self.rounds_data[i].height &&
+            if (on_roster &&
+                self.height == self.rounds_data[i].height &&
                 self.round    <  self.rounds_data[i].round  &&
                 small_threshold <= counts.anys)
             {
@@ -1107,8 +1116,9 @@ impl TMState {
             // timeouts
             if let Some(timeout) = &self.rounds_data[i].active_timeout &&
                 timeout.time <= now &&
-                self.height == timeout.height &&
-                self.round    == timeout.round
+                self.height  == timeout.height &&
+                self.round   == timeout.round &&
+                on_roster
             {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
@@ -2575,7 +2585,7 @@ pub fn run_instances(i: usize) {
         }
     } else if i == 999 {
         // let _joins: [; N];
-        for j in 0..N-1 {
+        for j in 0..N - 1 {
             if j == 0 {
                 rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
             } else {
@@ -2585,8 +2595,14 @@ pub fn run_instances(i: usize) {
     } else {
         if i == 0 {
             rt.spawn(instance(static_private_keys[i], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
-        } else {
+        }
+        else if i < N {
             rt.spawn(instance(static_private_keys[i], None, None, roster.clone(), vec![evidence_zero], None));
+        }
+        else {
+            let mut secret_key = [0u8; 32];
+            crypto_rng.fill_bytes(&mut secret_key);
+            rt.spawn(instance(SigningKey::from(secret_key), None, None, roster.clone(), vec![evidence_zero], None));
         }
     }
     rt.block_on(std::future::pending::<()>())
