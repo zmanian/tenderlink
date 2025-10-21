@@ -2359,7 +2359,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 },
                 PACKET_TYPE_EMPTY => (),
-                _ => println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
+                _ => (), //println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
             }
             continue;
         }
