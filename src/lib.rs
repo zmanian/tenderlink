@@ -1932,11 +1932,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let header_and_local_msg = &recv_buf2[8..length];
 
                         // @TodoHeaderAndStatus
-                        let header = if let Ok(header_ok) = PacketHeader::read_from(&header_and_local_msg[..]) {
-                            header_ok
-                        } else {
-                            break;
-                        };
+                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; };
                         let packet_type = header.tag & PACKET_TYPE_MASK;
 
                         let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
@@ -1976,11 +1972,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let header_and_local_msg = &recv_buf2[..length];
 
                         // @TodoHeaderAndStatus
-                        let header = if let Ok(header_ok) = PacketHeader::read_from(&header_and_local_msg[..]) {
-                            header_ok
-                        } else {
-                            break;
-                        };
+                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; };
                         let packet_type = header.tag & PACKET_TYPE_MASK;
                         if packet_type == PACKET_TYPE_CLIENT_ACK {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
@@ -2060,11 +2052,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let header_and_local_msg = &recv_buf2[..length];
 
                     // @TodoHeaderAndStatus
-                    let header = if let Ok(header_ok) = PacketHeader::read_from(&header_and_local_msg[..]) {
-                        header_ok
-                    } else {
-                        break;
-                    };
+                    let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; };
                     let packet_type = header.tag & PACKET_TYPE_MASK;
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
