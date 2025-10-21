@@ -1198,23 +1198,40 @@ impl TMState {
     }
 }
 
-// TODO: can we megastruct these and collapse the codepaths?
 #[derive(Debug)]
-struct Peer {
-    root_public_key: [u8; 32],
-    endpoint: Option<SecureUdpEndpoint>,
-    outgoing_handshake_state: Option<HandshakeState>,
-    pending_client_ack_transport_state: Option<StatelessTransportState>,
-    transport_state: Option<StatelessTransportState>,
-    watch_dog: Instant,
-
+struct PeerTransport {
     nonce_ack_latest: u64,
     nonce_ack_field: u64,
     on_send_next_nonce: u64,
     sent_packets:              RingStream<SentPacket, 1024>,
     received_packets:          RingStream<ReceivedPacket, 1024>,
     acknowledged_sent_packets: RingStream<AcknowledgedSentPacket, 1024>,
+}
+impl Default for PeerTransport {
+    fn default() -> Self {
+        Self {
+            nonce_ack_latest: 0,
+            nonce_ack_field: 0,
+            on_send_next_nonce: 0,
+            sent_packets:              RingStream::<SentPacket, 1024>::default(),
+            received_packets:          RingStream::<ReceivedPacket, 1024>::default(),
+            acknowledged_sent_packets: RingStream::<AcknowledgedSentPacket, 1024>::default(),
+        }
+    }
+}
 
+
+// TODO: can we megastruct these and collapse the codepaths?
+#[derive(Debug)]
+struct Peer {
+    root_public_key: [u8; 32],
+    endpoint: Option<SecureUdpEndpoint>,
+    outgoing_handshake_state: Option<HandshakeState>,
+    pending_client_ack_stateless_transport_state: Option<StatelessTransportState>,
+    stateless_transport_state: Option<StatelessTransportState>,
+    watch_dog: Instant,
+
+    transport: PeerTransport,
 
     connection_is_unknown: bool,
 
@@ -1222,21 +1239,15 @@ struct Peer {
     latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
-    fn default() -> Peer {
-        Peer {
+    fn default() -> Self {
+        Self {
             root_public_key: [0_u8; 32],
             endpoint: None,
             outgoing_handshake_state: None,
-            pending_client_ack_transport_state: None,
-            transport_state: None,
+            pending_client_ack_stateless_transport_state: None,
+            stateless_transport_state: None,
             watch_dog: Instant::now(),
-
-            nonce_ack_latest: 0,
-            nonce_ack_field: 0,
-            on_send_next_nonce: 0,
-            sent_packets:              RingStream::<SentPacket, 1024>::default(),
-            received_packets:          RingStream::<ReceivedPacket, 1024>::default(),
-            acknowledged_sent_packets: RingStream::<AcknowledgedSentPacket, 1024>::default(),
+            transport: PeerTransport::default(),
 
             connection_is_unknown: false,
             unacted_upon_status_height: None,
@@ -1258,13 +1269,11 @@ impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 #[derive(Debug)]
 struct UnknownPeer {
     endpoint: SecureUdpEndpoint,
-    transport_state: StatelessTransportState,
+    stateless_transport_state: StatelessTransportState,
     pending_client_ack: bool,
     watch_dog: Instant,
 
-    nonce_ack_latest: u64,
-    nonce_ack_field: u64,
-    on_send_next_nonce: u64,
+    transport: PeerTransport,
 }
 
 #[derive(Clone, Copy)]
@@ -1684,41 +1693,41 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 });
                 for peer in &mut peers {
                     if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
-                        if peer.transport_state.is_some() {
+                        if peer.stateless_transport_state.is_some() {
                             println!("{:05}: Disconnected from peer {:?}", my_port, peer.endpoint);
                         }
                         peer.outgoing_handshake_state           = None;
-                        peer.pending_client_ack_transport_state = None;
-                        peer.transport_state                    = None;
+                        peer.pending_client_ack_stateless_transport_state = None;
+                        peer.stateless_transport_state                    = None;
                         peer.watch_dog                          = Instant::now();
                     }
 
-                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.stateless_transport_state) {
                         if peer.connection_is_unknown {
                             // Gossip evidence in order to trigger upgrade
                             if let Some(evidence) = my_endpoint_evidence {
-                                let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
+                                let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field); // @TodoHeaderAndStatus
                                 let mut o  = 0;
                                 o += header  .write_to(&mut send_buf1[o..]);
                                 o += evidence.write_to(&mut send_buf1[o..]);
-                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
                         } else {
-                            let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.nonce_ack_latest, peer.nonce_ack_field);
+                            let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field);
                             let mut o  = 0;
-                            o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.on_send_next_nonce);
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                            o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.on_send_next_nonce);
+                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
                 for peer in &mut peers {
                     if let Some(peer_endpoint) = peer.endpoint {
-                        if peer.transport_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_transport_state.is_none() {
+                        if peer.stateless_transport_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_stateless_transport_state.is_none() {
                             let mut outgoing_state: HandshakeState = snow::Builder::new(noise_params.clone())
                                 .local_private_key(&my_static_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
-                            let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
+                            let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field); // @TodoHeaderAndStatus
                             let mut o = 0;
                             o += header.write_to(&mut send_buf1[o..]);
                             let n = outgoing_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
@@ -1728,12 +1737,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         }
 
                         if let (Some(transport), Some(evidence)) =
-                            (&mut peer.transport_state, roster_endpoint_evidence.choose(&mut base_rng)) {
-                            let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
+                            (&mut peer.stateless_transport_state, roster_endpoint_evidence.choose(&mut base_rng)) {
+                            let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field); // @TodoHeaderAndStatus
                             let mut o = 0;
                             o += header  .write_to(&mut send_buf1[o..]);
                             o += evidence.write_to(&mut send_buf1[o..]);
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
@@ -1763,7 +1772,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                 chunk_hdr.chunk_i = chunk_i as u32;
 
-                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
+                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field); // @TodoHeaderAndStatus
 
                                 let mut o = 0;
                                 o += header   .write_to(&mut send_buf1[o..]);
@@ -1788,11 +1797,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     }}
                                 }
 
-                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
+                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.stateless_transport_state) {
                                     if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
 
                                     sent_chunk_cs += 1;
-                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
+                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
                                 }
                             }
                         }
@@ -1806,7 +1815,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             continue;
                         }
 
-                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer.nonce_ack_latest, peer.nonce_ack_field); // @TodoHeaderAndStatus
+                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field); // @TodoHeaderAndStatus
                         let mut packet = PacketVotes {
                             height, round,
                             value_id: chunk_hdr.proposal_id,
@@ -1836,8 +1845,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     let mut o = 0;
                                     o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
+                                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.stateless_transport_state) {
+                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, send_buf2, &mut send_buf1[..o], stats);
                                     }
 
                                     packet.no_votes_n  = 0;
@@ -1862,8 +1871,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             o += header.write_to(&mut send_buf1[o..]);
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
-                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.transport_state) {
-                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..o], stats);
+                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.stateless_transport_state) {
+                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, send_buf2, &send_buf1[..o], stats);
                             }
                         }
                     }
@@ -1962,10 +1971,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             let peer_endpoint = peers[i].endpoint.unwrap();
             loop {
                 let peer = &mut peers[i];
-                if let Some(transport) = &mut peer.transport_state {
+                if let Some(transport) = &mut peer.stateless_transport_state {
                     nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
                     if let Ok(length) = transport.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        if nonce_is_ok(nonce, peer.nonce_ack_latest, peer.nonce_ack_field) {
+                        if nonce_is_ok(nonce, peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field) {
                             msg        = Some(&recv_buf2[0..length]);
                             peer_index = i;
                         }
@@ -1979,19 +1988,19 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            peer.on_send_next_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
+                            peer.transport.on_send_next_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
                             let header = PacketHeader::new_(packet_type, 0, 0); // @TodoHeaderAndStatus
                             let mut o = 0;
                             o += header.write_to(&mut send_buf1[o..]);
 
-                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..o], stats);
+                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.transport.on_send_next_nonce, send_buf2, &send_buf1[..o], stats);
 
-                            peer.transport_state                    = Some(transport);
+                            peer.stateless_transport_state                    = Some(transport);
                             peer.outgoing_handshake_state           = None;
-                            peer.pending_client_ack_transport_state = None;
-                            peer.nonce_ack_latest                   = nonce;
-                            peer.nonce_ack_field                    = !0;
+                            peer.pending_client_ack_stateless_transport_state = None;
+                            peer.transport.nonce_ack_latest                   = nonce;
+                            peer.transport.nonce_ack_field                    = !0;
                             peer.connection_is_unknown              = connection_is_unknown;
                         }
 
@@ -2009,7 +2018,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         process_acks(peer, header);
 
                         if packet_type == PACKET_TYPE_SERVER_HELLO {
-                            if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
+                            if peer.pending_client_ack_stateless_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
                                 if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                     println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
                                     finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
@@ -2036,7 +2045,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         }
                     }
                 }
-                if let Some(incoming) = &mut peer.pending_client_ack_transport_state {
+                if let Some(incoming) = &mut peer.pending_client_ack_stateless_transport_state {
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
@@ -2044,10 +2053,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let packet_type = header.type_();
                         if packet_type == PACKET_TYPE_CLIENT_ACK {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
-                            peer.transport_state          = peer.pending_client_ack_transport_state.take();
+                            peer.stateless_transport_state          = peer.pending_client_ack_stateless_transport_state.take();
                             peer.outgoing_handshake_state = None;
-                            peer.nonce_ack_latest         = nonce;
-                            peer.nonce_ack_field          = !0;
+                            peer.transport.nonce_ack_latest         = nonce;
+                            peer.transport.nonce_ack_field          = !0;
                             peer.connection_is_unknown    = false;
                             break;
                         }
@@ -2078,8 +2087,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
 
                             if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
-                                peer.pending_client_ack_transport_state = Some(transport);
-                                peer.on_send_next_nonce                 = start_nonce+1;
+                                peer.pending_client_ack_stateless_transport_state = Some(transport);
+                                peer.transport.on_send_next_nonce                 = start_nonce+1;
                             }
                             break;
                         }
@@ -2092,7 +2101,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.ip_address == from_ip && p.endpoint.port == from_port) {
                     let peer = &mut unknown_peers[i];
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
-                    if let Ok(length) = peer.transport_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
+                    if let Ok(length) = peer.stateless_transport_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.type_();
@@ -2100,14 +2109,14 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if packet_type == PACKET_TYPE_CLIENT_UNKNOWN_ACK {
                                 println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
                                 peer.pending_client_ack = false;
-                                peer.nonce_ack_latest   = nonce;
-                                peer.nonce_ack_field    = !0;
+                                peer.transport.nonce_ack_latest   = nonce;
+                                peer.transport.nonce_ack_field    = !0;
                                 break;
                             }
                             break;
                         }
 
-                        if nonce_is_ok(nonce, peer.nonce_ack_latest, peer.nonce_ack_field) {
+                        if nonce_is_ok(nonce, peer.transport.nonce_ack_latest, peer.transport.nonce_ack_field) {
                             msg             = Some(&header_and_local_msg);
                             peer_index      = i;
                             peer_is_unknown = true;
@@ -2140,8 +2149,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                         send_sock_msg(&ctx_str, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
 
-                        if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
-                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, transport_state: transport, pending_client_ack: true, watch_dog: Instant::now(), nonce_ack_latest: 0, nonce_ack_field: 0, on_send_next_nonce: start_nonce+1, });
+                        if let Ok(stateless_stateless_transport_state) = incoming_state.into_stateless_transport_mode() {
+                            let mut transport = PeerTransport::default();
+                            transport.on_send_next_nonce = start_nonce + 1;
+                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, stateless_transport_state: stateless_stateless_transport_state, pending_client_ack: true, watch_dog: Instant::now(), transport });
                         }
                         break;
                     }
@@ -2160,7 +2171,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
             peer.watch_dog = Instant::now();
-            nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
+            nonce_update(nonce, &mut peer.transport.nonce_ack_latest, &mut peer.transport.nonce_ack_field);
 
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
@@ -2170,12 +2181,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint);
                             let peer = unknown_peers.remove(peer_index);
                             peers[i].outgoing_handshake_state           = None;
-                            peers[i].pending_client_ack_transport_state = None;
-                            peers[i].transport_state                    = Some(peer.transport_state);
+                            peers[i].pending_client_ack_stateless_transport_state = None;
+                            peers[i].stateless_transport_state                    = Some(peer.stateless_transport_state);
                             peers[i].watch_dog                          = Instant::now();
-                            peers[i].nonce_ack_latest                   = peer.nonce_ack_latest;
-                            peers[i].nonce_ack_field                    = peer.nonce_ack_field;
-                            peers[i].on_send_next_nonce                 = peer.on_send_next_nonce;
+                            peers[i].transport                          = peer.transport;
                             peers[i].connection_is_unknown              = false;
                         }
                         roster_endpoint_evidence.retain(|e| e.root_public_key != evidence.root_public_key);
@@ -2183,7 +2192,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     }
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 }
-                _ => println!("{:05}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr),
+                _ => println!("{:05}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.nonce_ack_field, msg, addr),
             }
             continue;
         }
@@ -2191,7 +2200,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         else {
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
-            nonce_update(nonce, &mut peer.nonce_ack_latest, &mut peer.nonce_ack_field);
+            nonce_update(nonce, &mut peer.transport.nonce_ack_latest, &mut peer.transport.nonce_ack_field);
 
             // TODO: other TAGs should also cause this transition
             if let Some(status) = status {
@@ -2257,7 +2266,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 }
 
                 PACKET_TYPE_EMPTY => {}
-                _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.nonce_ack_field, msg, addr);
+                _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.nonce_ack_field, msg, addr);
             }
             continue;
         }
