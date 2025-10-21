@@ -72,10 +72,18 @@ struct TMDecision {
     //signatures: Vec<TMSig>, // ability to prove to others e.g. those catching up
 }
 
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct SentPacket {
-    bytes: u64,
-    time_sent: f64,
+    bytes: usize,
+    time_sent: tokio::time::Instant,
+}
+impl Default for SentPacket {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            time_sent: Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -1659,11 +1667,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             }
             o
         }
-        fn send_sock_msg(ctx_str: &str, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
+        fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
             match sock.try_send_to(msg, addr) {
                 Ok(_) => {
+                    transport.sent_packets.set(SentPacket { bytes: msg.len(), time_sent: Instant::now() }, transport.nonce as usize);
+
                     stats.packets_sent += 1;
                     stats.bytes_sent += msg.len();
                     ()
@@ -1672,13 +1682,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 Err(error) => panic!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
             }
         }
-        fn send_noise_msg(ctx_str: &str, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
+        fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
             let mut o = 0;
-            o += nonce                    .write_to(                  &mut send_buf2[o..]);
-            o += snow_state.write_message(*nonce, msg, &mut send_buf2[o..]).unwrap();
-            send_sock_msg(ctx_str, sock, peer_endpoint, &send_buf2[..o], stats);
+            o += transport.nonce.write_to(                           &mut send_buf2[o..]);
+            o += snow_state     .write_message(transport.nonce, msg, &mut send_buf2[o..]).unwrap();
+            send_sock_msg(ctx_str, transport, sock, peer_endpoint, &send_buf2[..o], stats);
 
-            *nonce += 1;
+            transport.nonce += 1;
         }
 
         let was_now = tokio::time::Instant::now();
@@ -1702,7 +1712,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         peer.watch_dog                          = Instant::now();
                     }
 
-                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.snow_state) {
+                    if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
                         if peer.connection_is_unknown {
                             // Gossip evidence in order to trigger upgrade
                             if let Some(evidence) = my_endpoint_evidence {
@@ -1710,13 +1720,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 let mut o  = 0;
                                 o += header  .write_to(&mut send_buf1[o..]);
                                 o += evidence.write_to(&mut send_buf1[o..]);
-                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                                send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
                         } else {
                             let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
                             let mut o  = 0;
                             o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                            send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
@@ -1732,17 +1742,17 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             o += header.write_to(&mut send_buf1[o..]);
                             let n = outgoing_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                             // TODO: no nonce?
-                            send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
+                            send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
                             peer.outgoing_handshake_state = Some(outgoing_state);
                         }
 
-                        if let (Some(transport), Some(evidence)) =
+                        if let (Some(snow_state), Some(evidence)) =
                             (&mut peer.snow_state, roster_endpoint_evidence.choose(&mut base_rng)) {
                             let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
                             let mut o = 0;
                             o += header  .write_to(&mut send_buf1[o..]);
                             o += evidence.write_to(&mut send_buf1[o..]);
-                            send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.nonce, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                            send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
@@ -1797,11 +1807,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     }}
                                 }
 
-                                if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.snow_state) {
+                                if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
                                     if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
 
                                     sent_chunk_cs += 1;
-                                    send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.nonce, send_buf2, &mut send_buf1[..o], stats);
+                                    send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
                                 }
                             }
                         }
@@ -1845,8 +1855,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     let mut o = 0;
                                     o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.snow_state) {
-                                        send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.nonce, send_buf2, &mut send_buf1[..o], stats);
+                                    if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
+                                        send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
                                     }
 
                                     packet.no_votes_n  = 0;
@@ -1871,8 +1881,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             o += header.write_to(&mut send_buf1[o..]);
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
-                            if let (Some(peer_endpoint), Some(transport)) = (peer.endpoint, &mut peer.snow_state) {
-                                send_noise_msg(&ctx_str, transport, &sock, peer_endpoint, &mut peer.transport.nonce, send_buf2, &send_buf1[..o], stats);
+                            if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
+                                send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
                             }
                         }
                     }
@@ -1971,9 +1981,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             let peer_endpoint = peers[i].endpoint.unwrap();
             loop {
                 let peer = &mut peers[i];
-                if let Some(transport) = &mut peer.snow_state {
+                if let Some(snow_state) = &mut peer.snow_state {
                     nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
-                    if let Ok(length) = transport.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
+                    if let Ok(length) = snow_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
                             msg        = Some(&recv_buf2[0..length]);
                             peer_index = i;
@@ -1984,7 +1994,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: snow::StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
+                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut snow_state: snow::StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
@@ -1994,9 +2004,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             let mut o = 0;
                             o += header.write_to(&mut send_buf1[o..]);
 
-                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.transport.nonce, send_buf2, &send_buf1[..o], stats);
+                            send_noise_msg(ctx_str, &mut peer.transport, &mut snow_state, sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
 
-                            peer.snow_state                    = Some(transport);
+                            peer.snow_state                    = Some(snow_state);
                             peer.outgoing_handshake_state           = None;
                             peer.pending_client_ack_snow_state = None;
                             peer.transport.ack_latest                   = nonce;
@@ -2019,9 +2029,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         if packet_type == PACKET_TYPE_SERVER_HELLO {
                             if peer.pending_client_ack_snow_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
-                                if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
+                                if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                     println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
+                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, false, &mut net_stats);
                                 }
                                 break;
                             }
@@ -2030,7 +2040,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             let other_side_port     = &local_msg[16..18];
                             let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
                             // TODO hash
-                            if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
+                            if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                 println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, other_side_endpoint);
 
                                 if my_endpoint_evidence.is_none() {
@@ -2039,7 +2049,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     my_endpoint_evidence = Some(evidence);
                                 }
 
-                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true, &mut net_stats);
+                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, true, &mut net_stats);
                             }
                             break;
                         }
@@ -2084,11 +2094,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             o += header     .write_to(&mut send_buf1[o..]);
 
                             let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-                            send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
 
-                            if let Ok(transport) = incoming_state.into_stateless_transport_mode() {
-                                peer.pending_client_ack_snow_state = Some(transport);
-                                peer.transport.nonce                 = start_nonce+1;
+                            // NOTE(Phillip): Let me know if there is an important reason to send the sock message when unsuccessfully entering stateless transport mode
+                            if let Ok(snow_state) = incoming_state.into_stateless_transport_mode() {
+                                peer.transport.nonce = start_nonce; // @Cleanup @Lazy.
+                                send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
+                                peer.transport.nonce += 1;
+                                peer.pending_client_ack_snow_state = Some(snow_state);
                             }
                             break;
                         }
@@ -2147,11 +2159,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         o += from_port  .write_to(&mut send_buf1[o..]);
 
                         let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-                        send_sock_msg(&ctx_str, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
 
+                        // NOTE(Phillip): Let me know if there is an important reason to send the sock message when unsuccessfully entering stateless transport mode
                         if let Ok(stateless_snow_state) = incoming_state.into_stateless_transport_mode() {
                             let mut transport = PeerTransport::default();
-                            transport.nonce = start_nonce + 1;
+                            transport.nonce = start_nonce;
+                            send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
+                            transport.nonce += 1;
                             unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport });
                         }
                         break;
