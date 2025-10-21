@@ -1904,6 +1904,24 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             votes: [ PubKeySig::NIL; 18 ],
                         };
 
+                        fn dbg_check_votes(ctx_str: &str, roster: &[SortedRosterMember], is_precommit: usize, packet: &PacketVotes) {
+                            #[cfg(debug_assertions)] // self-check signatures as sanity check
+                            for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+                                let (roster_i, sig) = (packet.votes[i].roster_i as usize, &packet.votes[i].sig);
+                                let Some(member) = roster.get(roster_i) else {
+                                    eprintln!("{ctx_str}: \x1b[91mBFT ERROR\x1b[0m: {} from {roster_i} - not in roster {}.{}: {}", ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
+                                    return;
+                                };
+                                let pub_key = member.pub_key;
+                                let sign_datas = make_vote_sign_datas(pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                                let sign_data  = &sign_datas[(i >= packet.no_votes_n as usize) as usize];
+                                match sig.verify(pub_key, sign_data) { Ok(_)=>{} Err((err, str)) => {
+                                    eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
+                                        sign_data.len(), ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
+                                }}
+                            }
+                        }
+
                         for roster_i in 0..round_data.msg_val_sigs.len() {
                             let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
                             if sig != TMSig::NIL {
@@ -1928,23 +1946,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
                                 };
 
-                                #[cfg(debug_assertions)]
-                                { // self-check signatures as sanity check
-                                    let pub_key    = round_data.roster[roster_i].pub_key;
-                                    let sign_datas = make_vote_sign_datas(pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                                    let sign_data  = &sign_datas[(value_id != ValueId::NIL) as usize];
-                                    match sig.verify(pub_key, sign_data) { Ok(_)=>{} Err((err, str)) => {
-                                        eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for {} from {roster_i}-{pub_key:?} {height}.{round}: {} {err}",
-                                            sign_data.len(), ["prevote", "precommit"][is_precommit as usize], packet.value_id);
-                                        continue;
-                                    }}
-                                }
-
 
                                 if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                     sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
                                     // full evidence block; send it
                                     if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
+                                    dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
+
                                     let mut o = 0;
                                     o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
@@ -1967,6 +1975,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             }
 
                             if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
+                            dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                             let mut o = 0;
                             o += header.write_to(&mut send_buf1[o..]);
