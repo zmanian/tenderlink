@@ -904,8 +904,8 @@ impl TMState {
 
                 if true {
                     let mut check_counts = ConsensusCounts::ZERO;
-                    for (_, sig) in round_data.msg_val_sigs.iter().enumerate() {
-                        check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
+                    for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                        check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[i].stake));
                     }
                     if check_counts != round_data.counts {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: counts don't match: incremental: {:?}, absolute: {:?}", ctx_str, round_data.counts, check_counts);
@@ -2561,9 +2561,8 @@ pub fn run_instances(i: usize) {
         SigningKey::from(secret_key)
     }).collect();
     let mut cumulative_stake = 0;
-    let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(_, sk)| {
-        //let stake = 2000 * (static_private_keys.len() - 1 - i) as u64;
-        let stake = 1;
+    let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
+        let stake = 2000 * (N - 1 - i) as u64;
         cumulative_stake += stake;
         SortedRosterMember { pub_key: PubKeyID(sk.verification_key().into()), stake, cumulative_stake }
     }).collect();
