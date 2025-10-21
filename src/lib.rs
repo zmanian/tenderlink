@@ -15,7 +15,7 @@ const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
-const PRINT_BFT_TIMEOUTS:   bool = 1 == 1;
+const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
 
 // MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
@@ -1901,14 +1901,18 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
+                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
                             // @TodoPacketHeader
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                             peer.on_send_next_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
-                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &[packet_type], stats);
+                            let header = PacketHeader::new_(packet_type, 0, 0);
+                            let mut o = 0;
+                            o += header.write_to(&mut send_buf1[o..]);
+
+                            send_noise_msg(ctx_str, &mut transport, sock, peer_endpoint, &mut peer.on_send_next_nonce, send_buf2, &send_buf1[..o], stats);
 
                             peer.transport_state                    = Some(transport);
                             peer.outgoing_handshake_state           = None;
@@ -1924,6 +1928,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         nonce = u64::from_le_bytes(recv_buf2[..8].try_into().unwrap());
 
+                        // @Duplicate
                         let header_and_local_msg = &recv_buf2[8..length];
 
                         // @TodoHeaderAndStatus
@@ -1940,13 +1945,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if peer.pending_client_ack_transport_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
                                 if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                     println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr);
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
+                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, false, &mut net_stats);
                                 }
                                 break;
                             }
                         } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
-                            let other_side_ip       = &local_msg[   .. 16];
-                            let other_side_port     = &local_msg[16 .. 18];
+                            let other_side_ip       = &local_msg[  ..16];
+                            let other_side_port     = &local_msg[16..18];
                             let other_side_endpoint = SecureUdpEndpoint { ip_address: other_side_ip.try_into().unwrap(), port: u16::from_le_bytes(other_side_port.try_into().unwrap()), public_key: my_static_keypair.public };
                             // TODO hash
                             if let Ok(transport) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
@@ -1958,7 +1963,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     my_endpoint_evidence = Some(evidence);
                                 }
 
-                                finish_outgoing_handshake(&ctx_str, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true, &mut net_stats);
+                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, transport, nonce, true, &mut net_stats);
                             }
                             break;
                         }
@@ -1967,8 +1972,17 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 if let Some(incoming) = &mut peer.pending_client_ack_transport_state {
                     nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        let local_msg = &recv_buf2[..length];
-                        if local_msg == [PACKET_TYPE_CLIENT_ACK] /* @TodoPacketHeader */ {
+                        // @Duplicate
+                        let header_and_local_msg = &recv_buf2[..length];
+
+                        // @TodoHeaderAndStatus
+                        let header = if let Ok(header_ok) = PacketHeader::read_from(&header_and_local_msg[..]) {
+                            header_ok
+                        } else {
+                            break;
+                        };
+                        let packet_type = header.tag & PACKET_TYPE_MASK;
+                        if packet_type == PACKET_TYPE_CLIENT_ACK {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
                             peer.transport_state          = peer.pending_client_ack_transport_state.take();
                             peer.outgoing_handshake_state = None;
@@ -1992,9 +2006,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                             let start_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
+                            // @TodoHeaderAndStatus
+                            let header = PacketHeader::new::<PACKET_TYPE_SERVER_HELLO>(0, 0);
+
                             let mut o = 0;
-                            o += start_nonce             .write_to(&mut send_buf1[o..]);
-                            o += PACKET_TYPE_SERVER_HELLO.write_to(&mut send_buf1[o..]);
+                            o += start_nonce.write_to(&mut send_buf1[o..]);
+                            o += header     .write_to(&mut send_buf1[o..]);
 
                             let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                             send_sock_msg(&ctx_str, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
@@ -2039,19 +2056,30 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
-                    let local_msg = &recv_buf2[0..length];
-                    if local_msg == [PACKET_TYPE_CLIENT_HELLO] {
+                    // @Duplicate
+                    let header_and_local_msg = &recv_buf2[..length];
+
+                    // @TodoHeaderAndStatus
+                    let header = if let Ok(header_ok) = PacketHeader::read_from(&header_and_local_msg[..]) {
+                        header_ok
+                    } else {
+                        break;
+                    };
+                    let packet_type = header.tag & PACKET_TYPE_MASK;
+                    if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
                         // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                         let start_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
+                        let header = PacketHeader::new::<PACKET_TYPE_SERVER_UNKNOWN_HELLO>(0, 0); // @TodoHeaderAndStatus
+
                         let mut o = 0;
-                        o += start_nonce                     .write_to(&mut send_buf1[o..]);
-                        o += PACKET_TYPE_SERVER_UNKNOWN_HELLO.write_to(&mut send_buf1[o..]);
-                        o += from_ip                         .write_to(&mut send_buf1[o..]);
-                        o += from_port                       .write_to(&mut send_buf1[o..]);
+                        o += start_nonce.write_to(&mut send_buf1[o..]);
+                        o += header     .write_to(&mut send_buf1[o..]); // @TodoPacketHeader
+                        o += from_ip    .write_to(&mut send_buf1[o..]);
+                        o += from_port  .write_to(&mut send_buf1[o..]);
 
                         let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                         send_sock_msg(&ctx_str, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
