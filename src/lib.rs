@@ -10,6 +10,7 @@ const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
+const PRINT_SIGN:           bool = 0 == 1;
 const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
@@ -622,6 +623,7 @@ impl TMState {
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
                     let sig = self.my_signing_key.sign(&buf[..o]).to_bytes();
+                    if PRINT_SIGN { println!("{}: signed proposal with {:?}", self.ctx_str(roster), TMSig(sig)) };
 
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
@@ -639,6 +641,7 @@ impl TMState {
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
                 let sig         = self.my_signing_key.sign(&signed_data).to_bytes();
+                if PRINT_SIGN { println!("{} signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], TMSig(sig)) };
 
                 self.check_and_incorporate_msg(
                     height, round, 0, value_id, -2,
@@ -1911,6 +1914,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
                                 // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
+                                if value_id != ValueId::NIL && value_id != packet.value_id {
+                                    eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: local mismastch: {:?} vs {:?}", ctx_str, packet.value_id, value_id);
+                                }
+
                                 // add nos and yeses from opposite ends to avoid excess moves
                                 if value_id == ValueId::NIL {
                                     packet.votes[packet.no_votes_n as usize] = pub_key_sig;
@@ -1919,6 +1926,24 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     packet.yes_votes_n += 1; // *intentionally* pre-decrement because we're indexing from end
                                     packet.votes[packet.votes.len() - packet.yes_votes_n as usize] = pub_key_sig;
                                 };
+
+                                #[cfg(debug_assertions)]
+                                { // self-check signatures as sanity check
+                                    let sign = Signature::from_bytes(&sig.0);
+                                    let pub_key = round_data.roster[roster_i].pub_key;
+                                    let vk = match VerificationKey::try_from(pub_key.0) { Ok(v)=>v, Err(err)=>{
+                                        eprintln!("{}: BFT FAULT: invalid proposal public key: {} ({})", ctx_str, proposer_pub_key, err);
+                                        continue;
+                                    }};
+                                    let sign_datas = make_vote_sign_datas(pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                                    match vk.verify(&sign, &sign_datas[(value_id != ValueId::NIL) as usize]) { Ok(_)=>{}, Err(err)=>{
+                                        eprintln!("{}: BFT FAULT: invalid signature from {}-{:?} for {} {}.{}[..{}]: {:?} {} {}",
+                                            ctx_str, roster_i, pub_key, ["prevote", "precommit"][is_precommit as usize],
+                                            height, round, sign_datas[0].len(), sig, packet.value_id, err);
+                                        continue;
+                                    }}
+                                }
+
 
                                 if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                     sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
