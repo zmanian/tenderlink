@@ -39,7 +39,7 @@ use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey
 use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
-use snow::{resolvers::CryptoResolver, HandshakeState, StatelessTransportState};
+use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
@@ -1226,9 +1226,9 @@ impl Default for PeerTransport {
 struct Peer {
     root_public_key: [u8; 32],
     endpoint: Option<SecureUdpEndpoint>,
-    outgoing_handshake_state: Option<HandshakeState>,
-    pending_client_ack_snow_state: Option<StatelessTransportState>,
-    snow_state: Option<StatelessTransportState>,
+    outgoing_handshake_state: Option<snow::HandshakeState>,
+    pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
+    snow_state: Option<snow::StatelessTransportState>,
     watch_dog: Instant,
 
     transport: PeerTransport,
@@ -1269,7 +1269,7 @@ impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 #[derive(Debug)]
 struct UnknownPeer {
     endpoint: SecureUdpEndpoint,
-    snow_state: StatelessTransportState,
+    snow_state: snow::StatelessTransportState,
     pending_client_ack: bool,
     watch_dog: Instant,
 
@@ -1672,7 +1672,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 Err(error) => panic!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
             }
         }
-        fn send_noise_msg(ctx_str: &str, snow_state: &mut StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
+        fn send_noise_msg(ctx_str: &str, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, nonce: &mut u64, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
             let mut o = 0;
             o += nonce                    .write_to(                  &mut send_buf2[o..]);
             o += snow_state.write_message(*nonce, msg, &mut send_buf2[o..]).unwrap();
@@ -1723,7 +1723,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 for peer in &mut peers {
                     if let Some(peer_endpoint) = peer.endpoint {
                         if peer.snow_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_snow_state.is_none() {
-                            let mut outgoing_state: HandshakeState = snow::Builder::new(noise_params.clone())
+                            let mut outgoing_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
                                 .local_private_key(&my_static_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
@@ -1984,7 +1984,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
+                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: snow::StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
@@ -2062,7 +2062,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         }
                     }
                 }
-                let mut incoming_state: HandshakeState = snow::Builder::new(noise_params.clone())
+                let mut incoming_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
@@ -2124,7 +2124,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         break;
                     }
                 }
-                let mut incoming_state: HandshakeState = snow::Builder::new(noise_params.clone())
+                let mut incoming_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
