@@ -1902,13 +1902,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
                         fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut transport: StatelessTransportState, nonce: u64, connection_is_unknown: bool, stats: &mut NetworkStats) {
-                            // @TodoPacketHeader
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
                             peer.on_send_next_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
 
-                            let header = PacketHeader::new_(packet_type, 0, 0);
+                            let header = PacketHeader::new_(packet_type, 0, 0); // @TodoHeaderAndStatus
                             let mut o = 0;
                             o += header.write_to(&mut send_buf1[o..]);
 
@@ -1928,13 +1927,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         nonce = u64::from_le_bytes(recv_buf2[..8].try_into().unwrap());
 
-                        // @Duplicate
-                        let header_and_local_msg = &recv_buf2[8..length];
-
-                        // @TodoHeaderAndStatus
-                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; };
+                        let header_and_local_msg = &recv_buf2[8..length]; // @Duplicate
+                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.tag & PACKET_TYPE_MASK;
-
                         let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
 
                         if packet_type == PACKET_TYPE_SERVER_HELLO {
@@ -1966,13 +1961,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     }
                 }
                 if let Some(incoming) = &mut peer.pending_client_ack_transport_state {
-                    nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
+                    nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        // @Duplicate
-                        let header_and_local_msg = &recv_buf2[..length];
-
-                        // @TodoHeaderAndStatus
-                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; };
+                        let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
+                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.tag & PACKET_TYPE_MASK;
                         if packet_type == PACKET_TYPE_CLIENT_ACK {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
@@ -1989,8 +1981,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
-                    let local_msg = &recv_buf2[..length];
-                    if local_msg == &[PACKET_TYPE_CLIENT_HELLO] /* @TodoPacketHeader */ {
+                    let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
+                    let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
+                    let packet_type = header.tag & PACKET_TYPE_MASK;
+                    if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
                         if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
@@ -2022,11 +2016,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             loop {
                 if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.ip_address == from_ip && p.endpoint.port == from_port) {
                     let peer = &mut unknown_peers[i];
-                    nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
+                    nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = peer.transport_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        let local_msg = &recv_buf2[0..length];
+                        let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
+                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
+                        let packet_type = header.tag & PACKET_TYPE_MASK;
                         if peer.pending_client_ack {
-                            if local_msg == [PACKET_TYPE_CLIENT_UNKNOWN_ACK] {
+                            if packet_type == PACKET_TYPE_CLIENT_UNKNOWN_ACK {
                                 println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
                                 peer.pending_client_ack = false;
                                 peer.nonce_ack_latest   = nonce;
@@ -2037,7 +2033,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         }
 
                         if nonce_is_ok(nonce, peer.nonce_ack_latest, peer.nonce_ack_field) {
-                            msg             = Some(&recv_buf2[0..length]);
+                            msg             = Some(&header_and_local_msg);
                             peer_index      = i;
                             peer_is_unknown = true;
                         }
@@ -2048,11 +2044,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     .local_private_key(&my_static_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
-                    // @Duplicate
-                    let header_and_local_msg = &recv_buf2[..length];
-
-                    // @TodoHeaderAndStatus
-                    let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; };
+                    let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
+                    let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                     let packet_type = header.tag & PACKET_TYPE_MASK;
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
@@ -2065,7 +2058,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                         let mut o = 0;
                         o += start_nonce.write_to(&mut send_buf1[o..]);
-                        o += header     .write_to(&mut send_buf1[o..]); // @TodoPacketHeader
+                        o += header     .write_to(&mut send_buf1[o..]);
                         o += from_ip    .write_to(&mut send_buf1[o..]);
                         o += from_port  .write_to(&mut send_buf1[o..]);
 
