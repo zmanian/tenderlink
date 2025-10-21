@@ -1286,6 +1286,7 @@ struct UnknownPeer {
     watch_dog: Instant,
 
     transport: PeerTransport,
+    unacted_upon_status_height: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1778,10 +1779,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         if peer.snow_state.is_some() {
                             println!("{:05}: Disconnected from peer {:?}", my_port, peer.endpoint);
                         }
-                        peer.outgoing_handshake_state           = None;
+                        peer.outgoing_handshake_state = None;
                         peer.pending_client_ack_snow_state = None;
-                        peer.snow_state                    = None;
-                        peer.watch_dog                          = Instant::now();
+                        peer.snow_state = None;
+                        peer.watch_dog = Instant::now();
+                        peer.unacted_upon_status_height = None;
+                        peer.latest_status = None;
                     }
 
                     if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
@@ -1794,12 +1797,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 o += evidence.write_to(&mut send_buf1[o..]);
                                 send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
-                        } else {
-                            let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
-                            let mut o  = 0;
-                            o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
-                            send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
+                        let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
+                        let mut o  = 0;
+                        o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
+                        send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                     }
                 }
                 for peer in &mut peers {
@@ -1809,6 +1811,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 .local_private_key(&my_static_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
+                            peer.transport = PeerTransport::default();
                             let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
                             let mut o = 0;
                             o += header.write_to(&mut send_buf1[o..]);
@@ -1833,7 +1836,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&mut roster).await;
 
-                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer: &mut Peer, sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
+                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1854,7 +1857,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                 chunk_hdr.chunk_i = chunk_i as u32;
 
-                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
+                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
 
                                 let mut o = 0;
                                 o += header   .write_to(&mut send_buf1[o..]);
@@ -1879,12 +1882,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     }}
                                 }
 
-                                if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
-                                    if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer.root_public_key); }
-
-                                    sent_chunk_cs += 1;
-                                    send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
-                                }
+                                if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_root_public_key); }
+                                sent_chunk_cs += 1;
+                                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
                             }
                         }
                     }
@@ -1897,7 +1897,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             continue;
                         }
 
-                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
+                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
                         let mut packet = PacketVotes {
                             height, round,
                             value_id: chunk_hdr.proposal_id,
@@ -1927,9 +1927,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                     let mut o = 0;
                                     o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
-                                        send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
-                                    }
+                                    send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
 
                                     packet.no_votes_n  = 0;
                                     packet.yes_votes_n = 0;
@@ -1953,9 +1951,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             o += header.write_to(&mut send_buf1[o..]);
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
-                            if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
-                                send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
-                            }
+                            send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
                         }
                     }
 
@@ -1977,19 +1973,28 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 for peer_i in 0..peers.len() {
                     let peer = &mut peers[peer_i];
+                    if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
                     if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
                         peer.unacted_upon_status_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut net_stats);
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_key, &sock, &mut net_stats);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
                         for round_i in current_height_start_i..bft_state.rounds_data.len()
                         {
                             let round_data = &bft_state.rounds_data[round_i];
-                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, peer, &sock, &mut net_stats);
+                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_key, &sock, &mut net_stats);
                         }
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
+                    }
+                }
+
+                for peer_i in 0..unknown_peers.len() {
+                    let peer = &mut unknown_peers[peer_i];
+                    if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
+                        peer.unacted_upon_status_height = None;
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
                     }
                 }
 
@@ -2277,7 +2282,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             transport.nonce = start_nonce;
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
-                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport });
+                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport, unacted_upon_status_height: None });
                         }
                         break;
                     }
@@ -2300,6 +2305,10 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
             process_acks(&mut peer.transport, header);
 
+            if let Some(status) = status {
+                peer.unacted_upon_status_height = Some(status.height);
+            }
+
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
@@ -2318,8 +2327,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         roster_endpoint_evidence.push(evidence);
                     }
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
-                }
-                _ => println!("{:05}:  From unknown peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.ack_field, msg, addr),
+                },
+                PACKET_TYPE_EMPTY => (),
+                _ => println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
             }
             continue;
         }
@@ -2502,6 +2512,7 @@ impl PacketStatus {
 }
 
 const PACKET_HEADER_SIZE: usize = 8 + 8; // 16
+#[derive(Debug, Clone, Copy)]
 struct PacketHeader {
     tag_and_ack: u64,
     ack_field: u64,
