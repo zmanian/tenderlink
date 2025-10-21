@@ -32,6 +32,10 @@ const MAX_PATH_HEADERS_SIZE: usize = (IPV6_HEADER_SIZE + UDP_HEADER_SIZE + WIREG
 
 const PATH_MTU: usize = ETHERNET_FRAME_SIZE - MAX_PATH_HEADERS_SIZE;
 
+// Tweak this!
+const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
+
+
 use static_assertions::{const_assert};
 use std::{io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -88,12 +92,12 @@ impl Default for SentPacket {
 
 #[derive(Debug, Default, Copy, Clone)]
 struct ReceivedPacket {
-    bytes: u64,
+    bytes: usize,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
 struct AcknowledgedSentPacket {
-    bytes: u64,
+    bytes: usize,
     rtt: f64,
 }
 
@@ -1484,7 +1488,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         SimRng::new(seed, 0)
     }));
 
-    let should_propose_bad_value_sometimes = my_endpoint.is_some(); // peer 0 only
+    let should_propose_bad_value_sometimes = false; // my_endpoint.is_some(); // peer 0 only
 
     let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
     let decisions2 = Arc::clone(&decisions);
@@ -1668,12 +1672,50 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             o
         }
         fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
+            // println!("Packet sent! Nonce: {}! {} bytes!", transport.nonce, msg.len());
+
+            transport.sent_packets.set(SentPacket { bytes: msg.len(), time_sent: Instant::now() }, transport.nonce as usize);
+
+            // TODO(phil) move this code
+            let bytes_in_flight = {
+                let mut bytes_in_flight = 0;
+                for slot_i in 0..transport.sent_packets.slots.len() {
+                    bytes_in_flight += transport.sent_packets.slots[slot_i].value.bytes;
+                }
+                bytes_in_flight
+            };
+
+            let (_, mean_rtt) = {
+                let mut bytes_acknowledged = 0;
+                let mut rtt_sum   = 0.0;
+                let mut rtt_sum_n = 0.0;
+                for slot_i in 0..transport.acknowledged_sent_packets.slots.len() {
+                    let packet = transport.acknowledged_sent_packets.slots[slot_i].value;
+                    bytes_acknowledged += packet.bytes;
+                    if packet.rtt > 0.0 {
+                        rtt_sum   += packet.rtt;
+                        rtt_sum_n += 1.0;
+                    }
+                }
+                if rtt_sum_n <= 0.0 { rtt_sum_n = 1.0; }
+                (bytes_acknowledged, rtt_sum / rtt_sum_n)
+            };
+
+            // TODO(phil): Compute real bandwidth using sliding congestion windows, TCP-style
+            // const BANDWIDTH_SAFETY_MARGIN: f64 =     0.8;
+
+            let target_bytes_in_flight = ((MAX_BANDWIDTH_BYTES_PER_SECOND as f64 * mean_rtt.max(0.01)) as usize).max(PATH_MTU);
+
+            // NOTE(phil) probabilistically lerp down towards 0 likelihood of sending a packet as we approach bandwidth limit
+            let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
+            if rand::random::<f64>() < rand_t {
+                return;
+            }
+
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
             match sock.try_send_to(msg, addr) {
                 Ok(_) => {
-                    transport.sent_packets.set(SentPacket { bytes: msg.len(), time_sent: Instant::now() }, transport.nonce as usize);
-
                     stats.packets_sent += 1;
                     stats.bytes_sent += msg.len();
                     ()
@@ -1689,6 +1731,36 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             send_sock_msg(ctx_str, transport, sock, peer_endpoint, &send_buf2[..o], stats);
 
             transport.nonce += 1;
+        }
+
+        fn process_acks(transport: &mut PeerTransport, header: PacketHeader) {
+            let now = Instant::now();
+
+            // println!("Packet ack! {}!", header.ack());
+
+            let mut ack_field = header.ack_field;
+            let ack = header.ack() as usize;
+
+            // TODO(Phil): figure out the off-by-one situation here...
+            if ack >= 64 {
+                for i in ack-64..ack+1 {
+                    let is_acknowledged = (ack_field >> 63) & 1 != 0;
+                    ack_field <<= 1;
+                    if !is_acknowledged { continue; }
+
+                    if let Some(sent_packet) = transport.sent_packets.at(i) &&
+                                sent_packet.bytes > 0 {
+                        transport.acknowledged_sent_packets.set(AcknowledgedSentPacket { bytes: sent_packet.bytes, rtt: now.duration_since(sent_packet.time_sent).as_secs_f64() }, ack);
+
+                        // println!("Packet acked!: {} bytes! {}", sent_packet.bytes, i + 64 - ack);
+
+                        *sent_packet = SentPacket::default();
+                    }
+                }
+            }
+
+            // let rough_packet_loss = 1.0 - (header.ack_field.count_ones() as f64 / 64.0);
+            // println!("Packet loss: {}%.", rough_packet_loss * 100.0);
         }
 
         let was_now = tokio::time::Instant::now();
@@ -1934,7 +2006,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let  bpp =  bpp as u32;
 
                     if kbps != 0 {
-                        println!("{}: \x1b[92mNET\x1b[0m: {} Kb/s | {} packets/s | {} bytes/packet",
+                        println!("{}: \x1b[92mNET\x1b[0m: {} KB/s | {} packets/s | {} bytes/packet",
                                  ctx_str, kbps, pps, bpp);
                     }
                 }
@@ -1948,6 +2020,39 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             } else {
                 next_tick_time += TICK_DURATION;
             }
+        }
+
+        fn timeout_drop(transport: &mut PeerTransport) {
+            let mut rtt_sum   = 0.0;
+            let mut rtt_sum_n = 0.0;
+            for slot_i in 0..transport.acknowledged_sent_packets.slots.len() {
+                let packet = transport.acknowledged_sent_packets.slots[slot_i].value;
+                if packet.rtt > 0.0 {
+                    rtt_sum   += packet.rtt;
+                    rtt_sum_n += 1.0;
+                }
+            }
+
+            let mean_rtt = rtt_sum / rtt_sum_n;
+
+            // NOTE(phil): timeout-drop packets.
+            // TODO(phil): be more intelligent
+            let now = Instant::now();
+            for slot_i in 0..transport.sent_packets.slots.len() {
+                let packet = &mut transport.sent_packets.slots[slot_i].value;
+                if packet.bytes > 0 {
+                    let time_since_sent = now.duration_since(packet.time_sent).as_secs_f64();
+                    if time_since_sent > mean_rtt * 1.5 { // timeout-drop
+                        packet.bytes = 0;
+                    }
+                }
+            }
+        }
+        for peer in &mut unknown_peers {
+            timeout_drop(&mut peer.transport);
+        }
+        for peer in &mut peers {
+            timeout_drop(&mut peer.transport);
         }
 
         let remaining = next_tick_time.saturating_duration_since(was_now);
@@ -1970,10 +2075,6 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
         let mut peer_is_unknown = false;
         let mut nonce = 0;
         let mut msg: Option<&[u8]> = None;
-
-        fn process_acks(peer: &mut Peer, header: PacketHeader) {
-            // peer
-        }
 
         //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
         //      the unknown connections array since that also shouldn't be able to be blocked.
@@ -1998,7 +2099,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             let packet_type = if connection_is_unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            peer.transport.nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
+                            peer.transport.nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
 
                             let header = PacketHeader::new_(packet_type, 0, 0); // @TodoHeaderAndStatus
                             let mut o = 0;
@@ -2025,7 +2126,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let packet_type = header.type_();
                         let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
 
-                        process_acks(peer, header);
+                        process_acks(&mut peer.transport, header);
 
                         if packet_type == PACKET_TYPE_SERVER_HELLO {
                             if peer.pending_client_ack_snow_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
@@ -2061,6 +2162,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.type_();
+
+                        process_acks(&mut peer.transport, header);
+
                         if packet_type == PACKET_TYPE_CLIENT_ACK {
                             println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr);
                             peer.snow_state          = peer.pending_client_ack_snow_state.take();
@@ -2079,13 +2183,16 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                     let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                     let packet_type = header.type_();
+
+                    process_acks(&mut peer.transport, header);
+
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from static key = {:?}", my_port, client_endpoint);
                         if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_key.into(), &peer.root_public_key) {
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            let start_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
+                            let start_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
 
                             let header = PacketHeader::new::<PACKET_TYPE_SERVER_HELLO>(0, 0); // @TodoHeaderAndStatus
 
@@ -2117,6 +2224,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.type_();
+
+                        process_acks(&mut peer.transport, header);
+
                         if peer.pending_client_ack {
                             if packet_type == PACKET_TYPE_CLIENT_UNKNOWN_ACK {
                                 println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr);
@@ -2143,12 +2253,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                     let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                     let packet_type = header.type_();
+
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
                         let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
                         println!("{:05}: Server recieved client hello from unknown peer with static key = {:?}", my_port, client_endpoint);
 
                         // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                        let start_nonce = rand::random::<u64>() >> (PACKET_TYPE_BITS + 1);
+                        let start_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
 
                         let header = PacketHeader::new::<PACKET_TYPE_SERVER_UNKNOWN_HELLO>(0, 0); // @TodoHeaderAndStatus
 
@@ -2187,6 +2298,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             peer.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
 
+            process_acks(&mut peer.transport, header);
+
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_key == evidence.root_public_key) {
@@ -2215,6 +2328,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
+
+            process_acks(&mut peer.transport, header);
 
             // TODO: other TAGs should also cause this transition
             if let Some(status) = status {
@@ -2402,7 +2517,7 @@ impl PacketHeader {
     }
     pub fn new_(tag: u8, ack_latest: u64, ack_field: u64) -> PacketHeader {
         PacketHeader {
-            tag_and_ack: tag as u64 | ((ack_latest) & (u64::MAX >> PACKET_TAG_BITS) << PACKET_TAG_BITS),
+            tag_and_ack: tag as u64 | (ack_latest << PACKET_TAG_BITS),
             ack_field,
         }
     }
