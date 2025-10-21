@@ -1899,7 +1899,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
                         let mut packet = PacketVotes {
                             height, round,
-                            value_id: chunk_hdr.proposal_id,
+                            value_id: round_data.proposal_id,
                             no_votes_n: 0, yes_votes_n: 0,
                             votes: [ PubKeySig::NIL; 18 ],
                         };
@@ -1910,8 +1910,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                                 let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
                                 // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_key.into()), pub_key_sig.pub_key);
 
+                                if packet.value_id == ValueId::NIL {
+                                    // NOTE(azmr): gossip seen votes even if we haven't seen proposal, but only 1 non-nil value id per packet
+                                    packet.value_id = value_id;
+                                }
                                 if value_id != ValueId::NIL && value_id != packet.value_id {
-                                    eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: local mismatch: {:?} vs {:?}", ctx_str, packet.value_id, value_id);
+                                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: local mismatch: {:?} vs {:?}", ctx_str, packet.value_id, value_id);
+                                    continue;
                                 }
 
                                 // add nos and yeses from opposite ends to avoid excess moves
