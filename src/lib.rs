@@ -2766,11 +2766,9 @@ impl CryptoResolver for SnowRngResolver {
 pub fn run_instances(i: usize) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let seed: u64 = if i == usize::MAX {
-        rand::rng().next_u64()
-    } else {
-        const MOCK_RNG_SEED_FOR_MULTIPROCESS: u64 = 0xdeadbeef12345;
-        MOCK_RNG_SEED_FOR_MULTIPROCESS
+    let seed: u64 = {
+        const RNG_SEED_FOR_MULTIPROCESS: u64 = 0xdeadbeef12345;
+        RNG_SEED_FOR_MULTIPROCESS
     };
 
     const N: usize = 4;
