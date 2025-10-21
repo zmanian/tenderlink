@@ -1985,16 +1985,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         }
                     }
 
-                    if PRINT_SEND_CS && sent_chunk_cs > 0 {
-                        eprintln!("{} sent {} proposal chunks", ctx_str, sent_chunk_cs);
-                    }
-
-                    if PRINT_SEND_CS && sent_c[0] > 0 {
-                        println!("{} sent {} prevotes", ctx_str, sent_c[0]);
-                    }
-                    if PRINT_SEND_CS && sent_c[1] > 0 {
-                        println!("{} sent {} precommits", ctx_str, sent_c[1]);
-                    }
+                    if PRINT_SEND_CS && sent_chunk_cs > 0 { eprintln!("{} sent {} proposal chunks", ctx_str, sent_chunk_cs); }
+                    if PRINT_SEND_CS && sent_c[0]     > 0 { eprintln!("{} sent {} prevotes",        ctx_str, sent_c[0]);     }
+                    if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{} sent {} precommits",      ctx_str, sent_c[1]);     }
                 }
 
                 if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|p|
