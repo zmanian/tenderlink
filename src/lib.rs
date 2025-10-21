@@ -56,6 +56,12 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
     e == std::io::ErrorKind::WouldBlock || e == std::io::ErrorKind::TimedOut
 }
 
+#[derive(Default)]
+struct NetworkStats {
+    bytes_sent: usize,
+    packets_sent: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct SortedRosterMember {
     pub pub_key: PubKeyID,
@@ -1601,16 +1607,9 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
     let mut unknown_peers: Vec<UnknownPeer> = Vec::new();
 
-    struct NetworkStats {
-        bytes_sent: usize,
-        packets_sent: usize,
-    }
-
-    let time_we_started_at = tokio::time::Instant::now();
-    let mut net_stats = NetworkStats {
-        bytes_sent: 0,
-        packets_sent: 0,
-    };
+    const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+    let mut net_stats_window_start = tokio::time::Instant::now();
+    let mut net_stats = NetworkStats::default();
 
     let mut recv_buf1 = [0; 2048];
     let mut recv_buf2 = [0; 2048];
@@ -1780,6 +1779,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
             // let rough_packet_loss = 1.0 - (header.ack_field.count_ones() as f64 / 64.0);
             // println!("Packet loss: {}%.", rough_packet_loss * 100.0);
+        }
+
+        if net_stats_window_start.elapsed() >= ONE_SECOND {
+            net_stats = NetworkStats::default();
+            net_stats_window_start = tokio::time::Instant::now();
         }
 
         let was_now = tokio::time::Instant::now();
@@ -2065,8 +2069,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 }
 
                 if PRINT_NETWORK_STATS {
-                    let elapsed = time_we_started_at.elapsed();
-                    let nonzero_elapsed_sec = if (elapsed.is_zero()) { 1f32 } else { elapsed.as_secs_f32() };
+                    let elapsed = net_stats_window_start.elapsed();
+                    let nonzero_elapsed_sec = elapsed.as_secs_f32().max(1.0);
 
                     let kbps = (std::cmp::max(1, net_stats.bytes_sent)   as f32) / 1000.0 / (nonzero_elapsed_sec);
                     let  pps = (std::cmp::max(1, net_stats.packets_sent) as f32)          / (nonzero_elapsed_sec);
