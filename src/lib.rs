@@ -1725,10 +1725,11 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             let target_bytes_in_flight = ((MAX_BANDWIDTH_BYTES_PER_SECOND as f64 * mean_rtt.max(0.01)) as usize).max(PATH_MTU);
 
             // NOTE(phil) probabilistically lerp down towards 0 likelihood of sending a packet as we approach bandwidth limit
-            let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
-            if rand::random::<f64>() < rand_t {
-                return;
-            }
+            // let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
+            // if rand::random::<f64>() < rand_t {
+            //     println!("Dropping packet because of congestion control.");
+            //     return;
+            // }
 
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
