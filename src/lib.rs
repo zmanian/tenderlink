@@ -1740,7 +1740,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     ()
                 },
                 Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                Err(error) => panic!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
+                Err(error) => eprintln!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
             }
         }
         fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
