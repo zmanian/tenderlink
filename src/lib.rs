@@ -1091,10 +1091,12 @@ impl TMState {
         for i in current_height_start_i..self.rounds_data.len() {
             let on_roster = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key).is_some();
             let counts = self.rounds_data[i].counts.clone();
+            let data_height = self.rounds_data[i].height;
+            let data_round = self.rounds_data[i].round;
             let has_enough_info_to_determine_validity = self.rounds_data[i].has_enough_info_to_determine_validity();
 
             // TODO: don't spam "while" messages repeatedly
-            let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
+            let is_current_height_and_round = (self.height, self.round) == (data_height, data_round);
             // println!("{:#?}", self);
             if PRINT_BFT_STATE {
                 println!("{} {}={}.{}, {}/{}, {}", ctx_str,
@@ -1210,15 +1212,20 @@ impl TMState {
             }
 
             // Crosslink recovery: a 2f+1 PRECOMMIT nil certificate abandons
-            // the current round and lets the next proposer resample the stream.
+            // its round. If the certificate is for the current round, advance
+            // immediately; if it arrives late, still clear any lock/valid state
+            // from that abandoned round so future rounds can resample.
             if (on_roster &&
-                is_current_height_and_round &&
+                data_height == self.height &&
+                data_round <= self.round &&
                 big_threshold <= counts.nil_precommits)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition nil-precommit recovery", ctx_str); }
-                self.clear_same_round_tendermint_state(self.round);
-                self.start_round(roster, now, self.round + 1).await;
-                continue;
+                self.clear_same_round_tendermint_state(data_round);
+                if data_round == self.round {
+                    self.start_round(roster, now, self.round + 1).await;
+                    continue;
+                }
             }
 
             // line 47: last orders on precommit period
@@ -3211,6 +3218,74 @@ mod tests {
             assert_eq!(state.step, TMStep::Precommit);
             assert_eq!(state.locked_value_round, (None, -1));
             assert_eq!(state.rounds_data[0].msg_val_sigs[0][1].0, ValueId::NIL);
+        });
+    }
+
+    #[test]
+    fn late_nil_precommit_quorum_clears_abandoned_round_lock_after_timeout() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let keys = test_keys(4);
+            let (mut state, mut roster) = test_state(&keys);
+            state.start_round(&roster, Instant::now(), 0).await;
+
+            let locked_value = BlockValue(b"round zero value".to_vec());
+            state.locked_value_round = (Some(locked_value.clone()), 0);
+            state.valid_value_round = (Some(locked_value), 0);
+
+            state.start_round(&roster, Instant::now(), 1).await;
+            assert_eq!(state.round, 1);
+
+            for roster_i in 0..3 {
+                sign_nil_precommit(&mut state, &roster, &keys, roster_i, 0);
+            }
+
+            state.bft_update(&mut roster).await;
+
+            assert_eq!(state.round, 1);
+            assert_eq!(state.locked_value_round, (None, -1));
+            assert_eq!(state.valid_value_round, (None, -1));
+        });
+    }
+
+    #[test]
+    fn mixed_precommit_quorum_does_not_clear_lock_without_nil_quorum() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let keys = test_keys(4);
+            let (mut state, mut roster) = test_state(&keys);
+            state.start_round(&roster, Instant::now(), 0).await;
+
+            let locked_value = BlockValue(b"possibly committed value".to_vec());
+            let locked_value_id = locked_value.id_from_value(&state.hash_keys);
+            {
+                let round_data = &mut state.rounds_data[0];
+                round_data.proposal = locked_value.clone();
+                round_data.proposal_id = locked_value_id;
+                round_data.proposal_sigs = vec![TMSig::NIL];
+                round_data.proposal_sigs_n = 1;
+            }
+            state.step = TMStep::Precommit;
+            state.locked_value_round = (Some(locked_value.clone()), 0);
+            state.valid_value_round = (Some(locked_value.clone()), 0);
+
+            sign_vote(&mut state, &roster, &keys, 0, 0, true, locked_value_id);
+            sign_vote(&mut state, &roster, &keys, 1, 0, true, locked_value_id);
+            sign_nil_precommit(&mut state, &roster, &keys, 2, 0);
+
+            state.bft_update(&mut roster).await;
+
+            assert_eq!(state.round, 0);
+            assert_eq!(state.locked_value_round, (Some(locked_value.clone()), 0));
+            assert_eq!(state.valid_value_round, (Some(locked_value), 0));
         });
     }
 
