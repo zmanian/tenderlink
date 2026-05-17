@@ -3,6 +3,8 @@ name = "tenderlink"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+
 [profile.dev]
 opt-level = 0            # no optimizations
 debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)

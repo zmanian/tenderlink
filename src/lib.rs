@@ -332,6 +332,7 @@ pub enum TMStatus {
     Indeterminate,
     Pass, // 2f+1 yes
     Fail, // f+1 no
+    Stale, // Crosslink stream changed before this value could be safely precommitted
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -421,6 +422,16 @@ impl RoundData {
         }
         self.proposal_checked_validity
     }
+
+    async fn proposal_fresh_validity(&mut self, validate_closure: ClosureToValidateProposedBlock) -> TMStatus {
+        if self.proposal_is_faulty {
+            TMStatus::Fail
+        } else if self.has_full_proposal() {
+            validate_closure.0(&self.proposal).await
+        } else {
+            TMStatus::Indeterminate
+        }
+    }
 }
 
 enum TMMsgData {
@@ -442,6 +453,7 @@ struct ConsensusCounts {
     nil_prevotes: u64,
     yes_prevotes: u64,
     precommits: u64,
+    nil_precommits: u64,
     yes_precommits: u64,
 }
 impl ConsensusCounts {
@@ -450,6 +462,7 @@ impl ConsensusCounts {
         prevotes: 0,
         precommits: 0,
         yes_prevotes: 0,
+        nil_precommits: 0,
         yes_precommits: 0,
         nil_prevotes: 0,
     };
@@ -463,6 +476,7 @@ impl std::ops::Add for ConsensusCounts {
             nil_prevotes:   self.nil_prevotes   + rhs.nil_prevotes,
             yes_prevotes:   self.yes_prevotes   + rhs.yes_prevotes,
             precommits:     self.precommits     + rhs.precommits,
+            nil_precommits: self.nil_precommits + rhs.nil_precommits,
             yes_precommits: self.yes_precommits + rhs.yes_precommits,
         }
     }
@@ -476,6 +490,7 @@ impl std::ops::Sub for ConsensusCounts {
             nil_prevotes:   self.nil_prevotes   - rhs.nil_prevotes,
             yes_prevotes:   self.yes_prevotes   - rhs.yes_prevotes,
             precommits:     self.precommits     - rhs.precommits,
+            nil_precommits: self.nil_precommits - rhs.nil_precommits,
             yes_precommits: self.yes_precommits - rhs.yes_precommits,
         }
     }
@@ -496,18 +511,20 @@ impl From<&([(ValueId, TMSig); 2], u64)> for ConsensusCounts {
             nil_prevotes: status[0][0] as u64 * stake,
             yes_prevotes: status[0][1] as u64 * stake,
             precommits: has_sigs[1] as u64 * stake,
+            nil_precommits: status[1][0] as u64 * stake,
             yes_precommits: status[1][1] as u64 * stake,
         }
     }
 }
 impl std::fmt::Debug for ConsensusCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Counts {{ a:{}  v:{} (nv:{} yv:{})  c:{} (yc:{}) }}",
+        write!(f, "Counts {{ a:{}  v:{} (nv:{} yv:{})  c:{} (nc:{} yc:{}) }}",
             self.anys,
             self.prevotes,
             self.nil_prevotes,
             self.yes_prevotes,
             self.precommits,
+            self.nil_precommits,
             self.yes_precommits,
         )
     }
@@ -727,6 +744,16 @@ impl TMState {
             ..RoundData::EMPTY
         });
         insert_i
+    }
+
+    fn clear_same_round_tendermint_state(&mut self, round: u32) {
+        let round = round as i64;
+        if self.locked_value_round.1 == round {
+            self.locked_value_round = (None, -1);
+        }
+        if self.valid_value_round.1 == round {
+            self.valid_value_round = (None, -1);
+        }
     }
 
     async fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
@@ -999,6 +1026,7 @@ impl TMState {
                     d.prevotes       |
                     d.precommits     |
                     d.yes_prevotes   |
+                    d.nil_precommits |
                     d.yes_precommits |
                     d.nil_prevotes) != 0 {
                     println!("{}: update to {:?} (d: {:?})", ctx_str, round_data.counts, d);
@@ -1147,16 +1175,26 @@ impl TMState {
                 is_current_height_and_round &&
                 has_enough_info_to_determine_validity &&
                 big_threshold <= counts.yes_prevotes &&
-                self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
-                if self.step == TMStep::Prevote {
-                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
-                    self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
-                    self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                match self.rounds_data[i].proposal_fresh_validity(self.validate_closure.clone()).await {
+                    TMStatus::Pass => {
+                        if PRINT_BFT_CONDITIONS { println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
+                        if self.step == TMStep::Prevote {
+                            if PRINT_BFT_CONDITIONS { println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
+                            self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
+                            self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                        }
+                        self.valid_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
+                    }
+                    TMStatus::Stale => {
+                        if self.step == TMStep::Prevote {
+                            if PRINT_BFT_CONDITIONS { println!("{}: in condition 36-stale: precommit nil", ctx_str); }
+                            self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
+                        }
+                    }
+                    TMStatus::Indeterminate | TMStatus::Fail => {}
                 }
-                self.valid_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
             }
 
             // line 44: seen 2f+1 nil prevotes: precommit nil
@@ -1169,6 +1207,18 @@ impl TMState {
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str); }
                 self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
+            }
+
+            // Crosslink recovery: a 2f+1 PRECOMMIT nil certificate abandons
+            // the current round and lets the next proposer resample the stream.
+            if (on_roster &&
+                is_current_height_and_round &&
+                big_threshold <= counts.nil_precommits)
+            {
+                if PRINT_BFT_CONDITIONS { println!("{}: in condition nil-precommit recovery", ctx_str); }
+                self.clear_same_round_tendermint_state(self.round);
+                self.start_round(roster, now, self.round + 1).await;
+                continue;
             }
 
             // line 47: last orders on precommit period
@@ -2934,6 +2984,235 @@ pub fn run_instances(i: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_keys(n: usize) -> Vec<SigningKey> {
+        (1..=n)
+            .map(|i| SigningKey::from([i as u8; 32]))
+            .collect()
+    }
+
+    fn test_roster(keys: &[SigningKey]) -> Vec<SortedRosterMember> {
+        let mut cumulative_stake = 0;
+        keys.iter()
+            .map(|key| {
+                cumulative_stake += 1;
+                SortedRosterMember {
+                    pub_key: PubKeyID(key.verification_key().into()),
+                    stake: 1,
+                    cumulative_stake,
+                }
+            })
+            .collect()
+    }
+
+    fn test_state_with_validator(
+        keys: &[SigningKey],
+        validate_closure: ClosureToValidateProposedBlock,
+    ) -> (TMState, Vec<SortedRosterMember>) {
+        let decisions = Arc::new(Mutex::new(Vec::<BlockValue>::new()));
+        let decisions2 = Arc::clone(&decisions);
+        let roster = test_roster(keys);
+        let state = TMState::init(
+            keys[0].clone(),
+            roster[0].pub_key,
+            0,
+            ClosureToProposeNewBlock(Arc::new(|| Box::pin(future::ready(None)))),
+            validate_closure,
+            ClosureToPushDecidedBlock(Arc::new(move |block, _fat_pointer| {
+                let decisions = Arc::clone(&decisions2);
+                Box::pin(async move {
+                    decisions.lock().unwrap().push(block);
+                    Vec::new()
+                })
+            })),
+            ClosureToGetHistoricalBlock(Arc::new(|_| {
+                Box::pin(future::ready((
+                    BlockValue(Vec::new()),
+                    FatPointerToBftBlock3 {
+                        vote_for_block_without_finalizer_public_key: [0; 44],
+                        signatures: Vec::new(),
+                    },
+                )))
+            })),
+            ClosureToUpdateRosterCmd(Arc::new(|_| Box::pin(future::ready(None)))),
+        );
+        (state, roster)
+    }
+
+    fn test_state(keys: &[SigningKey]) -> (TMState, Vec<SortedRosterMember>) {
+        test_state_with_validator(
+            keys,
+            ClosureToValidateProposedBlock(Arc::new(|_| Box::pin(future::ready(TMStatus::Pass)))),
+        )
+    }
+
+    fn sign_vote(
+        state: &mut TMState,
+        roster: &[SortedRosterMember],
+        keys: &[SigningKey],
+        roster_i: usize,
+        round: u32,
+        is_precommit: bool,
+        value_id: ValueId,
+    ) {
+        let packet_type = if is_precommit {
+            PACKET_TYPE_PRECOMMIT_SIGNATURES
+        } else {
+            PACKET_TYPE_PREVOTE_SIGNATURES
+        };
+        let sign_data = make_vote_sign_datas(
+            roster[roster_i].pub_key.0,
+            is_precommit,
+            state.height,
+            round,
+            value_id,
+        )[1];
+        let sig = TMSig(keys[roster_i].sign(&sign_data).to_bytes());
+        assert_eq!(
+            state.check_and_incorporate_msg(
+                state.height,
+                round,
+                0,
+                value_id,
+                -2,
+                roster,
+                roster_i,
+                packet_type,
+                &sign_data,
+                sig,
+            ),
+            TMStatus::Pass
+        );
+    }
+
+    fn sign_nil_precommit(
+        state: &mut TMState,
+        roster: &[SortedRosterMember],
+        keys: &[SigningKey],
+        roster_i: usize,
+        round: u32,
+    ) {
+        sign_vote(state, roster, keys, roster_i, round, true, ValueId::NIL);
+    }
+
+    #[test]
+    fn nil_precommit_quorum_advances_round_and_clears_same_round_lock() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let keys = test_keys(4);
+            let (mut state, mut roster) = test_state(&keys);
+            state.start_round(&roster, Instant::now(), 0).await;
+
+            let locked_value = BlockValue(b"stale value".to_vec());
+            state.step = TMStep::Precommit;
+            state.locked_value_round = (Some(locked_value.clone()), 0);
+            state.valid_value_round = (Some(locked_value), 0);
+
+            for roster_i in 0..3 {
+                sign_nil_precommit(&mut state, &roster, &keys, roster_i, 0);
+            }
+
+            state.bft_update(&mut roster).await;
+
+            assert_eq!(state.height, 0);
+            assert_eq!(state.round, 1);
+            assert_eq!(state.step, TMStep::Propose);
+            assert_eq!(state.locked_value_round, (None, -1));
+            assert_eq!(state.valid_value_round, (None, -1));
+        });
+    }
+
+    #[test]
+    fn later_nil_precommit_quorum_preserves_older_value_lock() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let keys = test_keys(4);
+            let (mut state, mut roster) = test_state(&keys);
+            state.start_round(&roster, Instant::now(), 1).await;
+
+            let older_locked_value = BlockValue(b"older value".to_vec());
+            state.step = TMStep::Precommit;
+            state.locked_value_round = (Some(older_locked_value.clone()), 0);
+            state.valid_value_round = (Some(older_locked_value.clone()), 0);
+
+            for roster_i in 0..3 {
+                sign_nil_precommit(&mut state, &roster, &keys, roster_i, 1);
+            }
+
+            state.bft_update(&mut roster).await;
+
+            assert_eq!(state.height, 0);
+            assert_eq!(state.round, 2);
+            assert_eq!(state.step, TMStep::Propose);
+            assert_eq!(state.locked_value_round, (Some(older_locked_value.clone()), 0));
+            assert_eq!(state.valid_value_round, (Some(older_locked_value), 0));
+        });
+    }
+
+    #[test]
+    fn stale_precommit_validation_precommits_nil_instead_of_cached_value() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let keys = test_keys(4);
+            let validation_calls = Arc::new(AtomicUsize::new(0));
+            let validation_calls2 = Arc::clone(&validation_calls);
+            let (mut state, mut roster) = test_state_with_validator(
+                &keys,
+                ClosureToValidateProposedBlock(Arc::new(move |_| {
+                    let validation_calls = Arc::clone(&validation_calls2);
+                    Box::pin(async move {
+                        if validation_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            TMStatus::Pass
+                        } else {
+                            TMStatus::Stale
+                        }
+                    })
+                })),
+            );
+            state.start_round(&roster, Instant::now(), 0).await;
+
+            let proposal = BlockValue(b"became stale before precommit".to_vec());
+            let proposal_id = proposal.id_from_value(&state.hash_keys);
+            {
+                let round_data = &mut state.rounds_data[0];
+                round_data.proposal = proposal;
+                round_data.proposal_id = proposal_id;
+                round_data.proposal_sigs = vec![TMSig::NIL];
+                round_data.proposal_sigs_n = 1;
+                assert_eq!(
+                    round_data
+                        .proposal_is_valid(state.validate_closure.clone())
+                        .await,
+                    TMStatus::Pass
+                );
+            }
+
+            for roster_i in 0..3 {
+                sign_vote(&mut state, &roster, &keys, roster_i, 0, false, proposal_id);
+            }
+            state.step = TMStep::Prevote;
+
+            state.bft_update(&mut roster).await;
+
+            assert_eq!(state.step, TMStep::Precommit);
+            assert_eq!(state.locked_value_round, (None, -1));
+            assert_eq!(state.rounds_data[0].msg_val_sigs[0][1].0, ValueId::NIL);
+        });
+    }
 
     // #[ignore]
     // #[test]
@@ -3024,4 +3303,3 @@ mod tests {
         }
     }
 }
-
